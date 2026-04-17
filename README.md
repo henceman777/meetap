@@ -14,8 +14,9 @@ make install
 # 配置会议 App（仅首次）
 meetap setup
 
-# 录制
-meetap start    # 开会前
+# 录制（⚠️ 必须先 start，再加入会议）
+meetap start    # 先开始录制
+                # 然后加入 Zoom / Teams / 腾讯会议
 meetap stop     # 开完后（自动转录）
 ```
 
