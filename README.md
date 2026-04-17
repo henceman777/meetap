@@ -29,6 +29,7 @@ App audio → BlackHole 2ch (system output)
 
 - 系统输出切到 BlackHole，ffmpeg 从中录制
 - audio-monitor 通过底层 AUHAL AudioUnit 实时转发到扬声器/耳机
+- 同时录制麦克风输入（你的声音）和系统音频（对方声音）
 - 停止后自动上传到 S3，调用 AWS Transcribe 转录，生成带说话人标签的文本
 
 ## Files
@@ -54,9 +55,7 @@ doc/
 
 ## Known Limitations
 
-- AirPods 等蓝牙耳机不支持（24kHz vs 48kHz 采样率不兼容）
-- 仅录制系统音频输出，不含麦克风输入
-- 转录目前固定为 en-US
+- 外放场景下麦克风会拾取扬声器回声，建议戴耳机录制
 
 ## License
 

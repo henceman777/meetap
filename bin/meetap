@@ -71,7 +71,8 @@ transcribe_recording() {
     echo "[$(date '+%H:%M:%S')] Starting transcription job: $JOB_NAME"
     aws transcribe start-transcription-job \
         --transcription-job-name "$JOB_NAME" \
-        --language-code "en-US" \
+        --identify-language \
+        --language-options "en-US,zh-CN,ja-JP" \
         --media-format "mp4" \
         --media "{\"MediaFileUri\": \"s3://${BUCKET}/${AUDIO_BASENAME}\"}" \
         --output-bucket-name "$BUCKET" \
@@ -247,8 +248,13 @@ start_recording() {
     OUTPUT_FILE="$SESSION_DIR/meeting_${TIMESTAMP}.m4a"
     echo "$OUTPUT_FILE" > "$OUTPUT_FILE_MARKER"
 
-    # 开始录制（从 BlackHole 采集）
+    # 开始录制（系统音频 + 麦克风混录）
+    local MIC_NAME
+    MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
+    echo "🎤 麦克风: $MIC_NAME"
     ffmpeg -f avfoundation -i ":BlackHole 2ch" \
+        -f avfoundation -i ":default" \
+        -filter_complex amix=inputs=2:duration=longest \
         -c:a aac -b:a 128k -ac 1 \
         "$OUTPUT_FILE" \
         < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
@@ -531,7 +537,7 @@ case "${1:-}" in
         echo ""
         echo "用法: $0 {start|stop|status|setup}"
         echo ""
-        echo "  start        自动检测耳机，创建多输出设备，开始录制"
+        echo "  start        开始录制（系统音频 + 麦克风）"
         echo "  stop         停止录制，恢复音频设备"
         echo "  status       查看当前录制状态"
         echo "  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
