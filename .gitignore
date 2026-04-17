@@ -1,0 +1,14 @@
+# Compiled Swift binaries
+bin/audio-multi-output
+bin/audio-monitor
+
+# macOS
+.DS_Store
+
+# Runtime state
+/tmp/meeting-record/
+
+# Recording files
+*.m4a
+*.json
+transcribe.log
