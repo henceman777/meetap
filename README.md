@@ -14,10 +14,10 @@ make install
 # 配置会议 App（仅首次）
 meetap setup
 
-# 录制（⚠️ 必须先 start，再加入会议）
-meetap start    # 先开始录制
-                # 然后加入 Zoom / Teams / 腾讯会议
+# 录制
+meetap start    # 开会前或开会后均可，支持 AirPods / 耳机 / 扬声器
 meetap stop     # 开完后（自动转录）
+# ⚠️ 录制期间不要手动切换音频输出设备
 ```
 
 ## How It Works
@@ -56,6 +56,7 @@ doc/
 
 ## Known Limitations
 
+- 录制期间手动切换系统音频输出会导致录音无声（误切后切回可恢复）
 - 外放场景下麦克风会拾取扬声器回声，建议戴耳机录制
 
 ## License
