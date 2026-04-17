@@ -35,7 +35,7 @@ App audio → BlackHole 2ch (system output)
 ## Files
 
 ```
-bin/
+src/
 ├── meetap                     # 主控脚本
 ├── audio-multi-output.swift   # CoreAudio 设备管理
 └── audio-monitor.swift        # AUHAL 音频实时转发

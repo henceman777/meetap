@@ -1,21 +1,24 @@
 PREFIX ?= $(HOME)/bin
+BUILD  ?= build
 
-.PHONY: build install clean
+.PHONY: all install clean
 
-build: bin/audio-multi-output bin/audio-monitor
+all: $(BUILD)/audio-multi-output $(BUILD)/audio-monitor
 
-bin/audio-multi-output: bin/audio-multi-output.swift
+$(BUILD)/audio-multi-output: src/audio-multi-output.swift
+	mkdir -p $(BUILD)
 	swiftc -O -framework CoreAudio -framework AudioToolbox $< -o $@
 
-bin/audio-monitor: bin/audio-monitor.swift
+$(BUILD)/audio-monitor: src/audio-monitor.swift
+	mkdir -p $(BUILD)
 	swiftc -O -framework CoreAudio -framework AudioToolbox $< -o $@
 
-install: build
+install: all
 	mkdir -p $(PREFIX)
-	cp bin/meetap $(PREFIX)/meetap
-	cp bin/audio-multi-output $(PREFIX)/audio-multi-output
-	cp bin/audio-monitor $(PREFIX)/audio-monitor
+	cp src/meetap $(PREFIX)/meetap
+	cp $(BUILD)/audio-multi-output $(PREFIX)/audio-multi-output
+	cp $(BUILD)/audio-monitor $(PREFIX)/audio-monitor
 	chmod +x $(PREFIX)/meetap
 
 clean:
-	rm -f bin/audio-multi-output bin/audio-monitor
+	rm -rf $(BUILD)
