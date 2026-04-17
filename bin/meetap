@@ -1,20 +1,6 @@
 #!/bin/bash
-# 会议录制脚本 - 全自动通过 BlackHole 录制内部音频
-#
-# 自动完成:
-#   1. 检测当前耳机/扬声器（AirPods、有线耳机、外放均可）
-#   2. 动态创建「当前设备 + BlackHole」多输出设备
-#   3. 切换系统输出到多输出设备
-#   4. 开始录制
-#   5. 结束时销毁多输出设备，恢复原始输出
-#
-# 兼容: Teams / Zoom / 飞书 / 腾讯会议
-#
-# 用法:
-#   meeting-record.sh setup  - 首次使用，一键配置 Zoom + Teams 扬声器
-#   meeting-record.sh start  - 开始录制
-#   meeting-record.sh stop   - 停止录制
-#   meeting-record.sh status - 查看状态
+# MeeTap - macOS 会议录制 + 自动转录工具
+VERSION="0.1"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL="$SCRIPT_DIR/audio-multi-output"
@@ -532,19 +518,23 @@ case "${1:-}" in
     setup-wemeet)
         setup_wemeet
         ;;
+    -v|--version|version)
+        echo "MeeTap v${VERSION}"
+        ;;
     *)
-        echo "会议录制工具 - 自动创建多输出设备并录制"
+        echo "MeeTap v${VERSION} - macOS 会议录制 + 自动转录"
         echo ""
-        echo "用法: $0 {start|stop|status|setup}"
+        echo "用法: meetap {start|stop|status|setup|version}"
         echo ""
         echo "  start        开始录制（系统音频 + 麦克风）"
-        echo "  stop         停止录制，恢复音频设备"
+        echo "  stop         停止录制，恢复音频设备，自动转录"
         echo "  status       查看当前录制状态"
         echo "  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
         echo "  setup-zoom   仅配置 Zoom"
         echo "  setup-teams  仅配置 Teams"
         echo "  setup-wemeet 仅配置腾讯会议"
+        echo "  version      显示版本号"
         echo ""
-        echo "首次使用请先运行: $0 setup"
+        echo "首次使用请先运行: meetap setup"
         ;;
 esac
