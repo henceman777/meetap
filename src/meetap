@@ -58,7 +58,7 @@ transcribe_recording() {
     aws transcribe start-transcription-job \
         --transcription-job-name "$JOB_NAME" \
         --identify-language \
-        --language-options "en-US,zh-CN,ja-JP" \
+        --language-options en-US zh-CN ja-JP \
         --media-format "mp4" \
         --media "{\"MediaFileUri\": \"s3://${BUCKET}/${AUDIO_BASENAME}\"}" \
         --output-bucket-name "$BUCKET" \
