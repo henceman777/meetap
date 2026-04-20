@@ -1,6 +1,6 @@
 # MeeTap
 
-macOS 会议录制 + 自动转录工具。通过 BlackHole 虚拟声卡无感录制 Zoom / Teams / 飞书 / 腾讯会议音频，录制结束后自动通过 AWS Transcribe 转录为文字。
+macOS 会议录制 + 自动转录 + 自动会议纪要工具。通过 BlackHole 虚拟声卡无感录制 Zoom / Teams / 飞书 / 腾讯会议音频，录制结束后自动通过 AWS Transcribe 转录为文字，再由 Claude Sonnet 4.6（Bedrock）生成结构化会议纪要。
 
 ## Quick Start
 
@@ -24,14 +24,16 @@ meetap stop     # 开完后（自动转录）
 
 ```
 App audio → BlackHole 2ch (system output)
-              ├── ffmpeg → meeting.m4a → AWS Transcribe → transcript.txt
+              ├── ffmpeg → meeting.m4a → AWS Transcribe → transcript.txt → Claude → meeting-notes.md
               └── audio-monitor (AUHAL) → Speaker/Headphone (you hear it)
 ```
 
 - 系统输出切到 BlackHole，ffmpeg 从中录制
 - audio-monitor 通过底层 AUHAL AudioUnit 实时转发到扬声器/耳机
 - 同时录制麦克风输入（你的声音）和系统音频（对方声音）
+- 持续静音 2 分钟后自动停止录制
 - 停止后自动上传到 S3，调用 AWS Transcribe 转录，生成带说话人标签的文本
+- 转录完成后自动调用 Claude Sonnet 4.6（Bedrock Converse Stream）生成中文会议纪要
 
 ## Files
 
@@ -52,6 +54,7 @@ doc/
 - macOS 13+ (Ventura)
 - BlackHole 2ch, ffmpeg, SwitchAudioSource
 - AWS CLI (configured, for auto-transcription)
+- Python 3 + boto3 (for meeting notes generation via Bedrock)
 - Xcode Command Line Tools (for Swift compilation)
 
 ## Known Limitations

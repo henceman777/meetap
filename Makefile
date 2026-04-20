@@ -19,6 +19,11 @@ install: all
 	cp $(BUILD)/audio-multi-output $(PREFIX)/audio-multi-output
 	cp $(BUILD)/audio-monitor $(PREFIX)/audio-monitor
 	chmod +x $(PREFIX)/meetap
+	@if [ ! -d "$(PREFIX)/meetap-venv" ]; then \
+		echo "Creating Python venv for boto3..."; \
+		python3 -m venv $(PREFIX)/meetap-venv; \
+		$(PREFIX)/meetap-venv/bin/pip install -q boto3; \
+	fi
 
 clean:
 	rm -rf $(BUILD)

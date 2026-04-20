@@ -5,6 +5,7 @@ VERSION="0.1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL="$SCRIPT_DIR/audio-multi-output"
 MONITOR="$SCRIPT_DIR/audio-monitor"
+VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
 RECORDING_DIR="$HOME/Record"
 STATE_DIR="/tmp/meeting-record"
 
@@ -16,6 +17,60 @@ MONITOR_PID_FILE="$STATE_DIR/monitor.pid"
 ORIGINAL_UID_FILE="$STATE_DIR/original-output.uid"
 ORIGINAL_NAME_FILE="$STATE_DIR/original-output.name"
 OUTPUT_FILE_MARKER="$STATE_DIR/output-file"
+AUTOSTOP_PID_FILE="$STATE_DIR/autostop.pid"
+MEETING_APPS_FILE="$STATE_DIR/meeting-apps"
+
+KNOWN_MEETING_APPS="zoom.us|Microsoft Teams|TencentMeeting|Webex|Lark|Feishu|DingTalk|Slack"
+
+detect_meeting_apps() {
+    local found=""
+    while IFS= read -r proc; do
+        [[ -n "$proc" ]] && found="${found:+$found,}$proc"
+    done < <(ps -eo comm= | grep -oE "$KNOWN_MEETING_APPS" | sort -u)
+    echo "$found"
+}
+
+is_audio_silent() {
+    local SAMPLE_DURATION=5
+    local SILENCE_THRESHOLD=-50
+    local mean_vol
+    mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t "$SAMPLE_DURATION" \
+        -af volumedetect -f null /dev/null 2>&1 \
+        | grep "mean_volume" | grep -oE '[-0-9.]+' | head -1)
+    if [[ -z "$mean_vol" ]]; then
+        return 1
+    fi
+    local vol_int=${mean_vol%%.*}
+    [[ $vol_int -le $SILENCE_THRESHOLD ]]
+}
+
+autostop_daemon() {
+    local CHECK_INTERVAL=30
+    local SILENCE_GRACE=120
+    local silence_start=""
+
+    while true; do
+        if [[ ! -f "$PID_FILE" ]] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            break
+        fi
+
+        if is_audio_silent; then
+            if [[ -z "$silence_start" ]]; then
+                silence_start=$(date +%s)
+            fi
+            local elapsed=$(( $(date +%s) - silence_start ))
+            if [[ $elapsed -ge $SILENCE_GRACE ]]; then
+                osascript -e "display notification \"持续静音 ${SILENCE_GRACE} 秒，自动停止录制\" with title \"MeeTap\"" 2>/dev/null
+                "$0" stop
+                break
+            fi
+        else
+            silence_start=""
+        fi
+
+        sleep $CHECK_INTERVAL
+    done
+}
 
 transcribe_recording() {
     local AUDIO_FILE="$1"
@@ -144,7 +199,131 @@ PYEOF
     aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
 
     echo "[$(date '+%H:%M:%S')] ✅ Transcription complete: $SESSION_DIR/transcript.txt"
-    osascript -e "display notification \"转录完成: transcript.txt\" with title \"MeeTap\"" 2>/dev/null
+    osascript -e "display notification \"转录完成，正在整理会议纪要...\" with title \"MeeTap\"" 2>/dev/null
+
+    # Generate polished meeting notes via Claude Sonnet 4.6 (Bedrock)
+    summarize_transcript "$SESSION_DIR"
+}
+
+summarize_transcript() {
+    local SESSION_DIR="$1"
+    local TRANSCRIPT="$SESSION_DIR/transcript.txt"
+    local OUTPUT="$SESSION_DIR/meeting-notes.md"
+    local AWS_REGION="us-east-1"
+    local MODEL_ID="us.anthropic.claude-sonnet-4-6"
+
+    if [[ ! -f "$TRANSCRIPT" ]]; then
+        echo "[$(date '+%H:%M:%S')] ⚠️ transcript.txt not found, skipping summarization"
+        return 1
+    fi
+
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        echo "[$(date '+%H:%M:%S')] ⚠️ Python venv not found: $VENV_PYTHON, skipping summarization"
+        return 1
+    fi
+
+    echo "[$(date '+%H:%M:%S')] 📝 Generating meeting notes via Claude Sonnet 4.6 (stream)..."
+
+    local SESSION_NAME
+    SESSION_NAME=$(basename "$SESSION_DIR")
+
+    "$VENV_PYTHON" - "$TRANSCRIPT" "$OUTPUT" "$AWS_REGION" "$MODEL_ID" "$SESSION_NAME" <<'PYEOF'
+import sys, boto3
+
+transcript_path = sys.argv[1]
+output_path = sys.argv[2]
+region = sys.argv[3]
+model_id = sys.argv[4]
+session_name = sys.argv[5]
+
+with open(transcript_path, "r") as f:
+    transcript = f.read()
+
+if len(transcript) > 120000:
+    transcript = transcript[:120000] + "\n\n[... 内容过长，已截断 ...]"
+
+prompt = f"""你是一位专业的会议纪要整理专家。请将以下会议转录文本整理成一份结构清晰、内容完整的中文会议纪要。
+
+## 要求
+
+1. **保留所有细节、线索和故事线**——不要遗漏任何实质性内容，包括具体的数字、案例、客户名称、技术细节
+2. **修正语音识别错误**——根据上下文修正明显的语音转文字错误（如人名、技术术语的拼写）
+3. **针对生僻或专业内容，增加扩展注解**——用 `> 📌 注解:` 格式对专业术语、技术概念、行业背景进行简要说明，帮助读者理解
+4. **识别发言人**——根据对话内容推断发言人的角色（如主讲人、提问者、补充者），用有意义的标签替代 spk_0/spk_1 等
+5. **使用 Markdown 格式**输出，包含标题、分节、要点列表
+6. **在末尾生成摘要**——包含会议主题、关键结论、待办事项（如有）
+
+## 输出格式
+
+```markdown
+# 会议纪要：[主题]
+
+**日期**：{session_name}
+**参会者**：[根据对话推断的角色列表]
+
+---
+
+## 一、[第一个主题]
+
+[整理后的内容，保留所有细节]
+
+> 📌 注解: [对专业术语或背景的补充说明]
+
+## 二、[第二个主题]
+
+...
+
+---
+
+## 会议摘要
+
+- **主题**：
+- **关键结论**：
+- **待办事项**：
+```
+
+## 转录原文
+
+{transcript}"""
+
+try:
+    client = boto3.client("bedrock-runtime", region_name=region)
+    response = client.converse_stream(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 16000},
+    )
+
+    text_parts = []
+    for event in response["stream"]:
+        if "contentBlockDelta" in event:
+            delta = event["contentBlockDelta"]["delta"]
+            if "text" in delta:
+                text_parts.append(delta["text"])
+
+    text = "".join(text_parts)
+
+    if not text.strip():
+        print("Error: empty response from Bedrock")
+        sys.exit(1)
+
+    with open(output_path, "w") as f:
+        f.write(text)
+
+    print(f"Meeting notes saved: {output_path}")
+
+except Exception as e:
+    print(f"Error: {e}")
+    sys.exit(1)
+PYEOF
+
+    if [[ -f "$OUTPUT" ]]; then
+        echo "[$(date '+%H:%M:%S')] ✅ Meeting notes generated: $OUTPUT"
+        osascript -e "display notification \"会议纪要已生成: meeting-notes.md\" with title \"MeeTap\"" 2>/dev/null
+    else
+        echo "[$(date '+%H:%M:%S')] ⚠️ Meeting notes generation failed, transcript.txt is still available"
+        osascript -e "display notification \"纪要生成失败，转录文件可用\" with title \"MeeTap\"" 2>/dev/null
+    fi
 }
 
 start_recording() {
@@ -242,6 +421,7 @@ start_recording() {
         -f avfoundation -i ":default" \
         -filter_complex amix=inputs=2:duration=longest \
         -c:a aac -b:a 128k -ac 1 \
+        -movflags frag_keyframe+empty_moov \
         "$OUTPUT_FILE" \
         < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
@@ -250,10 +430,17 @@ start_recording() {
 
     sleep 1
     if kill -0 $FFMPEG_PID 2>/dev/null; then
+        # 启动自动停止守护进程（基于音频静音检测）
+        autostop_daemon &
+        AUTOSTOP_PID=$!
+        echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
+        disown $AUTOSTOP_PID
+
         echo ""
         echo "🎙️  录制已开始"
         echo "   文件: $OUTPUT_FILE"
         echo "   播放: $ORIG_NAME"
+        echo "   自动停止: 持续静音 2 分钟后"
         echo ""
         echo "   停止录制: $0 stop"
     else
@@ -268,6 +455,12 @@ start_recording() {
 }
 
 stop_recording() {
+    # 停止自动停止守护进程
+    if [[ -f "$AUTOSTOP_PID_FILE" ]]; then
+        kill "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null
+        rm -f "$AUTOSTOP_PID_FILE" "$MEETING_APPS_FILE"
+    fi
+
     if [[ ! -f "$PID_FILE" ]]; then
         echo "⚠️  没有正在进行的录制"
         exit 1
@@ -279,7 +472,16 @@ stop_recording() {
     if kill -0 "$FFMPEG_PID" 2>/dev/null; then
         kill -INT "$FFMPEG_PID"
         echo "⏳ 等待录制完成..."
-        wait "$FFMPEG_PID" 2>/dev/null || sleep 2
+        for i in $(seq 1 15); do
+            kill -0 "$FFMPEG_PID" 2>/dev/null || break
+            sleep 1
+        done
+        # 如果 15 秒后仍未退出，强制终止
+        if kill -0 "$FFMPEG_PID" 2>/dev/null; then
+            echo "⚠️  ffmpeg 未响应 SIGINT，强制终止..."
+            kill -9 "$FFMPEG_PID" 2>/dev/null
+            sleep 1
+        fi
     fi
     rm -f "$PID_FILE"
 
@@ -348,6 +550,9 @@ show_status() {
         echo "🎙️  录制中 (PID: $(cat "$PID_FILE"))"
         [[ -f "$OUTPUT_FILE_MARKER" ]] && echo "   文件: $(cat "$OUTPUT_FILE_MARKER")"
         [[ -f "$ORIGINAL_NAME_FILE" ]] && echo "   播放设备: $(cat "$ORIGINAL_NAME_FILE")"
+        if [[ -f "$AUTOSTOP_PID_FILE" ]] && kill -0 "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null; then
+            echo "   自动停止: 已启用 (监控: $(cat "$MEETING_APPS_FILE" 2>/dev/null))"
+        fi
         if [[ -f "$MONITOR_PID_FILE" ]] && kill -0 "$(cat "$MONITOR_PID_FILE")" 2>/dev/null; then
             echo "   音频转发: 运行中"
         fi
