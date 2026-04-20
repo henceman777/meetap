@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="0.1"
+VERSION="0.2"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL="$SCRIPT_DIR/audio-multi-output"
@@ -198,16 +198,45 @@ PYEOF
     aws s3 rm "s3://${BUCKET}/.write_access_check_file.temp" --region "$AWS_REGION" 2>/dev/null
     aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
 
+    # Extract speaker stats from raw JSON
+    python3 - "$SESSION_DIR" <<'PYEOF'
+import json, sys, os
+session_dir = sys.argv[1]
+raw_json = os.path.join(session_dir, "transcribe-raw.json")
+stats_file = os.path.join(session_dir, "speaker-stats.txt")
+with open(raw_json) as f:
+    data = json.load(f)
+segments = data["results"]["speaker_labels"]["segments"]
+speakers = {}
+for seg in segments:
+    spk = seg["speaker_label"]
+    dur = float(seg["end_time"]) - float(seg["start_time"])
+    speakers[spk] = speakers.get(spk, 0) + dur
+total = sum(speakers.values())
+lines = []
+for spk in sorted(speakers):
+    dur = speakers[spk]
+    m, s = divmod(int(dur), 60)
+    pct = dur / total * 100 if total > 0 else 0
+    lines.append(f"{spk}: {m}m{s:02d}s ({pct:.1f}%)")
+total_m, total_s = divmod(int(total), 60)
+lines.append(f"total: {total_m}m{total_s:02d}s")
+with open(stats_file, "w") as f:
+    f.write("\n".join(lines) + "\n")
+print(f"Speaker stats saved: {stats_file}")
+PYEOF
+
     echo "[$(date '+%H:%M:%S')] ✅ Transcription complete: $SESSION_DIR/transcript.txt"
     osascript -e "display notification \"转录完成，正在整理会议纪要...\" with title \"MeeTap\"" 2>/dev/null
 
-    # Generate polished meeting notes via Claude Sonnet 4.6 (Bedrock)
+    # Generate meeting notes via Claude Sonnet 4.6 (Bedrock)
     summarize_transcript "$SESSION_DIR"
 }
 
 summarize_transcript() {
     local SESSION_DIR="$1"
     local TRANSCRIPT="$SESSION_DIR/transcript.txt"
+    local SPEAKER_STATS="$SESSION_DIR/speaker-stats.txt"
     local OUTPUT="$SESSION_DIR/meeting-notes.md"
     local AWS_REGION="us-east-1"
     local MODEL_ID="us.anthropic.claude-sonnet-4-6"
@@ -227,60 +256,129 @@ summarize_transcript() {
     local SESSION_NAME
     SESSION_NAME=$(basename "$SESSION_DIR")
 
-    "$VENV_PYTHON" - "$TRANSCRIPT" "$OUTPUT" "$AWS_REGION" "$MODEL_ID" "$SESSION_NAME" <<'PYEOF'
-import sys, boto3
+    "$VENV_PYTHON" - "$TRANSCRIPT" "$SPEAKER_STATS" "$OUTPUT" "$AWS_REGION" "$MODEL_ID" "$SESSION_NAME" <<'PYEOF'
+import sys, os, boto3
 
 transcript_path = sys.argv[1]
-output_path = sys.argv[2]
-region = sys.argv[3]
-model_id = sys.argv[4]
-session_name = sys.argv[5]
+stats_path = sys.argv[2]
+output_path = sys.argv[3]
+region = sys.argv[4]
+model_id = sys.argv[5]
+session_name = sys.argv[6]
 
 with open(transcript_path, "r") as f:
     transcript = f.read()
+
+speaker_stats = ""
+if os.path.exists(stats_path):
+    with open(stats_path, "r") as f:
+        speaker_stats = f.read().strip()
 
 if len(transcript) > 120000:
     transcript = transcript[:120000] + "\n\n[... 内容过长，已截断 ...]"
 
 prompt = f"""你是一位专业的会议纪要整理专家。请将以下会议转录文本整理成一份结构清晰、内容完整的中文会议纪要。
 
-## 要求
+## 核心要求
 
-1. **保留所有细节、线索和故事线**——不要遗漏任何实质性内容，包括具体的数字、案例、客户名称、技术细节
-2. **修正语音识别错误**——根据上下文修正明显的语音转文字错误（如人名、技术术语的拼写）
-3. **针对生僻或专业内容，增加扩展注解**——用 `> 📌 注解:` 格式对专业术语、技术概念、行业背景进行简要说明，帮助读者理解
-4. **识别发言人**——根据对话内容推断发言人的角色（如主讲人、提问者、补充者），用有意义的标签替代 spk_0/spk_1 等
-5. **使用 Markdown 格式**输出，包含标题、分节、要点列表
-6. **在末尾生成摘要**——包含会议主题、关键结论、待办事项（如有）
+1. **保留所有细节**——不要遗漏任何实质性内容，包括具体数字、案例、客户名称、技术细节
+2. **修正语音识别错误**——根据上下文修正明显的语音转文字错误（人名、术语拼写等）
+3. **专业术语注解**——用 `> 📌 注解:` 格式对专业术语、技术概念进行简要说明
+4. **识别发言人**——根据对话内容推断发言人角色，用有意义的标签替代 spk_0/spk_1
+5. **Action Items 必须溯源**——每个待办事项必须标注负责人，并引用触发该事项的原文
+6. **区分已决策和未决问题**——明确分开已达成共识的决策和仍需后续讨论的问题
 
-## 输出格式
+## 发言人统计（从音频分析得出）
+
+{speaker_stats}
+
+## 输出格式（严格遵循此结构）
 
 ```markdown
 # 会议纪要：[主题]
 
 **日期**：{session_name}
-**参会者**：[根据对话推断的角色列表]
+**时长**：[从发言人统计的 total 获取]
+**参会者**：
+- **[推断姓名]**（[角色] | [发言时长], [占比]%）— [一句话职责描述]
+- ...
 
 ---
 
-## 一、[第一个主题]
+## ⚡ 30 秒速览
 
-[整理后的内容，保留所有细节]
+> [3-5 句话概括整场会议核心结论。目标：没参会的人读完这段就能跟上后续讨论]
+
+---
+
+## ✅ Action Items
+
+- [ ] **[负责人]** — [具体事项]（[截止时间，如有]）
+  📎 原文: "[触发该 action 的原话，保留关键上下文]"
+- ...
+
+[如果会议中没有明确的 action items，写"本次会议未产生明确的 action items"]
+
+## 🔑 关键决策
+
+- [已达成共识的决定，一句话描述]
+  📎 原文: "[支撑该决策的原话]"
+- ...
+
+## ❓ 待讨论 / 未决问题
+
+- [提出但未在本次会议解决的问题]
+- ...
+
+[如果所有问题都已解决，写"本次会议无未决问题"]
+
+---
+
+## 一、[第一个议题]
+
+[详细整理的内容，保留所有细节、案例、数据]
 
 > 📌 注解: [对专业术语或背景的补充说明]
 
-## 二、[第二个主题]
+## 二、[第二个议题]
 
 ...
 
 ---
 
-## 会议摘要
+## 📊 关键数字与指标
 
-- **主题**：
-- **关键结论**：
-- **待办事项**：
+| 数字 | 上下文 |
+|------|--------|
+| [具体数字] | [该数字出现的语境和含义] |
+| ... | ... |
+
+[如果会议中没有提到具体数字或指标，省略此节]
+
+## 👤 发言人贡献摘要
+
+- **[发言人A]**：[该发言人的核心观点和贡献，2-3 句话]
+- **[发言人B]**：[该发言人的核心观点和贡献，2-3 句话]
+- ...
+
+## 📋 术语速查
+
+| 缩写/术语 | 全称/含义 |
+|----------|----------|
+| ... | ... |
+
+[如果会议中没有需要解释的专业术语，省略此节]
 ```
+
+## 注意事项
+
+- **30 秒速览**放在最前面，是整份纪要最重要的部分，必须精炼有力
+- **Action Items** 紧跟其后，每一条都必须有负责人和原文溯源（📎）
+- **关键决策**和**待讨论**严格区分：已拍板的放决策，没结论的放待讨论
+- **正文详细分节**保留所有细节，这是会后深度回顾的依据
+- **关键数字**单独提取，方便快速查找会议中提到的数据
+- **发言人贡献摘要**让读者快速了解每人的核心输出
+- 如果某个章节确实没有内容（如没有 action items），按格式说明处理，不要凭空编造
 
 ## 转录原文
 
