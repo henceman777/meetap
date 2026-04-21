@@ -36,7 +36,7 @@ is_audio_silent() {
     local mean_vol
     mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t "$SAMPLE_DURATION" \
         -af volumedetect -f null /dev/null 2>&1 \
-        | grep "mean_volume" | grep -oE '[-0-9.]+' | head -1)
+        | sed -n 's/.*mean_volume: \([-0-9.]*\).*/\1/p')
     if [[ -z "$mean_vol" ]]; then
         return 1
     fi
