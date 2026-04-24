@@ -239,7 +239,7 @@ summarize_transcript() {
     local SPEAKER_STATS="$SESSION_DIR/speaker-stats.txt"
     local OUTPUT="$SESSION_DIR/meeting-notes.md"
     local AWS_REGION="us-east-1"
-    local MODEL_ID="us.anthropic.claude-sonnet-4-6"
+    local MODEL_ID="us.anthropic.claude-opus-4-7-v1"
 
     if [[ ! -f "$TRANSCRIPT" ]]; then
         echo "[$(date '+%H:%M:%S')] ⚠️ transcript.txt not found, skipping summarization"
