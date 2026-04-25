@@ -125,7 +125,7 @@ cat transcript.txt | claude -p "根据以下转录生成会议纪要..." > meeti
 - S3 桶名：`meetap-transcribe-{account-id}`
 
 **会议纪要（Bedrock）：**
-- 模型：`global.anthropic.claude-opus-4-7`
+- 模型：`us.anthropic.claude-sonnet-4-6`（Sonnet 性价比最优，Opus 质量相近但成本 5 倍）
 - maxTokens：16000
 - AWS Region：us-east-1（写了两处，分别在 transcribe 和 summarize 中）
 
