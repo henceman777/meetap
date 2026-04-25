@@ -5,7 +5,7 @@
 region = us-east-1
 
 # CLI display language (same codes as transcription languages)
-language = zh-CN
+language = en-US
 
 # Bedrock model for meeting notes generation
 model = us.anthropic.claude-sonnet-4-6
