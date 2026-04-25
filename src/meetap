@@ -15,6 +15,7 @@ CFG_MAX_SPEAKERS=10
 CFG_SILENCE_THRESHOLD=-50
 CFG_SILENCE_GRACE=120
 CFG_AUDIO_BITRATE="128k"
+CFG_MULTI_LANGUAGE=false
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
@@ -39,6 +40,7 @@ load_config() {
             silence_threshold)     CFG_SILENCE_THRESHOLD="$val" ;;
             silence_grace)         CFG_SILENCE_GRACE="$val" ;;
             audio_bitrate)         CFG_AUDIO_BITRATE="$val" ;;
+            multi_language)        CFG_MULTI_LANGUAGE="$val" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -148,10 +150,14 @@ transcribe_recording() {
     fi
 
     # Start transcription
+    local LANG_FLAG="--identify-language"
+    if [[ "$CFG_MULTI_LANGUAGE" == "true" ]]; then
+        LANG_FLAG="--identify-multiple-languages"
+    fi
     echo "[$(date '+%H:%M:%S')] Starting transcription job: $JOB_NAME"
     aws transcribe start-transcription-job \
         --transcription-job-name "$JOB_NAME" \
-        --identify-language \
+        $LANG_FLAG \
         --language-options $CFG_TRANSCRIBE_LANGUAGES \
         --media-format "mp4" \
         --media "{\"MediaFileUri\": \"s3://${BUCKET}/${AUDIO_BASENAME}\"}" \
@@ -897,6 +903,10 @@ case "${1:-}" in
 
 # Audio recording bitrate
 # audio_bitrate = 128k
+
+# Enable multi-language detection within a single session (true/false)
+# Useful when speakers switch languages; may reduce accuracy for short phrases
+# multi_language = false
 CFGEOF
                 echo "✅ Config file created: $CONFIG_FILE"
                 echo "   Uncomment and edit to customize"
@@ -919,6 +929,7 @@ CFGEOF
             echo "  silence_threshold     = $CFG_SILENCE_THRESHOLD"
             echo "  silence_grace         = $CFG_SILENCE_GRACE"
             echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
+            echo "  multi_language        = $CFG_MULTI_LANGUAGE"
             echo ""
             echo "Run 'meetap config init' to generate config file"
         fi
