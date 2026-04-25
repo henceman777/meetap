@@ -175,7 +175,7 @@ transcribe_recording() {
 
     if [[ "$STATUS" != "COMPLETED" ]]; then
         echo "❌ Transcription failed: $STATUS"
-        aws s3 rm "s3://${BUCKET}/${AUDIO_BASENAME}" --region "$AWS_REGION" 2>/dev/null
+        aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
         aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
         osascript -e "display notification \"转录失败，请查看日志\" with title \"MeeTap\"" 2>/dev/null
         return 1
@@ -231,10 +231,8 @@ with open(output_txt, "w") as f:
 print(f"Transcript saved: {len(lines)} speaker turns")
 PYEOF
 
-    # Cleanup S3 and Transcribe job
-    aws s3 rm "s3://${BUCKET}/${AUDIO_BASENAME}" --region "$AWS_REGION" 2>/dev/null
-    aws s3 rm "s3://${BUCKET}/${JOB_NAME}.json" --region "$AWS_REGION" 2>/dev/null
-    aws s3 rm "s3://${BUCKET}/.write_access_check_file.temp" --region "$AWS_REGION" 2>/dev/null
+    # Cleanup S3 bucket and Transcribe job
+    aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
     aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
 
     # Extract speaker stats from raw JSON
