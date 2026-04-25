@@ -901,7 +901,7 @@ case "${1:-}" in
 # Auto-stop after N seconds of continuous silence
 # silence_grace = 120
 
-# Audio recording bitrate
+# Audio recording bitrate (64k=small file, 128k=balanced, 256k=high quality)
 # audio_bitrate = 128k
 
 # Enable multi-language detection within a single session (true/false)
