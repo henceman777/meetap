@@ -2,11 +2,54 @@
 # MeeTap - macOS 会议录制 + 自动转录工具
 VERSION="0.2"
 
+# --- Config ---
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
+
+# Defaults
+CFG_REGION="us-east-1"
+CFG_LANGUAGE="zh-CN"
+CFG_MODEL="us.anthropic.claude-sonnet-4-6"
+CFG_TRANSCRIBE_LANGUAGES="en-US zh-CN ja-JP"
+CFG_RECORDING_DIR="$HOME/Record"
+CFG_MAX_SPEAKERS=10
+CFG_SILENCE_THRESHOLD=-50
+CFG_SILENCE_GRACE=120
+CFG_AUDIO_BITRATE="128k"
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        case "$key" in
+            region)                CFG_REGION="$val" ;;
+            language)              CFG_LANGUAGE="$val" ;;
+            model)                 CFG_MODEL="$val" ;;
+            transcribe_languages)  CFG_TRANSCRIBE_LANGUAGES="$val" ;;
+            recording_dir)         CFG_RECORDING_DIR="${val/#\~/$HOME}" ;;
+            max_speakers)          CFG_MAX_SPEAKERS="$val" ;;
+            silence_threshold)     CFG_SILENCE_THRESHOLD="$val" ;;
+            silence_grace)         CFG_SILENCE_GRACE="$val" ;;
+            audio_bitrate)         CFG_AUDIO_BITRATE="$val" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+load_config
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL="$SCRIPT_DIR/audio-multi-output"
 MONITOR="$SCRIPT_DIR/audio-monitor"
 VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
-RECORDING_DIR="$HOME/Record"
+RECORDING_DIR="$CFG_RECORDING_DIR"
 STATE_DIR="/tmp/meeting-record"
 
 mkdir -p "$RECORDING_DIR" "$STATE_DIR"
@@ -31,22 +74,18 @@ detect_meeting_apps() {
 }
 
 is_audio_silent() {
-    local SAMPLE_DURATION=5
-    local SILENCE_THRESHOLD=-50
     local mean_vol
-    mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t "$SAMPLE_DURATION" \
+    mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t 5 \
         -af volumedetect -f null /dev/null 2>&1 \
         | sed -n 's/.*mean_volume: \([-0-9.]*\).*/\1/p')
     if [[ -z "$mean_vol" ]]; then
         return 1
     fi
     local vol_int=${mean_vol%%.*}
-    [[ $vol_int -le $SILENCE_THRESHOLD ]]
+    [[ $vol_int -le $CFG_SILENCE_THRESHOLD ]]
 }
 
 autostop_daemon() {
-    local CHECK_INTERVAL=30
-    local SILENCE_GRACE=120
     local silence_start=""
 
     while true; do
@@ -59,8 +98,8 @@ autostop_daemon() {
                 silence_start=$(date +%s)
             fi
             local elapsed=$(( $(date +%s) - silence_start ))
-            if [[ $elapsed -ge $SILENCE_GRACE ]]; then
-                osascript -e "display notification \"持续静音 ${SILENCE_GRACE} 秒，自动停止录制\" with title \"MeeTap\"" 2>/dev/null
+            if [[ $elapsed -ge $CFG_SILENCE_GRACE ]]; then
+                osascript -e "display notification \"持续静音 ${CFG_SILENCE_GRACE} 秒，自动停止录制\" with title \"MeeTap\"" 2>/dev/null
                 "$0" stop
                 break
             fi
@@ -68,7 +107,7 @@ autostop_daemon() {
             silence_start=""
         fi
 
-        sleep $CHECK_INTERVAL
+        sleep 30
     done
 }
 
@@ -76,7 +115,7 @@ transcribe_recording() {
     local AUDIO_FILE="$1"
     local SESSION_DIR="$2"
     local LOG_FILE="$SESSION_DIR/transcribe.log"
-    local AWS_REGION="us-east-1"
+    local AWS_REGION="$CFG_REGION"
 
     exec > "$LOG_FILE" 2>&1
     echo "[$(date '+%H:%M:%S')] Transcription started"
@@ -113,12 +152,12 @@ transcribe_recording() {
     aws transcribe start-transcription-job \
         --transcription-job-name "$JOB_NAME" \
         --identify-language \
-        --language-options en-US zh-CN ja-JP \
+        --language-options $CFG_TRANSCRIBE_LANGUAGES \
         --media-format "mp4" \
         --media "{\"MediaFileUri\": \"s3://${BUCKET}/${AUDIO_BASENAME}\"}" \
         --output-bucket-name "$BUCKET" \
         --region "$AWS_REGION" \
-        --settings '{"ShowSpeakerLabels": true, "MaxSpeakerLabels": 10}' \
+        --settings "{\"ShowSpeakerLabels\": true, \"MaxSpeakerLabels\": $CFG_MAX_SPEAKERS}" \
         > /dev/null
 
     # Poll for completion
@@ -229,7 +268,7 @@ PYEOF
     echo "[$(date '+%H:%M:%S')] ✅ Transcription complete: $SESSION_DIR/transcript.txt"
     osascript -e "display notification \"转录完成，正在整理会议纪要...\" with title \"MeeTap\"" 2>/dev/null
 
-    # Generate meeting notes via Claude Sonnet 4.6 (Bedrock)
+    # Generate meeting notes via Bedrock
     summarize_transcript "$SESSION_DIR"
 }
 
@@ -238,8 +277,8 @@ summarize_transcript() {
     local TRANSCRIPT="$SESSION_DIR/transcript.txt"
     local SPEAKER_STATS="$SESSION_DIR/speaker-stats.txt"
     local OUTPUT="$SESSION_DIR/meeting-notes.md"
-    local AWS_REGION="us-east-1"
-    local MODEL_ID="us.anthropic.claude-sonnet-4-6"
+    local AWS_REGION="$CFG_REGION"
+    local MODEL_ID="$CFG_MODEL"
 
     if [[ ! -f "$TRANSCRIPT" ]]; then
         echo "[$(date '+%H:%M:%S')] ⚠️ transcript.txt not found, skipping summarization"
@@ -251,7 +290,7 @@ summarize_transcript() {
         return 1
     fi
 
-    echo "[$(date '+%H:%M:%S')] 📝 Generating meeting notes via Claude Sonnet 4.6 (stream)..."
+    echo "[$(date '+%H:%M:%S')] 📝 Generating meeting notes via $MODEL_ID (stream)..."
 
     local SESSION_NAME
     SESSION_NAME=$(basename "$SESSION_DIR")
@@ -518,7 +557,7 @@ start_recording() {
     ffmpeg -f avfoundation -i ":BlackHole 2ch" \
         -f avfoundation -i ":default" \
         -filter_complex amix=inputs=2:duration=longest \
-        -c:a aac -b:a 128k -ac 1 \
+        -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
         -movflags frag_keyframe+empty_moov \
         "$OUTPUT_FILE" \
         < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
@@ -821,21 +860,84 @@ case "${1:-}" in
     setup-wemeet)
         setup_wemeet
         ;;
+    config)
+        if [[ "${2:-}" == "init" ]]; then
+            config_dir="$(dirname "$CONFIG_FILE")"
+            mkdir -p "$config_dir"
+            if [[ -f "$CONFIG_FILE" ]]; then
+                echo "⚠️  配置文件已存在: $CONFIG_FILE"
+                echo "   如需重置，请先删除后重新运行 meetap config init"
+            else
+                cat > "$CONFIG_FILE" <<'CFGEOF'
+# MeeTap 配置文件
+# 取消注释并修改需要自定义的参数
+
+# AWS Region（影响 S3、Transcribe、Bedrock）
+# region = us-east-1
+
+# CLI 消息语言（预留，当前未生效）
+# language = zh-CN
+
+# Bedrock 会议纪要模型
+# model = us.anthropic.claude-sonnet-4-6
+
+# 转录语言候选（空格分隔，按优先级排列）
+# transcribe_languages = en-US zh-CN ja-JP
+
+# 录音存放目录
+# recording_dir = ~/Record
+
+# 说话人分离上限 (2-10)
+# max_speakers = 10
+
+# 静音自动停止: 阈值(dB)
+# silence_threshold = -50
+
+# 静音自动停止: 持续静音多少秒后停止
+# silence_grace = 120
+
+# 录音码率
+# audio_bitrate = 128k
+CFGEOF
+                echo "✅ 默认配置文件已生成: $CONFIG_FILE"
+                echo "   编辑后取消注释即可生效"
+            fi
+        else
+            echo "MeeTap v${VERSION} 当前配置"
+            echo "==============================="
+            if [[ -f "$CONFIG_FILE" ]]; then
+                echo "配置文件: $CONFIG_FILE"
+            else
+                echo "配置文件: (未创建，使用默认值)"
+            fi
+            echo ""
+            echo "  region                = $CFG_REGION"
+            echo "  language              = $CFG_LANGUAGE"
+            echo "  model                 = $CFG_MODEL"
+            echo "  transcribe_languages  = $CFG_TRANSCRIBE_LANGUAGES"
+            echo "  recording_dir         = $CFG_RECORDING_DIR"
+            echo "  max_speakers          = $CFG_MAX_SPEAKERS"
+            echo "  silence_threshold     = $CFG_SILENCE_THRESHOLD"
+            echo "  silence_grace         = $CFG_SILENCE_GRACE"
+            echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
+            echo ""
+            echo "运行 'meetap config init' 生成配置文件"
+        fi
+        ;;
     -v|--version|version)
         echo "MeeTap v${VERSION}"
         ;;
     *)
         echo "MeeTap v${VERSION} - macOS 会议录制 + 自动转录"
         echo ""
-        echo "用法: meetap {start|stop|status|setup|version}"
+        echo "用法: meetap {start|stop|status|setup|config|version}"
         echo ""
         echo "  start        开始录制（系统音频 + 麦克风）"
         echo "  stop         停止录制，恢复音频设备，自动转录"
         echo "  status       查看当前录制状态"
         echo "  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
-        echo "  setup-zoom   仅配置 Zoom"
-        echo "  setup-teams  仅配置 Teams"
-        echo "  setup-wemeet 仅配置腾讯会议"
+        echo "  config       显示当前配置"
+        echo "  config init  生成默认配置文件"
         echo "  version      显示版本号"
         echo ""
         echo "首次使用请先运行: meetap setup"
