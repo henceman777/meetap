@@ -132,7 +132,7 @@ transcribe_recording() {
         return 1
     fi
 
-    local BUCKET="meetap-transcribe-${ACCOUNT_ID}"
+    local BUCKET="meetap-transcribe-${ACCOUNT_ID}-${AWS_REGION}"
     local AUDIO_BASENAME
     AUDIO_BASENAME=$(basename "$AUDIO_FILE")
     local JOB_NAME="meetap-$(date +%Y%m%d-%H%M%S)-$$"
@@ -865,50 +865,51 @@ case "${1:-}" in
             config_dir="$(dirname "$CONFIG_FILE")"
             mkdir -p "$config_dir"
             if [[ -f "$CONFIG_FILE" ]]; then
-                echo "⚠️  配置文件已存在: $CONFIG_FILE"
-                echo "   如需重置，请先删除后重新运行 meetap config init"
+                echo "⚠️  Config file already exists: $CONFIG_FILE"
+                echo "   Delete it first and re-run 'meetap config init' to reset"
             else
                 cat > "$CONFIG_FILE" <<'CFGEOF'
-# MeeTap 配置文件
-# 取消注释并修改需要自定义的参数
+# MeeTap Configuration
+# Uncomment and modify parameters as needed
 
-# AWS Region（影响 S3、Transcribe、Bedrock）
+# AWS Region (affects S3, Transcribe, Bedrock)
 # region = us-east-1
 
-# CLI 消息语言（预留，当前未生效）
+# CLI display language (same codes as transcription languages)
 # language = zh-CN
 
-# Bedrock 会议纪要模型
+# Bedrock model for meeting notes generation
 # model = us.anthropic.claude-sonnet-4-6
 
-# 转录语言候选（空格分隔，按优先级排列）
+# Transcription languages (space-separated, priority order, AWS Transcribe codes)
+# Full list: https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html
 # transcribe_languages = en-US zh-CN ja-JP
 
-# 录音存放目录
+# Recording output directory
 # recording_dir = ~/Record
 
-# 说话人分离上限 (2-10)
+# Max speaker labels for speaker diarization (2-10)
 # max_speakers = 10
 
-# 静音自动停止: 阈值(dB)
+# Auto-stop silence detection threshold (dB)
 # silence_threshold = -50
 
-# 静音自动停止: 持续静音多少秒后停止
+# Auto-stop after N seconds of continuous silence
 # silence_grace = 120
 
-# 录音码率
+# Audio recording bitrate
 # audio_bitrate = 128k
 CFGEOF
-                echo "✅ 默认配置文件已生成: $CONFIG_FILE"
-                echo "   编辑后取消注释即可生效"
+                echo "✅ Config file created: $CONFIG_FILE"
+                echo "   Uncomment and edit to customize"
             fi
         else
-            echo "MeeTap v${VERSION} 当前配置"
-            echo "==============================="
+            echo "MeeTap v${VERSION} Configuration"
+            echo "================================="
             if [[ -f "$CONFIG_FILE" ]]; then
-                echo "配置文件: $CONFIG_FILE"
+                echo "Config file: $CONFIG_FILE"
             else
-                echo "配置文件: (未创建，使用默认值)"
+                echo "Config file: (not created, using defaults)"
             fi
             echo ""
             echo "  region                = $CFG_REGION"
@@ -921,7 +922,7 @@ CFGEOF
             echo "  silence_grace         = $CFG_SILENCE_GRACE"
             echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
             echo ""
-            echo "运行 'meetap config init' 生成配置文件"
+            echo "Run 'meetap config init' to generate config file"
         fi
         ;;
     -v|--version|version)
