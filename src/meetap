@@ -229,7 +229,7 @@ PYEOF
     echo "[$(date '+%H:%M:%S')] ✅ Transcription complete: $SESSION_DIR/transcript.txt"
     osascript -e "display notification \"转录完成，正在整理会议纪要...\" with title \"MeeTap\"" 2>/dev/null
 
-    # Generate meeting notes via Claude Sonnet 4.6 (Bedrock)
+    # Generate meeting notes via Claude Opus 4.7 (Bedrock)
     summarize_transcript "$SESSION_DIR"
 }
 
@@ -251,7 +251,7 @@ summarize_transcript() {
         return 1
     fi
 
-    echo "[$(date '+%H:%M:%S')] 📝 Generating meeting notes via Claude Sonnet 4.6 (stream)..."
+    echo "[$(date '+%H:%M:%S')] 📝 Generating meeting notes via Claude Opus 4.7 (stream)..."
 
     local SESSION_NAME
     SESSION_NAME=$(basename "$SESSION_DIR")
