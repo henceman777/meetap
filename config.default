@@ -7,7 +7,10 @@ region = us-east-1
 # CLI display language (same codes as transcription languages)
 language = en-US
 
-# Bedrock model for meeting notes generation
+# Backend for meeting notes generation (bedrock | claude-code)
+ai_backend = bedrock
+
+# Bedrock model (only used when ai_backend = bedrock)
 model = us.anthropic.claude-sonnet-4-6
 
 # Transcription languages (space-separated, priority order, AWS Transcribe codes)
