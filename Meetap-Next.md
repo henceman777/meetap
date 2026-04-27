@@ -11,7 +11,7 @@
 | [A. 架构与技术栈](#a-架构与技术栈) | 2 | 2026-04-25 |
 | [B. 分发与安装](#b-分发与安装) | 1 | 2026-04-25 |
 | [C. 录制与音频](#c-录制与音频) | 0 | — |
-| [D. 转录与语音识别](#d-转录与语音识别) | 1 | 2026-04-27 |
+| [D. 转录与语音识别](#d-转录与语音识别) | 2 | 2026-04-27 |
 | [E. 纪要生成（AI 后端）](#e-纪要生成ai-后端) | 2 | 2026-04-26 |
 | [F. 纪要质量（模板与 Prompt）](#f-纪要质量模板与-prompt) | 12 | 2026-04-26 |
 | [G. 用户体验与交互](#g-用户体验与交互) | 0 | — |
@@ -225,6 +225,106 @@ ffmpeg → 本地 .m4a → 上传 S3 → Transcribe 成功 → rm 本地 .m4a
 **第一步落地方案 C**（转写后删除）——一行代码，立即可用，覆盖 80% 需求。config 加 `audio_persist = true | false`。
 
 **后续如有严格零落盘需求**，再评估方案 B（RAM disk）。方案 A（Streaming API）因 speaker diarization 能力折损，暂不推荐。
+
+---
+
+### D-2. Whisper + pyannote 替代 AWS Transcribe
+
+- **日期**：2026-04-27
+- **状态**：🔍 评估中
+- **优先级**：P1
+- **实施方式**：需要代码改动
+
+**问题**：AWS Transcribe 占 meetap 运行成本的 86%（$24/月 @ 1000 分钟）。本地开源方案 Whisper + pyannote 可将转写成本降至 $0，同时获得离线能力。
+
+#### 功能对比
+
+| 功能 | AWS Transcribe | Whisper + pyannote | 影响 |
+|------|---------------|-------------------|------|
+| 语音转文字 | 原生 | Whisper 原生 | ✅ 无损替代 |
+| 说话人分离 | 内置，质量好 | pyannote 3.1，质量接近 | ⚠️ 基本持平，极短发言略弱 |
+| 自动语言检测 | `--identify-language` | Whisper 原生支持 | ✅ 无损替代 |
+| 多语言混合 | `--identify-multiple-languages` | Whisper 原生，更强 | ✅ 甚至更好 |
+| 词级时间戳 | 支持 | Whisper 支持 | ✅ 无损替代 |
+| 重叠语音 | 不支持 | pyannote 3.x 支持 | ✅ 更好 |
+
+**说话人分离质量**：pyannote DER（Diarization Error Rate）约 5-8%，Transcribe 约 5-10%，基本持平。不影响纪要生成质量。
+
+#### 运维对比
+
+| 维度 | AWS Transcribe | Whisper + pyannote |
+|------|---------------|-------------------|
+| 硬件要求 | 无（云端） | 需 GPU 或强 CPU |
+| 处理速度（30 分钟音频） | ~3 分钟（含上传） | GPU: ~2-3 分钟，CPU: ~5-8 分钟 |
+| 安装复杂度 | `pip install boto3` | `pip install openai-whisper pyannote.audio torch` + 模型下载 (~3GB) |
+| 离线能力 | 需联网 | 完全离线 |
+| 稳定性 | 高（托管服务） | 依赖本地环境（CUDA/MPS 版本、内存） |
+
+**M1/M2 Mac 加速**：Whisper.cpp（C++ 实现）在 Apple Silicon 上利用 Neural Engine / CoreML，处理速度接近实时。pyannote 也支持 MPS 后端。
+
+#### 成本对比（1000 分钟/月）
+
+| 方案 | 转写成本 | Bedrock 成本 | 合计 | 节省 |
+|------|---------|-------------|------|------|
+| 当前（Transcribe） | $24.00 | $3.66 | **$27.66** | — |
+| Whisper + pyannote | $0 | $3.66 | **$3.66** | **-87%** |
+| 全本地化（+ Ollama） | $0 | $0 | **$0** | -100% |
+
+#### 代码影响
+
+改动范围限于 `transcribe_recording()` 函数（src/meetap 约 160 行）。接口不变——输入音频文件，输出 `transcript.txt`（带 speaker label）。下游的 `build_prompt()` 和纪要生成完全不受影响。
+
+#### 实现思路
+
+**第一步：新增 `backend_whisper()` 函数**
+
+```python
+# 伪代码
+def backend_whisper(audio_file, session_dir):
+    # 1. Whisper 转写
+    model = whisper.load_model("large-v3")
+    result = model.transcribe(audio_file, word_timestamps=True)
+
+    # 2. pyannote 说话人分离
+    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+    diarization = pipeline(audio_file)
+
+    # 3. 合并：将 Whisper 的词级时间戳与 pyannote 的说话人段对齐
+    transcript = align_speakers(result, diarization)
+
+    # 4. 输出 transcript.txt（格式与 Transcribe 输出一致）
+    write_transcript(transcript, session_dir)
+```
+
+**第二步：config 新增 `transcribe_backend`**
+
+```ini
+# ~/.config/meetap/config
+transcribe_backend = transcribe    # 可选值: transcribe | whisper
+```
+
+**第三步：首次使用自动下载模型**
+
+首次运行时检测模型是否存在，不存在则提示下载（Whisper large-v3 ~3GB，pyannote ~100MB）。
+
+#### 风险
+
+1. **安装门槛高**：torch + pyannote + whisper 的依赖链复杂，pip 冲突风险大。建议用独立 venv 或 conda 环境
+2. **CPU 模式慢**：无 GPU 的旧 Mac 上处理 1 小时音频可能需要 15-20 分钟
+3. **pyannote 许可证**：pyannote 3.x 需在 Hugging Face 接受模型许可协议（免费但需账号）
+4. **内存占用**：Whisper large-v3 + pyannote 同时加载需 ~6-8GB RAM
+
+#### 收敛建议
+
+- 作为 **可选后端**（`transcribe_backend = whisper`），不替代 Transcribe 默认值
+- 优先支持 Apple Silicon Mac（M1/M2/M3），利用 MPS/CoreML 加速
+- 降级策略：Whisper 失败时自动 fallback 到 Transcribe
+
+#### 与其他条目的关系
+
+- **D-1**（音频不落盘）→ Whisper 本地转写天然不需要 S3 上传，方案 C（转写后删除）同样适用
+- **E-2**（AI 后端可插拔）→ 转写层同样需要可插拔设计，复用相同的配置模式
+- **Meetap-Cost.md** → 详细成本对比数据见该文档
 
 ---
 
@@ -983,7 +1083,7 @@ meetap send <session-dir>      # 手动发送已有纪要
 | 优先级 | 条目 | 说明 |
 |--------|------|------|
 | P0 | F-1, F-2, F-3, F-5, F-12 | Action Items 强化 + 情绪地图 + 历史回顾 + 类型感知 |
-| P1 | A-1, E-1, E-2, F-6, F-7, F-9, H-1 | 架构评估 + AI 后端可插拔 + 纪要结构增强 + 邮件发送 |
+| P1 | A-1, D-2, E-1, E-2, F-6, F-7, F-9, H-1 | 架构评估 + Whisper 替代 Transcribe + AI 后端可插拔 + 纪要结构增强 + 邮件发送 |
 | P2 | B-1, D-1, F-4, F-8, F-10, F-11 | 分发打包 + 音频不落盘 + 低优纪要优化 |
 
 ### 按实施方式
@@ -991,7 +1091,7 @@ meetap send <session-dir>      # 手动发送已有纪要
 | 方式 | 条目 |
 |------|------|
 | 纯 prompt 改动 | F-1, F-3, F-4, F-5, F-6, F-7, F-8, F-9, F-11, F-12 |
-| 需要代码改动 | D-1, E-2, F-2, F-10, F-12(可选 --type 参数), H-1 |
+| 需要代码改动 | D-1, D-2, E-2, F-2, F-10, F-12(可选 --type 参数), H-1 |
 | 独立工程任务 | A-1, B-1, E-1 |
 
 ---
