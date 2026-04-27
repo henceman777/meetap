@@ -11,11 +11,11 @@
 | [A. 架构与技术栈](#a-架构与技术栈) | 2 | 2026-04-25 |
 | [B. 分发与安装](#b-分发与安装) | 1 | 2026-04-25 |
 | [C. 录制与音频](#c-录制与音频) | 0 | — |
-| [D. 转录与语音识别](#d-转录与语音识别) | 0 | — |
+| [D. 转录与语音识别](#d-转录与语音识别) | 1 | 2026-04-27 |
 | [E. 纪要生成（AI 后端）](#e-纪要生成ai-后端) | 2 | 2026-04-26 |
 | [F. 纪要质量（模板与 Prompt）](#f-纪要质量模板与-prompt) | 12 | 2026-04-26 |
 | [G. 用户体验与交互](#g-用户体验与交互) | 0 | — |
-| [H. 集成与生态](#h-集成与生态) | 0 | — |
+| [H. 集成与生态](#h-集成与生态) | 1 | 2026-04-27 |
 
 ---
 
@@ -153,7 +153,78 @@ brew install meetap
 
 涉及 ASR 引擎选型、说话人分离、多语言支持、转录精度优化等话题。
 
-> 暂无条目。新增时从 D-1 开始编号。
+### D-1. 音频不落盘转写
+
+- **日期**：2026-04-27
+- **状态**：🔍 评估中
+- **优先级**：P2
+- **实施方式**：需要代码改动
+
+**问题**：当前流程 `ffmpeg 录音 → 本地 .m4a → 上传 S3 → Transcribe → 下载结果`，会议音频始终保留在本地磁盘。部分用户（合规敏感、磁盘空间有限、隐私偏好）希望音频"过手即弃"——转写完成后本地不残留音频文件。
+
+#### 方案 A：流式转写（Transcribe Streaming API）
+
+ffmpeg 的音频输出通过管道直接喂给 AWS Transcribe Streaming API，完全不产生本地文件。
+
+```
+ffmpeg → pipe:1 (PCM) → boto3 TranscribeStreamingClient → 实时返回文本
+```
+
+**优点**：
+- 真正的零落盘，音频数据只在内存中流过
+- 转写延迟更低（边录边转，不用等录完再上传）
+
+**缺点**：
+- Streaming API 的说话人分离（speaker diarization）能力弱于批量 API
+- 不支持 `--identify-language`（自动语言检测），需预设语言
+- ffmpeg 输出格式需改为 PCM（Streaming API 不支持 m4a/mp4）
+- 网络中断 = 丢失已录部分，无法重试
+
+**技术要点**：
+- ffmpeg 输出 `-f s16le -ar 16000 -ac 1 pipe:1`，通过 Python subprocess 读取 stdin
+- boto3 `transcribe-streaming` 的 `start_stream_transcription()` 接收 audio chunks
+- 需处理 WebSocket 断连重连
+
+#### 方案 B：内存文件系统中转（推荐）
+
+录音写入 macOS 的 tmpfs（`/dev/shm` 或 RAM disk），转写完成后自动清除。严格说不是"完全不落盘"（数据经过内存文件系统），但对用户来说等效——录音结束后本地无文件残留。
+
+```
+ffmpeg → /tmp/meetap-ram/meeting.m4a → 上传 S3 → Transcribe → 删除 RAM 文件
+```
+
+**优点**：
+- 对现有代码改动最小（只改录音路径）
+- 保留批量 Transcribe API 的全部能力（speaker diarization、auto language detection）
+- 可靠性与现有流程一致
+
+**缺点**：
+- macOS 没有原生 `/dev/shm`，需要 `hdiutil` 或 `diskutil` 创建 RAM disk
+- 长时间会议的音频可能占用较多内存（1 小时 ≈ 60MB @ 128kbps）
+- 异常退出（crash/断电）时音频不可恢复
+
+**技术要点**：
+- 创建 RAM disk：`hdiutil attach -nomount ram://$(( SIZE_MB * 2048 ))`
+- 或使用 `/tmp`（macOS 的 `/tmp` 是 tmpfs，重启即清除），配合录制结束后主动删除
+- config 新增 `audio_persist = true | false`，默认 `true`（保持现有行为）
+
+#### 方案 C：混合方案——先落盘，转写后删除
+
+最简单：现有流程不变，转写成功后自动删除本地音频文件。
+
+```
+ffmpeg → 本地 .m4a → 上传 S3 → Transcribe 成功 → rm 本地 .m4a
+```
+
+**优点**：零代码风险，只在 `transcribe_recording()` 末尾加一行 `rm`
+
+**缺点**：音频曾短暂存在于磁盘（严格合规场景不满足）
+
+#### 收敛建议
+
+**第一步落地方案 C**（转写后删除）——一行代码，立即可用，覆盖 80% 需求。config 加 `audio_persist = true | false`。
+
+**后续如有严格零落盘需求**，再评估方案 B（RAM disk）。方案 A（Streaming API）因 speaker diarization 能力折损，暂不推荐。
 
 ---
 
@@ -822,7 +893,86 @@ meetap stop --type decision      # 手动指定为决策评审
 
 涉及与日历、Slack、邮件、项目管理工具等外部系统的集成。
 
-> 暂无条目。新增时从 H-1 开始编号。
+### H-1. 会议纪要邮件发送
+
+- **日期**：2026-04-27
+- **状态**：💡 待实施
+- **优先级**：P1
+- **实施方式**：需要代码改动
+
+**问题**：会议纪要生成后仅保存在本地文件系统，用户需要手动复制分发给参会者。
+
+#### 配置
+
+`~/.config/meetap/config` 新增：
+
+```ini
+email = alice@example.com, bob@example.com
+email_subject_prefix = [MeeTap]
+```
+
+- `email`：收件人列表，逗号分隔，可配多个
+- `email_subject_prefix`：邮件主题前缀，默认 `[MeeTap]`
+- 邮件主题自动生成：`{prefix} {会议标题}`（从 meeting-notes.md 的 H1 标题提取）
+
+#### 发送方式评估
+
+| 方案 | 依赖 | 配置复杂度 | 适用场景 |
+|------|------|-----------|----------|
+| **AWS SES**（推荐） | boto3 + 已验证发件人 | 低（已有 AWS 凭证） | AWS 用户，已配置 SES |
+| **msmtp / mailx** | 系统工具 + SMTP 配置 | 中 | 通用，需配 SMTP 服务器 |
+| **Python smtplib** | 无额外依赖 | 中 | 通用，需配 SMTP 凭证 |
+| **macOS Mail.app** | AppleScript / osascript | 低 | Mac 用户，Mail.app 已登录 |
+
+#### 推荐实现（AWS SES）
+
+meetap 用户已有 AWS 凭证（Transcribe 和 Bedrock 都需要），SES 是最自然的选择。
+
+```python
+import boto3
+
+def send_meeting_notes(session_dir, recipients, region):
+    notes_path = os.path.join(session_dir, "meeting-notes.md")
+    with open(notes_path) as f:
+        content = f.read()
+
+    title = content.split('\n')[0].lstrip('# ').strip()
+    subject = f"[MeeTap] {title}"
+
+    ses = boto3.client('ses', region_name=region)
+    ses.send_email(
+        Source=sender,  # 需 SES 验证
+        Destination={'ToAddresses': recipients},
+        Message={
+            'Subject': {'Data': subject},
+            'Body': {
+                'Text': {'Data': content},
+                'Html': {'Data': markdown_to_html(content)}
+            }
+        }
+    )
+```
+
+**技术要点**：
+- 发件人地址需在 SES 中预先验证（或 SES 已移出沙盒模式）
+- config 可选 `email_sender`，默认用 SES 已验证的地址
+- Markdown → HTML 转换：用 Python `markdown` 库（已在 venv 中）或简单正则
+- 发送时机：在 `summarize_transcript()` 成功后自动调用
+- 失败不阻塞：发送失败只打日志和通知，不影响纪要文件生成
+
+#### CLI 交互
+
+```bash
+meetap stop                    # 转写 + 纪要 + 自动发邮件（如已配置 email）
+meetap stop --no-email         # 转写 + 纪要，不发邮件
+meetap send <session-dir>      # 手动发送已有纪要
+```
+
+#### 后续增强
+
+- 支持附件模式（将 .md 作为附件而非正文）
+- 支持 Slack webhook 发送（新增 `slack_webhook` 配置项）
+- 支持自定义邮件模板
 
 ---
 
@@ -833,15 +983,15 @@ meetap stop --type decision      # 手动指定为决策评审
 | 优先级 | 条目 | 说明 |
 |--------|------|------|
 | P0 | F-1, F-2, F-3, F-5, F-12 | Action Items 强化 + 情绪地图 + 历史回顾 + 类型感知 |
-| P1 | A-1, E-1, E-2, F-6, F-7, F-9 | 架构评估 + AI 后端可插拔 + 纪要结构增强 |
-| P2 | B-1, F-4, F-8, F-10, F-11 | 分发打包 + 低优纪要优化 |
+| P1 | A-1, E-1, E-2, F-6, F-7, F-9, H-1 | 架构评估 + AI 后端可插拔 + 纪要结构增强 + 邮件发送 |
+| P2 | B-1, D-1, F-4, F-8, F-10, F-11 | 分发打包 + 音频不落盘 + 低优纪要优化 |
 
 ### 按实施方式
 
 | 方式 | 条目 |
 |------|------|
 | 纯 prompt 改动 | F-1, F-3, F-4, F-5, F-6, F-7, F-8, F-9, F-11, F-12 |
-| 需要代码改动 | E-2, F-2, F-10, F-12(可选 --type 参数) |
+| 需要代码改动 | D-1, E-2, F-2, F-10, F-12(可选 --type 参数), H-1 |
 | 独立工程任务 | A-1, B-1, E-1 |
 
 ---
