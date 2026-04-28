@@ -66,6 +66,7 @@ ORIGINAL_NAME_FILE="$STATE_DIR/original-output.name"
 OUTPUT_FILE_MARKER="$STATE_DIR/output-file"
 AUTOSTOP_PID_FILE="$STATE_DIR/autostop.pid"
 MEETING_APPS_FILE="$STATE_DIR/meeting-apps"
+VISUALIZER_PID_FILE="$STATE_DIR/visualizer.pid"
 
 KNOWN_MEETING_APPS="zoom.us|Microsoft Teams|TencentMeeting|Webex|Lark|Feishu|DingTalk|Slack"
 
@@ -75,6 +76,68 @@ detect_meeting_apps() {
         [[ -n "$proc" ]] && found="${found:+$found,}$proc"
     done < <(ps -eo comm= | grep -oE "$KNOWN_MEETING_APPS" | sort -u)
     echo "$found"
+}
+
+audio_visualizer() {
+    local DOTS=("⠁" "⠂" "⠄" "⡀" "⡁" "⡂" "⡄" "⣀" "⣁" "⣂" "⣄" "⣠" "⣡" "⣢" "⣤" "⣰" "⣱" "⣲" "⣴" "⣸" "⣹" "⣺" "⣼" "⣾" "⣿")
+    local MAX_IDX=$(( ${#DOTS[@]} - 1 ))
+    local WIDTH=40
+    local history=()
+    for ((i=0; i<WIDTH; i++)); do history+=(0); done
+
+    tput civis 2>/dev/null
+
+    cleanup_vis() {
+        tput cnorm 2>/dev/null
+        printf "\r\033[K"
+    }
+    trap cleanup_vis EXIT
+
+    while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
+        local rms
+        rms=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t 0.3 \
+            -af astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level \
+            -f null /dev/null 2>&1 \
+            | sed -n 's/.*RMS_level=\([-0-9.]*\).*/\1/p' | tail -1)
+
+        if [[ -z "$rms" ]]; then
+            rms="-91"
+        fi
+
+        local vol_int=${rms%%.*}
+        vol_int=${vol_int#-}
+        local level
+        if [[ $vol_int -ge 90 ]]; then
+            level=0
+        elif [[ $vol_int -le 5 ]]; then
+            level=$MAX_IDX
+        else
+            level=$(( (90 - vol_int) * MAX_IDX / 85 ))
+        fi
+
+        history=("${history[@]:1}" "$level")
+
+        local bar=""
+        for ((i=0; i<WIDTH; i++)); do
+            local idx=${history[$i]}
+            bar="${bar}${DOTS[$idx]}"
+        done
+
+        local elapsed=""
+        if [[ -f "$PID_FILE" ]]; then
+            local start_time
+            start_time=$(stat -f %m "$PID_FILE" 2>/dev/null)
+            if [[ -n "$start_time" ]]; then
+                local now=$(date +%s)
+                local secs=$(( now - start_time ))
+                elapsed=$(printf "%02d:%02d" $((secs/60)) $((secs%60)))
+            fi
+        fi
+
+        printf "\r\033[K   🎙️ %s ⏱ %s" "$bar" "$elapsed"
+    done
+
+    cleanup_vis
 }
 
 is_audio_silent() {
@@ -448,7 +511,7 @@ ${speaker_stats}
 
 ---
 
-*— Listen · Analyze · Recap · Refine · Yield — Your Audio Notes Generator · [meetap](https://github.com/henceman777/meetap) —*
+*— **L**isten · **A**nalyze · **R**ecap · **R**efine · **Y**ield — **Y**our **A**udio **N**otes **G**enerator · [Meetap](https://github.com/henceman777/meetap) —*
 \`\`\`
 
 ## 注意事项
@@ -693,6 +756,12 @@ start_recording() {
         echo "   自动停止: 持续静音 2 分钟后"
         echo ""
         echo "   停止录制: $0 stop"
+        echo ""
+
+        audio_visualizer &
+        VISUALIZER_PID=$!
+        echo $VISUALIZER_PID > "$VISUALIZER_PID_FILE"
+        disown $VISUALIZER_PID
     else
         echo "❌ ffmpeg 启动失败:"
         cat "$STATE_DIR/ffmpeg.log"
@@ -705,6 +774,14 @@ start_recording() {
 }
 
 stop_recording() {
+    # 停止音频可视化
+    if [[ -f "$VISUALIZER_PID_FILE" ]]; then
+        kill "$(cat "$VISUALIZER_PID_FILE")" 2>/dev/null
+        rm -f "$VISUALIZER_PID_FILE"
+        tput cnorm 2>/dev/null
+        printf "\r\033[K"
+    fi
+
     # 停止自动停止守护进程
     if [[ -f "$AUTOSTOP_PID_FILE" ]]; then
         kill "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null
