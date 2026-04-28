@@ -688,6 +688,9 @@ summarize_transcript() {
 }
 
 start_recording() {
+    local VERBOSE=false
+    [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]] && VERBOSE=true
+
     # 检查是否已在录制
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo "⚠️  已有录制进程在运行 (PID: $(cat "$PID_FILE"))"
@@ -728,28 +731,28 @@ start_recording() {
         if [[ -f "$ORIGINAL_UID_FILE" ]]; then
             ORIG_UID=$(cat "$ORIGINAL_UID_FILE")
             ORIG_NAME=$(cat "$ORIGINAL_NAME_FILE" 2>/dev/null || echo "$ORIG_UID")
-            echo "📍 当前音频输出: BlackHole (实际设备: $ORIG_NAME)"
+            $VERBOSE && echo "📍 当前音频输出: BlackHole (实际设备: $ORIG_NAME)"
         else
             echo "⚠️  当前输出是 BlackHole，请先切回正常扬声器/耳机"
             exit 1
         fi
     else
-        echo "📍 当前音频输出: $ORIG_NAME"
+        $VERBOSE && echo "📍 当前音频输出: $ORIG_NAME"
     fi
 
     echo "$ORIG_UID" > "$ORIGINAL_UID_FILE"
     echo "$ORIG_NAME" > "$ORIGINAL_NAME_FILE"
 
     # 切换系统输出到 BlackHole
-    echo "🔧 切换系统输出到 BlackHole 2ch ..."
+    $VERBOSE && echo "🔧 切换系统输出到 BlackHole 2ch ..."
     if ! SwitchAudioSource -s "BlackHole 2ch" -t output &>/dev/null; then
         echo "❌ 无法切换到 BlackHole"
         exit 1
     fi
-    echo "✅ 系统输出已切换到: BlackHole 2ch"
+    $VERBOSE && echo "✅ 系统输出已切换到: BlackHole 2ch"
 
     # 启动 audio-monitor：BlackHole → 原始设备（实时转发，用户能听到）
-    echo "🔧 启动音频转发: BlackHole → $ORIG_NAME ..."
+    $VERBOSE && echo "🔧 启动音频转发: BlackHole → $ORIG_NAME ..."
     "$MONITOR" "$BH_UID" "$ORIG_UID" > "$STATE_DIR/monitor.log" 2>&1 &
     MONITOR_PID=$!
     echo $MONITOR_PID > "$MONITOR_PID_FILE"
@@ -763,7 +766,7 @@ start_recording() {
         rm -f "$MONITOR_PID_FILE"
         exit 1
     fi
-    echo "✅ 音频转发已启动 → $ORIG_NAME"
+    $VERBOSE && echo "✅ 音频转发已启动 → $ORIG_NAME"
 
     # 创建本次录制的会话目录
     SESSION_DIR="$RECORDING_DIR/$(date +"%Y%m%d_%H%M")"
@@ -778,7 +781,7 @@ start_recording() {
     # 开始录制（系统音频 + 麦克风混录）
     local MIC_NAME
     MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
-    echo "🎤 麦克风: $MIC_NAME"
+    $VERBOSE && echo "🎤 麦克风: $MIC_NAME"
     ffmpeg -f avfoundation -i ":BlackHole 2ch" \
         -f avfoundation -i ":default" \
         -filter_complex amix=inputs=2:duration=longest \
@@ -1088,7 +1091,7 @@ setup_apps() {
 
 case "${1:-}" in
     start)
-        start_recording
+        start_recording "${2:-}"
         ;;
     stop)
         stop_recording
@@ -1194,7 +1197,7 @@ CFGEOF
         echo ""
         echo "用法: meetap {start|stop|status|setup|config|version}"
         echo ""
-        echo "  start        开始录制（系统音频 + 麦克风）"
+        echo "  start [-t]   开始录制（-t 显示详细设备信息）"
         echo "  stop         停止录制，恢复音频设备，自动转录"
         echo "  status       查看当前录制状态"
         echo "  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
