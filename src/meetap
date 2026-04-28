@@ -808,6 +808,8 @@ stop_recording() {
         ORIG_NAME=$(cat "$ORIGINAL_NAME_FILE")
         if SwitchAudioSource -s "$ORIG_NAME" -t output &>/dev/null; then
             echo "🔊 音频输出已恢复: $ORIG_NAME"
+        elif SwitchAudioSource -s "MacBook Pro Speakers" -t output &>/dev/null; then
+            echo "⚠️  原始设备 ($ORIG_NAME) 已断开，已切换到: MacBook Pro Speakers"
         else
             echo "⚠️  原始设备 ($ORIG_NAME) 已断开，请手动选择输出设备"
         fi
