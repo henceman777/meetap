@@ -17,6 +17,7 @@ CFG_SILENCE_GRACE=120
 CFG_AUDIO_BITRATE="128k"
 CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
+CFG_VISUALIZER="spectrum"
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
@@ -43,6 +44,7 @@ load_config() {
             audio_bitrate)         CFG_AUDIO_BITRATE="$val" ;;
             multi_language)        CFG_MULTI_LANGUAGE="$val" ;;
             ai_backend)            CFG_AI_BACKEND="$val" ;;
+            visualizer)            CFG_VISUALIZER="$val" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -78,12 +80,24 @@ detect_meeting_apps() {
 }
 
 audio_visualizer() {
-    local BARS=("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█")
-    local MAX_IDX=$(( ${#BARS[@]} - 1 ))
+    local style="${CFG_VISUALIZER:-spectrum}"
     local WIDTH=30
     local history=()
     for ((i=0; i<WIDTH; i++)); do history+=(0); done
     local START_TS=$(date +%s)
+
+    local CHARS
+    case "$style" in
+        bar)
+            CHARS=("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█") ;;
+        dot)
+            CHARS=("⠀" "⡀" "⡄" "⡆" "⡇" "⣇" "⣷" "⣿") ;;
+        block)
+            CHARS=(" " "░" "░" "▒" "▒" "▓" "▓" "█") ;;
+        spectrum|*)
+            CHARS=("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█") ;;
+    esac
+    local MAX_IDX=$(( ${#CHARS[@]} - 1 ))
 
     tput civis 2>/dev/null
     trap 'tput cnorm 2>/dev/null; printf "\r\033[K"' EXIT INT TERM
@@ -110,15 +124,28 @@ audio_visualizer() {
         history=("${history[@]:1}" "$level")
 
         local bar=""
-        for ((i=0; i<WIDTH; i++)); do
-            bar="${bar}${BARS[${history[$i]}]}"
-        done
+        if [[ "$style" == "spectrum" ]]; then
+            for ((i=0; i<WIDTH; i++)); do
+                local l=${history[$i]}
+                local c
+                if [[ $l -le 2 ]]; then   c="\033[32m"
+                elif [[ $l -le 4 ]]; then  c="\033[33m"
+                elif [[ $l -le 5 ]]; then  c="\033[38;5;208m"
+                else                        c="\033[31m"
+                fi
+                bar="${bar}${c}${CHARS[$l]}\033[0m"
+            done
+        else
+            for ((i=0; i<WIDTH; i++)); do
+                bar="${bar}${CHARS[${history[$i]}]}"
+            done
+        fi
 
         local now=$(date +%s)
         local secs=$(( now - START_TS ))
         local elapsed=$(printf "%02d:%02d" $((secs/60)) $((secs%60)))
 
-        printf "\r\033[K   🎙️ %s  %s" "$bar" "$elapsed"
+        printf "\r\033[K   🎙️ ${bar}  %s" "$elapsed"
     done
 }
 
@@ -1070,6 +1097,8 @@ ai_backend = bedrock
 # ── Display ──────────────────────────────────────────────────
 # CLI display language
 # language = zh-CN
+# Audio visualizer style: spectrum (color bars) | bar | dot | block
+# visualizer = spectrum
 CFGEOF
                 echo "✅ Config file created: $CONFIG_FILE"
                 echo "   Uncomment and edit to customize"
@@ -1094,6 +1123,7 @@ CFGEOF
             echo "  silence_grace         = $CFG_SILENCE_GRACE"
             echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
             echo "  multi_language        = $CFG_MULTI_LANGUAGE"
+            echo "  visualizer            = $CFG_VISUALIZER"
             echo ""
             echo "Run 'meetap config init' to generate config file"
         fi
