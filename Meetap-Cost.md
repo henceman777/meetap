@@ -149,4 +149,4 @@ meetap 按 AWS 用量计费，无 seat 限制。核心成本来自三个 AWS 服
 | **数据合规要求高** | **meetap** | 数据不离开自有 AWS 账户 |
 | **零成本追求** | meetap + Whisper 本地 + Ollama | 需自行搭建，有质量折损 |
 
-*— **L**isten · **A**nalyze · **R**ecap · **R**efine · **Y**ield — **Y**our **A**udio **N**otes **G**enerator · [Meetap](https://github.com/henceman777/meetap) —*
+*—— **L**isten · **A**nalyze · **R**ecap · **R**efine · **Y**ield · [Meetap](https://github.com/henceman777/meetap) · **Y**our **A**udio **N**otes **G**enerator ——*

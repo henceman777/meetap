@@ -66,7 +66,6 @@ ORIGINAL_NAME_FILE="$STATE_DIR/original-output.name"
 OUTPUT_FILE_MARKER="$STATE_DIR/output-file"
 AUTOSTOP_PID_FILE="$STATE_DIR/autostop.pid"
 MEETING_APPS_FILE="$STATE_DIR/meeting-apps"
-VISUALIZER_PID_FILE="$STATE_DIR/visualizer.pid"
 
 KNOWN_MEETING_APPS="zoom.us|Microsoft Teams|TencentMeeting|Webex|Lark|Feishu|DingTalk|Slack"
 
@@ -511,7 +510,7 @@ ${speaker_stats}
 
 ---
 
-*— **L**isten · **A**nalyze · **R**ecap · **R**efine · **Y**ield — **Y**our **A**udio **N**otes **G**enerator · [Meetap](https://github.com/henceman777/meetap) —*
+*—— **L**isten · **A**nalyze · **R**ecap · **R**efine · **Y**ield · [Meetap](https://github.com/henceman777/meetap) · **Y**our **A**udio **N**otes **G**enerator ——*
 \`\`\`
 
 ## 注意事项
@@ -705,6 +704,7 @@ start_recording() {
     "$MONITOR" "$BH_UID" "$ORIG_UID" > "$STATE_DIR/monitor.log" 2>&1 &
     MONITOR_PID=$!
     echo $MONITOR_PID > "$MONITOR_PID_FILE"
+    disown $MONITOR_PID
     sleep 1
 
     if ! kill -0 $MONITOR_PID 2>/dev/null; then
@@ -740,6 +740,7 @@ start_recording() {
 
     FFMPEG_PID=$!
     echo $FFMPEG_PID > "$PID_FILE"
+    disown $FFMPEG_PID
 
     sleep 1
     if kill -0 $FFMPEG_PID 2>/dev/null; then
@@ -758,10 +759,7 @@ start_recording() {
         echo "   停止录制: $0 stop"
         echo ""
 
-        audio_visualizer &
-        VISUALIZER_PID=$!
-        echo $VISUALIZER_PID > "$VISUALIZER_PID_FILE"
-        disown $VISUALIZER_PID
+        audio_visualizer
     else
         echo "❌ ffmpeg 启动失败:"
         cat "$STATE_DIR/ffmpeg.log"
