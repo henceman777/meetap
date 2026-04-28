@@ -250,7 +250,7 @@ transcribe_recording() {
         return 1
     fi
 
-    if [[ "$CFG_AUDIO_PERSIST" != "true" ]]; then
+    if [[ "$CFG_AUDIO_PERSIST" != "true" && ! -f "$STATE_DIR/test-mode" ]]; then
         rm -f "$AUDIO_FILE"
         echo "[$(date '+%H:%M:%S')] 🗑️ Local audio deleted (audio_persist=false)"
     fi
@@ -696,7 +696,12 @@ summarize_transcript() {
 
 start_recording() {
     local VERBOSE=false
-    [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]] && VERBOSE=true
+    if [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]]; then
+        VERBOSE=true
+        echo "true" > "$STATE_DIR/test-mode"
+    else
+        rm -f "$STATE_DIR/test-mode"
+    fi
 
     # 检查是否已在录制
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
