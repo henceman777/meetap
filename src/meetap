@@ -18,6 +18,7 @@ CFG_AUDIO_BITRATE="128k"
 CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
 CFG_VISUALIZER="dot"
+CFG_AUDIO_PERSIST=false
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
@@ -45,6 +46,7 @@ load_config() {
             multi_language)        CFG_MULTI_LANGUAGE="$val" ;;
             ai_backend)            CFG_AI_BACKEND="$val" ;;
             visualizer)            CFG_VISUALIZER="$val" ;;
+            audio_persist)         CFG_AUDIO_PERSIST="$val" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -246,6 +248,11 @@ transcribe_recording() {
     if ! aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_BASENAME}" --region "$AWS_REGION"; then
         echo "❌ Upload failed"
         return 1
+    fi
+
+    if [[ "$CFG_AUDIO_PERSIST" != "true" ]]; then
+        rm -f "$AUDIO_FILE"
+        echo "[$(date '+%H:%M:%S')] 🗑️ Local audio deleted (audio_persist=false)"
     fi
 
     # Start transcription
@@ -1148,6 +1155,8 @@ ai_backend = bedrock
 # recording_dir = ~/Record
 # Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
 # audio_bitrate = 128k
+# Keep local audio file after S3 upload (true=keep, false=delete after upload)
+# audio_persist = false
 
 # ── Auto-stop ────────────────────────────────────────────────
 # Silence detection threshold (dB)
@@ -1183,6 +1192,7 @@ CFGEOF
             echo "  silence_threshold     = $CFG_SILENCE_THRESHOLD"
             echo "  silence_grace         = $CFG_SILENCE_GRACE"
             echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
+            echo "  audio_persist         = $CFG_AUDIO_PERSIST"
             echo "  multi_language        = $CFG_MULTI_LANGUAGE"
             echo "  visualizer            = $CFG_VISUALIZER"
             echo ""
