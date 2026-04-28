@@ -1,8 +1,3 @@
-# Exclude internal docs and dev files from release tarballs
-doc/                    export-ignore
-Meetap-Next.md          export-ignore
-Meetap-Cost.md          export-ignore
-lessonlearn.md          export-ignore
-excalidraw.log          export-ignore
+# Exclude dev files from release tarballs
 .gitattributes          export-ignore
 .gitignore              export-ignore
