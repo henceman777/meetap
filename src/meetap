@@ -53,7 +53,7 @@ load_config() {
 
 load_config
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink "$0" || echo "$0")")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && cd "$(dirname "$(readlink "$(basename "$0")" || echo "$(basename "$0")")")" && pwd)"
 TOOL="$SCRIPT_DIR/audio-multi-output"
 MONITOR="$SCRIPT_DIR/audio-monitor"
 VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
