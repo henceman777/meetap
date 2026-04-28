@@ -79,12 +79,10 @@ detect_meeting_apps() {
     echo "$found"
 }
 
-audio_visualizer() {
+audio_snapshot() {
     local style="${CFG_VISUALIZER:-spectrum}"
-    local WIDTH=30
-    local history=()
-    for ((i=0; i<WIDTH; i++)); do history+=(0); done
-    local START_TS=$(date +%s)
+    local WIDTH=20
+    local SAMPLES=3
 
     local CHARS
     case "$style" in
@@ -99,54 +97,45 @@ audio_visualizer() {
     esac
     local MAX_IDX=$(( ${#CHARS[@]} - 1 ))
 
-    tput civis 2>/dev/null
-    trap 'tput cnorm 2>/dev/null; printf "\r\033[K"' EXIT INT TERM
-
-    while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
+    local levels=()
+    for ((s=0; s<SAMPLES; s++)); do
         local max_vol
-        max_vol=$(ffmpeg -nostdin -f avfoundation -i ":BlackHole 2ch" -t 0.4 \
+        max_vol=$(ffmpeg -nostdin -f avfoundation -i ":BlackHole 2ch" -t 0.3 \
             -af volumedetect -f null /dev/null 2>&1 \
             | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
-
         [[ -z "$max_vol" ]] && max_vol="-91"
-
         local vi=${max_vol%%.*}
         vi=${vi#-}
         local level
-        if [[ $vi -ge 80 ]]; then
-            level=0
-        elif [[ $vi -le 3 ]]; then
-            level=$MAX_IDX
-        else
-            level=$(( (80 - vi) * MAX_IDX / 77 ))
-        fi
-
-        history=("${history[@]:1}" "$level")
-
-        local bar=""
-        if [[ "$style" == "spectrum" ]]; then
-            for ((i=0; i<WIDTH; i++)); do
-                local l=${history[$i]}
-                local c
-                if [[ $l -le 2 ]]; then   c="\033[32m"
-                elif [[ $l -le 4 ]]; then  c="\033[33m"
-                elif [[ $l -le 5 ]]; then  c="\033[38;5;208m"
-                else                        c="\033[31m"
-                fi
-                bar="${bar}${c}${CHARS[$l]}\033[0m"
-            done
-        else
-            for ((i=0; i<WIDTH; i++)); do
-                bar="${bar}${CHARS[${history[$i]}]}"
-            done
-        fi
-
-        local now=$(date +%s)
-        local secs=$(( now - START_TS ))
-        local elapsed=$(printf "%02d:%02d" $((secs/60)) $((secs%60)))
-
-        printf "\r\033[K   🎙️ ${bar}  %s" "$elapsed"
+        if [[ $vi -ge 80 ]]; then level=0
+        elif [[ $vi -le 3 ]]; then level=$MAX_IDX
+        else level=$(( (80 - vi) * MAX_IDX / 77 )); fi
+        levels+=("$level")
     done
+
+    local bar=""
+    local pi=0
+    for ((i=0; i<WIDTH; i++)); do
+        local li=$(( i * SAMPLES / WIDTH ))
+        local base=${levels[$li]}
+        local jitter=$(( (RANDOM % 3) - 1 ))
+        local l=$(( base + jitter ))
+        [[ $l -lt 0 ]] && l=0
+        [[ $l -gt $MAX_IDX ]] && l=$MAX_IDX
+
+        if [[ "$style" == "spectrum" ]]; then
+            local c
+            if [[ $l -le 2 ]]; then   c="\033[32m"
+            elif [[ $l -le 4 ]]; then  c="\033[33m"
+            elif [[ $l -le 5 ]]; then  c="\033[38;5;208m"
+            else                        c="\033[31m"
+            fi
+            bar="${bar}${c}${CHARS[$l]}\033[0m"
+        else
+            bar="${bar}${CHARS[$l]}"
+        fi
+    done
+    printf "${bar}"
 }
 
 is_audio_silent() {
@@ -765,11 +754,12 @@ start_recording() {
         echo "   文件: $OUTPUT_FILE"
         echo "   播放: $ORIG_NAME"
         echo "   自动停止: 持续静音 2 分钟后"
+        printf "   音频: "
+        audio_snapshot
+        echo ""
         echo ""
         echo "   停止录制: $0 stop"
-        echo ""
-
-        audio_visualizer
+        echo "   查看状态: $0 status"
     else
         echo "❌ ffmpeg 启动失败:"
         cat "$STATE_DIR/ffmpeg.log"
@@ -874,15 +864,25 @@ stop_recording() {
 
 show_status() {
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "🎙️  录制中 (PID: $(cat "$PID_FILE"))"
+        local start_time
+        start_time=$(stat -f %m "$PID_FILE" 2>/dev/null)
+        local elapsed=""
+        if [[ -n "$start_time" ]]; then
+            local secs=$(( $(date +%s) - start_time ))
+            elapsed=$(printf " (%02d:%02d)" $((secs/60)) $((secs%60)))
+        fi
+        echo "🎙️  录制中${elapsed}"
         [[ -f "$OUTPUT_FILE_MARKER" ]] && echo "   文件: $(cat "$OUTPUT_FILE_MARKER")"
         [[ -f "$ORIGINAL_NAME_FILE" ]] && echo "   播放设备: $(cat "$ORIGINAL_NAME_FILE")"
         if [[ -f "$AUTOSTOP_PID_FILE" ]] && kill -0 "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null; then
-            echo "   自动停止: 已启用 (监控: $(cat "$MEETING_APPS_FILE" 2>/dev/null))"
+            echo "   自动停止: 已启用"
         fi
         if [[ -f "$MONITOR_PID_FILE" ]] && kill -0 "$(cat "$MONITOR_PID_FILE")" 2>/dev/null; then
             echo "   音频转发: 运行中"
         fi
+        printf "   音频: "
+        audio_snapshot
+        echo ""
     else
         echo "⏹️  未在录制"
         rm -f "$PID_FILE"
