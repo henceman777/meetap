@@ -17,7 +17,7 @@ CFG_SILENCE_GRACE=120
 CFG_AUDIO_BITRATE="128k"
 CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
-CFG_VISUALIZER="spectrum"
+CFG_VISUALIZER="dot"
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
@@ -80,9 +80,26 @@ detect_meeting_apps() {
     echo "$found"
 }
 
+setup_statusbar() {
+    local tty_dev="$1"
+    local rows
+    rows=$(tput lines 2>/dev/null < "$tty_dev" || echo 24)
+    printf '\033[1;%dr' "$((rows - 1))" > "$tty_dev"
+    printf '\033[%d;1H\033[K' "$rows" > "$tty_dev"
+    printf '\033[%d;1H' "$((rows - 1))" > "$tty_dev"
+}
+
+teardown_statusbar() {
+    local tty_dev="$1"
+    local rows
+    rows=$(tput lines 2>/dev/null < "$tty_dev" || echo 24)
+    printf '\033[1;%dr' "$rows" > "$tty_dev"
+    printf '\033[%d;1H\033[K' "$rows" > "$tty_dev"
+}
+
 start_visualizer() {
     local tty_dev="$1"
-    local style="${CFG_VISUALIZER:-spectrum}"
+    local style="${CFG_VISUALIZER:-dot}"
     local WIDTH=30
     local history=()
     for ((i=0; i<WIDTH; i++)); do history+=(0); done
@@ -102,8 +119,6 @@ start_visualizer() {
     local MAX_IDX=$(( ${#CHARS[@]} - 1 ))
     local ROWS
     ROWS=$(tput lines 2>/dev/null < "$tty_dev" || echo 24)
-
-    printf '\033[%d;1H\033[K' "$ROWS" > "$tty_dev"
 
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
         local max_vol
@@ -145,24 +160,17 @@ start_visualizer() {
 
         printf '\0337\033[%d;1H\033[K 🎙️ %b  %s\0338' "$ROWS" "$bar" "$elapsed" > "$tty_dev" 2>/dev/null || break
     done
-
-    printf '\0337\033[%d;1H\033[K\0338' "$ROWS" > "$tty_dev" 2>/dev/null
 }
 
 stop_visualizer() {
     if [[ -f "$VISUALIZER_PID_FILE" ]]; then
-        local vis_pid
-        vis_pid=$(cat "$VISUALIZER_PID_FILE")
-        kill "$vis_pid" 2>/dev/null
+        kill "$(cat "$VISUALIZER_PID_FILE")" 2>/dev/null
         rm -f "$VISUALIZER_PID_FILE"
-        sleep 0.2
-        local tty_dev
-        tty_dev=$(tty 2>/dev/null)
-        if [[ -n "$tty_dev" && "$tty_dev" != "not a tty" ]]; then
-            local rows
-            rows=$(tput lines 2>/dev/null || echo 24)
-            printf '\033[%d;1H\033[K' "$rows" > "$tty_dev"
-        fi
+    fi
+    local tty_dev
+    tty_dev=$(tty 2>/dev/null)
+    if [[ -n "$tty_dev" && "$tty_dev" != "not a tty" ]]; then
+        teardown_statusbar "$tty_dev"
     fi
 }
 
@@ -788,6 +796,7 @@ start_recording() {
         local TTY_DEV
         TTY_DEV=$(tty 2>/dev/null)
         if [[ -n "$TTY_DEV" && "$TTY_DEV" != "not a tty" ]]; then
+            setup_statusbar "$TTY_DEV"
             start_visualizer "$TTY_DEV" &
             echo $! > "$VISUALIZER_PID_FILE"
             disown $!
@@ -1131,8 +1140,8 @@ ai_backend = bedrock
 # ── Display ──────────────────────────────────────────────────
 # CLI display language
 # language = zh-CN
-# Audio visualizer style: spectrum (color bars) | bar | dot | block
-# visualizer = spectrum
+# Audio visualizer style: dot | bar | spectrum (color bars) | block
+# visualizer = dot
 CFGEOF
                 echo "✅ Config file created: $CONFIG_FILE"
                 echo "   Uncomment and edit to customize"
