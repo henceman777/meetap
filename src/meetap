@@ -400,6 +400,20 @@ build_prompt() {
     local SESSION_NAME
     SESSION_NAME=$(basename "$SESSION_DIR")
 
+    local SESSION_DATE
+    local folder_base="${SESSION_NAME%%_*}"
+    local folder_time="${SESSION_NAME##*_}"
+    if [[ ${#folder_base} -eq 8 ]]; then
+        local y="${folder_base:0:4}" m="${folder_base:4:2}" d="${folder_base:6:2}"
+        local weekday
+        weekday=$(date -j -f "%Y-%m-%d" "${y}-${m}-${d}" "+%u" 2>/dev/null)
+        local weekdays=("" "周一" "周二" "周三" "周四" "周五" "周六" "周日")
+        SESSION_DATE="${y}-${m}-${d}（${weekdays[$weekday]}）${folder_time:0:2}:${folder_time:2:2}"
+    else
+        local m="${folder_base:0:2}" d="${folder_base:2:2}"
+        SESSION_DATE="$(date +%Y)-${m}-${d} ${folder_time:0:2}:${folder_time:2:2}"
+    fi
+
     local transcript
     transcript=$(cat "$TRANSCRIPT")
     if [[ ${#transcript} -gt 120000 ]]; then
@@ -439,7 +453,7 @@ ${speaker_stats}
 > * **附录**（发言人摘要、术语速查）
 
 
-**日期**：${SESSION_NAME}
+**日期**：${SESSION_DATE}
 **时长**：[从发言人统计的 total 获取]
 **参会者**：
 
@@ -752,7 +766,7 @@ start_recording() {
     echo "✅ 音频转发已启动 → $ORIG_NAME"
 
     # 创建本次录制的会话目录
-    SESSION_DIR="$RECORDING_DIR/$(date +"%m%d_%H%M")"
+    SESSION_DIR="$RECORDING_DIR/$(date +"%Y%m%d_%H%M")"
     mkdir -p "$SESSION_DIR"
     echo "$SESSION_DIR" > "$STATE_DIR/session-dir"
 
