@@ -35,3 +35,9 @@ audio_bitrate = 128k
 # Enable multi-language detection within a single session (true/false)
 # Useful when speakers switch languages; may reduce accuracy for short phrases
 multi_language = false
+
+# Keep local audio file after S3 upload (true=keep, false=delete after upload)
+audio_persist = false
+
+# Audio visualizer style: dot | bar | spectrum (color bars) | block
+visualizer = dot
