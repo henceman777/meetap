@@ -790,12 +790,13 @@ start_recording() {
         echo "   文件: $OUTPUT_FILE"
         echo "   播放: $ORIG_NAME"
         echo "   自动停止: 持续静音 2 分钟后"
-        echo ""
         echo "   停止录制: $0 stop"
+        echo ""
 
         local TTY_DEV
         TTY_DEV=$(tty 2>/dev/null)
         if [[ -n "$TTY_DEV" && "$TTY_DEV" != "not a tty" ]]; then
+            sleep 0.1
             setup_statusbar "$TTY_DEV"
             start_visualizer "$TTY_DEV" &
             echo $! > "$VISUALIZER_PID_FILE"
