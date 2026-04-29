@@ -618,59 +618,80 @@ for line in md_content.split("\n"):
         title = line[2:].strip()
         break
 
-# Markdown to HTML (basic conversion)
+# Markdown to HTML
 html = md_content
 html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
 html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
 html = re.sub(r'^### (.+)$', r'<h3>\1</h3>', html, flags=re.MULTILINE)
+html = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', html)
 html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html)
 html = re.sub(r'\*(.+?)\*', r'<em>\1</em>', html)
 html = re.sub(r'^- \[ \] (.+)$', r'<li>☐ \1</li>', html, flags=re.MULTILINE)
 html = re.sub(r'^- \[x\] (.+)$', r'<li>☑ \1</li>', html, flags=re.MULTILINE)
 html = re.sub(r'^- (.+)$', r'<li>\1</li>', html, flags=re.MULTILINE)
 html = re.sub(r'^---$', r'<hr>', html, flags=re.MULTILINE)
-html = re.sub(r'\n\n', r'<br><br>', html)
+# Wrap consecutive <li> in <ul>
+html = re.sub(r'((?:<li>.*?</li>\n?)+)', r'<ul>\1</ul>', html)
+# Wrap plain-text blocks in <p>
+lines = html.split('\n')
+out, buf = [], []
+for ln in lines:
+    s = ln.strip()
+    if not s:
+        if buf:
+            block = ' '.join(buf)
+            if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
+                out.append(f'<p>{block}</p>')
+            else:
+                out.append(block)
+            buf = []
+    else:
+        buf.append(ln)
+if buf:
+    block = ' '.join(buf)
+    if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
+        out.append(f'<p>{block}</p>')
+    else:
+        out.append(block)
+html = '\n'.join(out)
+# Signature line: match any Meetap footer and render as styled HTML
+sig_html = ('<p style="color:#888;margin-top:24px;font-style:italic">'
+    '—— <a href="https://github.com/henceman777/meetap" style="color:#4a90d9">Meetap</a>'
+    ' —— <strong>L</strong>isten · <strong>a</strong>nalyze · <strong>r</strong>ecap · '
+    '<strong>r</strong>efine · <strong>y</strong>ield , '
+    '<strong>Y</strong>our <strong>a</strong>udio <strong>n</strong>otes '
+    '<strong>g</strong>enerator</p>')
+html = re.sub(r'<p>.*?——.*?[Mm]eetap.*?——.*?</p>', sig_html, html)
 html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
-body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #333; }}
-h1 {{ color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 10px; }}
-h2 {{ color: #2c3e50; margin-top: 30px; }}
-h3 {{ color: #34495e; }}
-li {{ margin: 4px 0; list-style: none; }}
-hr {{ border: none; border-top: 1px solid #eee; margin: 30px 0; }}
-strong {{ color: #1a1a1a; }}
+body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 0 auto; padding: 0 20px; line-height: 1.5; color: #333; font-size: 14px; }}
+h1 {{ color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 6px; margin: 16px 0 8px; font-size: 20px; }}
+h2 {{ color: #2c3e50; margin: 18px 0 6px; font-size: 16px; }}
+h3 {{ color: #34495e; margin: 14px 0 4px; font-size: 15px; }}
+p {{ margin: 6px 0; }}
+ul {{ margin: 4px 0; padding-left: 20px; }}
+li {{ margin: 2px 0; list-style: none; }}
+hr {{ border: none; border-top: 1px solid #ddd; margin: 12px 0; }}
 </style></head><body>{html}</body></html>"""
 
-# HTML to PDF via lightweight approach: use macOS built-in
-# Write HTML to temp file, convert via cupsfilter or wkhtmltopdf if available
-import subprocess, tempfile
-html_tmp = os.path.join(os.path.dirname(pdf_path), ".notes.html")
-with open(html_tmp, "w") as f:
-    f.write(html)
-
-# Try /usr/sbin/cupsfilter (macOS built-in, no extra deps)
+# HTML to PDF via PyMuPDF
 try:
-    with open(pdf_path, "wb") as pdf_out:
-        subprocess.run(
-            ["/usr/sbin/cupsfilter", "-o", "fit-to-page", html_tmp],
-            stdout=pdf_out, stderr=subprocess.DEVNULL, check=True, timeout=30
-        )
-except Exception:
-    # Fallback: use textutil + cupsfilter chain via HTML
-    try:
-        subprocess.run(
-            ["textutil", "-convert", "html", "-output", html_tmp, html_tmp],
-            capture_output=True, timeout=10
-        )
-        with open(pdf_path, "wb") as pdf_out:
-            subprocess.run(
-                ["/usr/sbin/cupsfilter", html_tmp],
-                stdout=pdf_out, stderr=subprocess.DEVNULL, check=True, timeout=30
-            )
-    except Exception as e:
-        print(f"PDF conversion failed: {e}, sending as HTML attachment")
-        pdf_path = None
+    import fitz
+    story = fitz.Story(html)
+    writer = fitz.DocumentWriter(pdf_path)
+    mediabox = fitz.paper_rect("a4")
+    where = mediabox + (36, 36, -36, -36)
+    more = True
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+except Exception as e:
+    print(f"PDF conversion failed: {e}, sending HTML only")
+    pdf_path = None
 
 # Send via SES
 try:
@@ -699,8 +720,7 @@ except Exception as e:
     print(f"Email send failed: {e}")
     sys.exit(1)
 finally:
-    if os.path.exists(html_tmp):
-        os.remove(html_tmp)
+    pass
 PYEOF
 
     if [[ $? -eq 0 ]]; then
@@ -873,7 +893,7 @@ start_recording() {
 
         echo ""
         echo "🎙️  录制已开始"
-        echo "   文件: $OUTPUT_FILE"
+        $VERBOSE && echo "   文件: $OUTPUT_FILE"
         echo "   播放: $ORIG_NAME"
         echo "   自动停止: 持续静音 2 分钟后"
         echo "   停止录制: $0 stop"
@@ -900,6 +920,8 @@ start_recording() {
 }
 
 stop_recording() {
+    local VERBOSE=false
+    [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]] && VERBOSE=true
     stop_visualizer
 
     # 停止自动停止守护进程
@@ -965,15 +987,23 @@ stop_recording() {
                 MINS=$((DURATION / 60))
                 SECS=$((DURATION % 60))
                 echo ""
-                echo "✅ 录制已保存"
-                echo "   文件: $OUTPUT_FILE"
-                echo "   大小: $FILE_SIZE"
-                echo "   时长: ${MINS}分${SECS}秒"
+                if $VERBOSE; then
+                    echo "✅ 录制已保存"
+                    echo "   文件: $OUTPUT_FILE"
+                    echo "   大小: $FILE_SIZE"
+                    echo "   时长: ${MINS}分${SECS}秒"
+                else
+                    echo "✅ 会议采样成功"
+                fi
             else
                 echo ""
-                echo "✅ 录制已保存"
-                echo "   文件: $OUTPUT_FILE"
-                echo "   大小: $FILE_SIZE"
+                if $VERBOSE; then
+                    echo "✅ 录制已保存"
+                    echo "   文件: $OUTPUT_FILE"
+                    echo "   大小: $FILE_SIZE"
+                else
+                    echo "✅ 会议采样成功"
+                fi
             fi
         fi
     fi
@@ -1165,7 +1195,7 @@ case "${1:-}" in
         start_recording "${2:-}"
         ;;
     stop)
-        stop_recording
+        stop_recording "${2:-}"
         ;;
     status)
         show_status
@@ -1192,50 +1222,54 @@ case "${1:-}" in
             else
                 cat > "$CONFIG_FILE" <<'CFGEOF'
 # MeeTap Configuration
-# Uncomment and modify parameters as needed
 
 # ── AWS ──────────────────────────────────────────────────────
 # Region (affects S3, Transcribe, Bedrock)
-# region = us-east-1
+region = us-east-1
 
 # ── AI / Meeting Notes ───────────────────────────────────────
 # Backend for meeting notes generation (bedrock | claude-code)
 ai_backend = bedrock
 # Bedrock model (only used when ai_backend = bedrock)
-# model = us.anthropic.claude-sonnet-4-6
+model = us.anthropic.claude-sonnet-4-6
 
 # ── Transcription ────────────────────────────────────────────
 # Languages (space-separated, priority order, AWS Transcribe codes)
 # Full list: https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html
-# transcribe_languages = en-US zh-CN ja-JP
+transcribe_languages = en-US zh-CN ja-JP
 # Max speaker labels for speaker diarization (2-10)
-# max_speakers = 10
+max_speakers = 10
 # Enable multi-language detection within a single session (true/false)
-# Useful when speakers switch languages; may reduce accuracy for short phrases
-# multi_language = false
+multi_language = false
 
 # ── Recording ────────────────────────────────────────────────
 # Output directory
-# recording_dir = ~/Record
+recording_dir = ~/Record
 # Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
-# audio_bitrate = 128k
+audio_bitrate = 128k
 # Keep local audio file after S3 upload (true=keep, false=delete after upload)
-# audio_persist = false
+audio_persist = false
 
 # ── Auto-stop ────────────────────────────────────────────────
 # Silence detection threshold (dB)
-# silence_threshold = -50
+silence_threshold = -50
 # Stop after N seconds of continuous silence
-# silence_grace = 120
+silence_grace = 120
 
 # ── Display ──────────────────────────────────────────────────
-# CLI display language
-# language = zh-CN
+# CLI display language (en-US | zh-CN | ja-JP | ...)
+language = zh-CN
 # Audio visualizer style: dot | bar | spectrum (color bars) | block
-# visualizer = dot
+visualizer = dot
+
+# ── Email (optional) ────────────────────────────────────────
+# Recipients for meeting notes (comma-separated, leave empty to disable)
+# email = alice@example.com, bob@example.com
+# SES verified sender address (required if email is set)
+# email_sender = meetap@example.com
 CFGEOF
                 echo "✅ Config file created: $CONFIG_FILE"
-                echo "   Uncomment and edit to customize"
+                echo "   Edit to customize: $CONFIG_FILE"
             fi
         else
             echo "MeeTap v${VERSION} Configuration"
@@ -1274,7 +1308,7 @@ CFGEOF
         echo "用法: meetap {start|stop|status|setup|config|version}"
         echo ""
         echo "  start [-t]   开始录制（-t 显示详细设备信息）"
-        echo "  stop         停止录制，恢复音频设备，自动转录"
+        echo "  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
         echo "  status       查看当前录制状态"
         echo "  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
         echo "  config       显示当前配置"

@@ -1,49 +1,46 @@
 # MeeTap Configuration
-# Modify parameters as needed
 
-# AWS Region (affects S3, Transcribe, Bedrock)
+# ── AWS ──────────────────────────────────────────────────────
+# Region (affects S3, Transcribe, Bedrock)
 region = us-east-1
 
-# CLI display language (same codes as transcription languages)
-language = en-US
-
+# ── AI / Meeting Notes ───────────────────────────────────────
 # Backend for meeting notes generation (bedrock | claude-code)
 ai_backend = bedrock
-
 # Bedrock model (only used when ai_backend = bedrock)
 model = us.anthropic.claude-sonnet-4-6
 
-# Transcription languages (space-separated, priority order, AWS Transcribe codes)
+# ── Transcription ────────────────────────────────────────────
+# Languages (space-separated, priority order, AWS Transcribe codes)
 # Full list: https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html
 transcribe_languages = en-US zh-CN ja-JP
-
-# Recording output directory
-recording_dir = ~/Record
-
 # Max speaker labels for speaker diarization (2-10)
 max_speakers = 10
-
-# Auto-stop silence detection threshold (dB)
-silence_threshold = -50
-
-# Auto-stop after N seconds of continuous silence
-silence_grace = 120
-
-# Audio recording bitrate (64k=small file, 128k=balanced, 256k=high quality)
-audio_bitrate = 128k
-
 # Enable multi-language detection within a single session (true/false)
-# Useful when speakers switch languages; may reduce accuracy for short phrases
 multi_language = false
 
+# ── Recording ────────────────────────────────────────────────
+# Output directory
+recording_dir = ~/Record
+# Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
+audio_bitrate = 128k
 # Keep local audio file after S3 upload (true=keep, false=delete after upload)
 audio_persist = false
 
+# ── Auto-stop ────────────────────────────────────────────────
+# Silence detection threshold (dB)
+silence_threshold = -50
+# Stop after N seconds of continuous silence
+silence_grace = 120
+
+# ── Display ──────────────────────────────────────────────────
+# CLI display language (en-US | zh-CN | ja-JP | ...)
+language = zh-CN
 # Audio visualizer style: dot | bar | spectrum (color bars) | block
 visualizer = dot
 
-# Email recipients for meeting notes (comma-separated, leave empty to disable)
+# ── Email (optional) ────────────────────────────────────────
+# Recipients for meeting notes (comma-separated, leave empty to disable)
 # email = alice@example.com, bob@example.com
-
 # SES verified sender address (required if email is set)
 # email_sender = meetap@example.com
