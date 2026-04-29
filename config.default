@@ -41,3 +41,9 @@ audio_persist = false
 
 # Audio visualizer style: dot | bar | spectrum (color bars) | block
 visualizer = dot
+
+# Email recipients for meeting notes (comma-separated, leave empty to disable)
+# email = alice@example.com, bob@example.com
+
+# SES verified sender address (required if email is set)
+# email_sender = meetap@example.com

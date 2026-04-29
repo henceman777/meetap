@@ -19,6 +19,8 @@ CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
 CFG_VISUALIZER="dot"
 CFG_AUDIO_PERSIST=false
+CFG_EMAIL=""
+CFG_EMAIL_SENDER=""
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
@@ -47,6 +49,8 @@ load_config() {
             ai_backend)            CFG_AI_BACKEND="$val" ;;
             visualizer)            CFG_VISUALIZER="$val" ;;
             audio_persist)         CFG_AUDIO_PERSIST="$val" ;;
+            email)                 CFG_EMAIL="$val" ;;
+            email_sender)          CFG_EMAIL_SENDER="$val" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -499,7 +503,7 @@ ${speaker_stats}
 
 ---
 
-*—— [Meetap](https://github.com/henceman777/meetap) ——*
+*—— **L**isten · **a**nalyze · **r**ecap · **r**efine · **y**ield  —  [Meetap](https://github.com/henceman777/meetap)  —  **Y**our **a**udio **n**otes **g**enerator ——*
 
 ## 转录原文
 
@@ -575,6 +579,137 @@ summarize_via_claude_code() {
     fi
 }
 
+send_meeting_notes() {
+    local NOTES_FILE="$1"
+    local SESSION_DIR="$2"
+
+    [[ -z "$CFG_EMAIL" ]] && return 0
+    [[ -z "$CFG_EMAIL_SENDER" ]] && {
+        echo "[$(date '+%H:%M:%S')] ⚠️ email_sender not configured, skipping email"
+        return 1
+    }
+    [[ ! -x "$VENV_PYTHON" ]] && {
+        echo "[$(date '+%H:%M:%S')] ⚠️ Python venv not found, skipping email"
+        return 1
+    }
+
+    local PDF_FILE="${NOTES_FILE%.md}.pdf"
+    echo "[$(date '+%H:%M:%S')] 📧 Converting to PDF and sending email..."
+
+    "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$CFG_EMAIL" "$CFG_EMAIL_SENDER" "$CFG_REGION" <<'PYEOF'
+import sys, os, re, boto3
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+
+notes_path = sys.argv[1]
+pdf_path = sys.argv[2]
+recipients = [r.strip() for r in sys.argv[3].split(",") if r.strip()]
+sender = sys.argv[4]
+region = sys.argv[5]
+
+with open(notes_path, "r") as f:
+    md_content = f.read()
+
+# Extract title from first H1
+title = "Meeting Notes"
+for line in md_content.split("\n"):
+    if line.startswith("# "):
+        title = line[2:].strip()
+        break
+
+# Markdown to HTML (basic conversion)
+html = md_content
+html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
+html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
+html = re.sub(r'^### (.+)$', r'<h3>\1</h3>', html, flags=re.MULTILINE)
+html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html)
+html = re.sub(r'\*(.+?)\*', r'<em>\1</em>', html)
+html = re.sub(r'^- \[ \] (.+)$', r'<li>☐ \1</li>', html, flags=re.MULTILINE)
+html = re.sub(r'^- \[x\] (.+)$', r'<li>☑ \1</li>', html, flags=re.MULTILINE)
+html = re.sub(r'^- (.+)$', r'<li>\1</li>', html, flags=re.MULTILINE)
+html = re.sub(r'^---$', r'<hr>', html, flags=re.MULTILINE)
+html = re.sub(r'\n\n', r'<br><br>', html)
+html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #333; }}
+h1 {{ color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 10px; }}
+h2 {{ color: #2c3e50; margin-top: 30px; }}
+h3 {{ color: #34495e; }}
+li {{ margin: 4px 0; list-style: none; }}
+hr {{ border: none; border-top: 1px solid #eee; margin: 30px 0; }}
+strong {{ color: #1a1a1a; }}
+</style></head><body>{html}</body></html>"""
+
+# HTML to PDF via lightweight approach: use macOS built-in
+# Write HTML to temp file, convert via cupsfilter or wkhtmltopdf if available
+import subprocess, tempfile
+html_tmp = os.path.join(os.path.dirname(pdf_path), ".notes.html")
+with open(html_tmp, "w") as f:
+    f.write(html)
+
+# Try /usr/sbin/cupsfilter (macOS built-in, no extra deps)
+try:
+    with open(pdf_path, "wb") as pdf_out:
+        subprocess.run(
+            ["/usr/sbin/cupsfilter", "-o", "fit-to-page", html_tmp],
+            stdout=pdf_out, stderr=subprocess.DEVNULL, check=True, timeout=30
+        )
+except Exception:
+    # Fallback: use textutil + cupsfilter chain via HTML
+    try:
+        subprocess.run(
+            ["textutil", "-convert", "html", "-output", html_tmp, html_tmp],
+            capture_output=True, timeout=10
+        )
+        with open(pdf_path, "wb") as pdf_out:
+            subprocess.run(
+                ["/usr/sbin/cupsfilter", html_tmp],
+                stdout=pdf_out, stderr=subprocess.DEVNULL, check=True, timeout=30
+            )
+    except Exception as e:
+        print(f"PDF conversion failed: {e}, sending as HTML attachment")
+        pdf_path = None
+
+# Send via SES
+try:
+    ses = boto3.client("ses", region_name=region)
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = f"[MeeTap] {title}"
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+
+    body = MIMEText(html, "html", "utf-8")
+    msg.attach(body)
+
+    if pdf_path and os.path.exists(pdf_path):
+        with open(pdf_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="pdf")
+            att.add_header("Content-Disposition", "attachment", filename=os.path.basename(pdf_path))
+            msg.attach(att)
+
+    ses.send_raw_email(
+        Source=sender,
+        Destinations=recipients,
+        RawMessage={"Data": msg.as_string()}
+    )
+    print(f"Email sent to: {', '.join(recipients)}")
+except Exception as e:
+    print(f"Email send failed: {e}")
+    sys.exit(1)
+finally:
+    if os.path.exists(html_tmp):
+        os.remove(html_tmp)
+PYEOF
+
+    if [[ $? -eq 0 ]]; then
+        echo "[$(date '+%H:%M:%S')] ✅ Email sent to: $CFG_EMAIL"
+    else
+        echo "[$(date '+%H:%M:%S')] ⚠️ Email sending failed (notes still available locally)"
+    fi
+}
+
 summarize_transcript() {
     local SESSION_DIR="$1"
     local TRANSCRIPT="$SESSION_DIR/transcript.txt"
@@ -609,6 +744,7 @@ summarize_transcript() {
     if [[ -f "$OUTPUT" ]]; then
         echo "[$(date '+%H:%M:%S')] ✅ Meeting notes generated: $OUTPUT"
         osascript -e "display notification \"会议纪要已生成: meeting-notes.md\" with title \"MeeTap\"" 2>/dev/null
+        send_meeting_notes "$OUTPUT" "$SESSION_DIR"
     else
         echo "[$(date '+%H:%M:%S')] ⚠️ Meeting notes generation failed, transcript.txt is still available"
         osascript -e "display notification \"纪要生成失败，转录文件可用\" with title \"MeeTap\"" 2>/dev/null
@@ -1123,6 +1259,8 @@ CFGEOF
             echo "  audio_persist         = $CFG_AUDIO_PERSIST"
             echo "  multi_language        = $CFG_MULTI_LANGUAGE"
             echo "  visualizer            = $CFG_VISUALIZER"
+            echo "  email                 = ${CFG_EMAIL:-<not set>}"
+            echo "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
             echo ""
             echo "Run 'meetap config init' to generate config file"
         fi
