@@ -221,8 +221,16 @@ autostop_daemon() {
 transcribe_recording() {
     local AUDIO_FILE="$1"
     local SESSION_DIR="$2"
-    local LOG_FILE="$SESSION_DIR/transcribe.log"
+    local LOG_DIR="$SESSION_DIR/log"
+    mkdir -p "$LOG_DIR"
+    local LOG_FILE="$LOG_DIR/meetap.log"
     local AWS_REGION="$CFG_REGION"
+
+    # Move audio file into log/
+    if [[ -f "$AUDIO_FILE" && "$(dirname "$AUDIO_FILE")" != "$LOG_DIR" ]]; then
+        mv "$AUDIO_FILE" "$LOG_DIR/"
+        AUDIO_FILE="$LOG_DIR/$(basename "$AUDIO_FILE")"
+    fi
 
     exec > "$LOG_FILE" 2>&1
     echo "[$(date '+%H:%M:%S')] Transcription started"
@@ -317,15 +325,16 @@ transcribe_recording() {
 
     # Download result
     echo "[$(date '+%H:%M:%S')] Downloading transcript..."
-    aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$SESSION_DIR/transcribe-raw.json" --region "$AWS_REGION"
+    aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$LOG_DIR/transcribe-raw.json" --region "$AWS_REGION"
 
     # Extract transcript with speaker labels
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 
 session_dir = sys.argv[1]
-raw_json = os.path.join(session_dir, "transcribe-raw.json")
-output_txt = os.path.join(session_dir, "transcript.txt")
+log_dir = os.path.join(session_dir, "log")
+raw_json = os.path.join(log_dir, "transcribe-raw.json")
+output_txt = os.path.join(log_dir, "transcript.txt")
 
 with open(raw_json) as f:
     data = json.load(f)
@@ -373,8 +382,9 @@ PYEOF
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 session_dir = sys.argv[1]
-raw_json = os.path.join(session_dir, "transcribe-raw.json")
-stats_file = os.path.join(session_dir, "speaker-stats.txt")
+log_dir = os.path.join(session_dir, "log")
+raw_json = os.path.join(log_dir, "transcribe-raw.json")
+stats_file = os.path.join(log_dir, "speaker-stats.txt")
 with open(raw_json) as f:
     data = json.load(f)
 segments = data["results"]["speaker_labels"]["segments"]
@@ -397,7 +407,7 @@ with open(stats_file, "w") as f:
 print(f"Speaker stats saved: {stats_file}")
 PYEOF
 
-    echo "[$(date '+%H:%M:%S')] ✅ Transcription complete: $SESSION_DIR/transcript.txt"
+    echo "[$(date '+%H:%M:%S')] ✅ Transcription complete: $LOG_DIR/transcript.txt"
     osascript -e "display notification \"转录完成，正在整理会议纪要...\" with title \"MeeTap\"" 2>/dev/null
 
     # Generate meeting notes via Bedrock
@@ -406,8 +416,9 @@ PYEOF
 
 build_prompt() {
     local SESSION_DIR="$1"
-    local TRANSCRIPT="$SESSION_DIR/transcript.txt"
-    local SPEAKER_STATS="$SESSION_DIR/speaker-stats.txt"
+    local LOG_DIR="$SESSION_DIR/log"
+    local TRANSCRIPT="$LOG_DIR/transcript.txt"
+    local SPEAKER_STATS="$LOG_DIR/speaker-stats.txt"
     local SESSION_NAME
     SESSION_NAME=$(basename "$SESSION_DIR")
 
@@ -764,12 +775,13 @@ PYEOF
 
 summarize_transcript() {
     local SESSION_DIR="$1"
-    local TRANSCRIPT="$SESSION_DIR/transcript.txt"
+    local LOG_DIR="$SESSION_DIR/log"
+    local TRANSCRIPT="$LOG_DIR/transcript.txt"
     local OUTPUT="$SESSION_DIR/meeting-notes.md"
-    local PROMPT_FILE="$SESSION_DIR/.prompt.tmp"
+    local PROMPT_FILE="$LOG_DIR/.prompt.tmp"
 
     if [[ ! -f "$TRANSCRIPT" ]]; then
-        echo "[$(date '+%H:%M:%S')] ⚠️ transcript.txt not found, skipping summarization"
+        echo "[$(date '+%H:%M:%S')] ⚠️ transcript.txt not found in log/, skipping summarization"
         return 1
     fi
 
