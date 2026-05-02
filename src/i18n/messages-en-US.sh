@@ -125,15 +125,14 @@ MSG_SETUP_ALL_DONE="✅ Setup complete! You can now run %s start to record a mee
 MSG_SETUP_ALL_DONE_HINT="   You only need to do this once, unless you change it back in an app."
 
 # ── Config command ──
-MSG_CONFIG_EXISTS="⚠️  Config file already exists: %s"
-MSG_CONFIG_EXISTS_HINT="   Delete it first and re-run 'meetap config init' to reset"
-MSG_CONFIG_CREATED="✅ Config file created: %s"
-MSG_CONFIG_CREATED_HINT="   Edit to customize: %s"
+MSG_CONFIG_BOOTSTRAPPED="📝 Default config created: %s"
 MSG_CONFIG_HEADER="MeeTap v%s Configuration"
 MSG_CONFIG_SEPARATOR="================================="
 MSG_CONFIG_FILE_PATH="Config file: %s"
-MSG_CONFIG_FILE_NONE="Config file: (not created, using defaults)"
-MSG_CONFIG_HINT_INIT="Run 'meetap config init' to generate config file"
+MSG_CONFIG_FILE_NONE="Config file: (not created, using built-in defaults)"
+MSG_CONFIG_RESET_HINT="To reset to defaults: rm %s and run any meetap command"
+MSG_CONFIG_OPENING_EDITOR="✏️  Opening editor: %s"
+MSG_CONFIG_NO_TEMPLATE="❌ Default config template not found, cannot initialize"
 
 # ── Usage ──
 MSG_USAGE_HEADER="MeeTap v%s - macOS meeting recorder + auto-transcription"
@@ -142,8 +141,8 @@ MSG_USAGE_START="  start [-t]   Start recording (-t shows verbose device info)"
 MSG_USAGE_STOP="  stop [-t]    Stop recording, restore audio device, auto-transcribe (-t shows verbose file info)"
 MSG_USAGE_STATUS="  status       Show current recording status"
 MSG_USAGE_SETUP="  setup        One-click setup for Zoom + Teams + Tencent Meeting (only once)"
-MSG_USAGE_CONFIG="  config       Show current configuration"
-MSG_USAGE_CONFIG_INIT="  config init  Generate default config file"
+MSG_USAGE_CONFIG="  config       Open config in \$EDITOR"
+MSG_USAGE_CONFIG_SHOW="  config show  Show current configuration"
 MSG_USAGE_VERSION="  version      Show version"
 MSG_USAGE_HINT="First-time users please run: meetap setup"
 

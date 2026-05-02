@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="0.2.2"
+VERSION="0.2.3"
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
@@ -21,6 +21,37 @@ CFG_VISUALIZER="dot"
 CFG_AUDIO_PERSIST=false
 CFG_EMAIL=""
 CFG_EMAIL_SENDER=""
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && cd "$(dirname "$(readlink "$(basename "$0")" || echo "$(basename "$0")")")" && pwd)"
+
+# Locate the config.default template across install layouts.
+# Echoes the path on stdout if found; returns 1 otherwise.
+find_config_template() {
+    local candidates=(
+        "$SCRIPT_DIR/../config.default"               # dev / source tree
+        "$SCRIPT_DIR/share/meetap/config.default"     # make install (PREFIX=~/bin)
+        "$SCRIPT_DIR/../share/meetap/config.default"  # make install (standard prefix)
+        "/opt/homebrew/etc/meetap/config.default"     # Homebrew (Apple Silicon)
+        "/usr/local/etc/meetap/config.default"        # Homebrew (Intel)
+    )
+    for p in "${candidates[@]}"; do
+        [[ -f "$p" ]] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+# On first run, copy the default config into XDG_CONFIG_HOME so the tool
+# works out of the box regardless of install method (make, brew, etc.).
+ensure_config() {
+    [[ -f "$CONFIG_FILE" ]] && return 0
+    local template
+    template=$(find_config_template) || return 0   # template missing → silently fall back to built-in defaults
+    mkdir -p "$(dirname "$CONFIG_FILE")" || return 0
+    cp "$template" "$CONFIG_FILE" 2>/dev/null || return 0
+    # i18n is not yet loaded here — emit a neutral hint using the locale fallback.
+    # The first-run message is printed to stderr so it doesn't pollute piped stdout.
+    echo "📝 Default config created: $CONFIG_FILE" >&2
+}
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
@@ -55,15 +86,19 @@ load_config() {
     done < "$CONFIG_FILE"
 }
 
+ensure_config
 load_config
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && cd "$(dirname "$(readlink "$(basename "$0")" || echo "$(basename "$0")")")" && pwd)"
 
 # --- i18n (CLI display only; meeting notes are always Chinese) ---
 load_i18n() {
     local i18n_dir=""
-    # Look for i18n/ next to the script (dev or installed layout)
-    for d in "$SCRIPT_DIR/i18n" "$SCRIPT_DIR/../src/i18n"; do
+    # Look for i18n/ across dev, make install, and Homebrew layouts
+    for d in \
+        "$SCRIPT_DIR/i18n" \
+        "$SCRIPT_DIR/../src/i18n" \
+        "$SCRIPT_DIR/../share/meetap/i18n" \
+        "/opt/homebrew/share/meetap/i18n" \
+        "/usr/local/share/meetap/i18n"; do
         [[ -d "$d" ]] && { i18n_dir="$d"; break; }
     done
     [[ -z "$i18n_dir" ]] && return 0
@@ -1292,94 +1327,53 @@ case "${1:-}" in
         setup_wemeet
         ;;
     config)
-        if [[ "${2:-}" == "init" ]]; then
-            config_dir="$(dirname "$CONFIG_FILE")"
-            mkdir -p "$config_dir"
-            if [[ -f "$CONFIG_FILE" ]]; then
-                _t CONFIG_EXISTS "$CONFIG_FILE"
-                _t CONFIG_EXISTS_HINT
-            else
-                cat > "$CONFIG_FILE" <<'CFGEOF'
-# MeeTap Configuration
-
-# ── AWS ──────────────────────────────────────────────────────
-# Region (affects S3, Transcribe, Bedrock)
-region = us-east-1
-
-# ── AI / Meeting Notes ───────────────────────────────────────
-# Backend for meeting notes generation (bedrock | claude-code)
-ai_backend = bedrock
-# Bedrock model (only used when ai_backend = bedrock)
-model = us.anthropic.claude-sonnet-4-6
-
-# ── Transcription ────────────────────────────────────────────
-# Languages (space-separated, priority order, AWS Transcribe codes)
-# Full list: https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html
-transcribe_languages = en-US zh-CN ja-JP
-# Max speaker labels for speaker diarization (2-10)
-max_speakers = 10
-# Enable multi-language detection within a single session (true/false)
-multi_language = false
-
-# ── Recording ────────────────────────────────────────────────
-# Output directory
-recording_dir = ~/Record
-# Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
-audio_bitrate = 128k
-# Keep local audio file after S3 upload (true=keep, false=delete after upload)
-audio_persist = false
-
-# ── Auto-stop ────────────────────────────────────────────────
-# Silence detection threshold (dB)
-silence_threshold = -50
-# Stop after N seconds of continuous silence
-silence_grace = 120
-
-# ── Display ──────────────────────────────────────────────────
-# CLI display language (en-US | zh-CN)
-# Only affects terminal output, notifications, and help text.
-# Meeting notes are always generated in Chinese regardless of this setting;
-# transcripts remain in the meeting's original language.
-language = zh-CN
-# Audio visualizer style: dot | bar | spectrum (color bars) | block
-visualizer = dot
-
-# ── Email (optional) ────────────────────────────────────────
-# Recipients for meeting notes (comma-separated, leave empty to disable)
-# email = alice@example.com, bob@example.com
-# SES verified sender address (required if email is set)
-# email_sender = meetap@example.com
-CFGEOF
-                _t CONFIG_CREATED "$CONFIG_FILE"
-                _t CONFIG_CREATED_HINT "$CONFIG_FILE"
-            fi
-        else
-            _t CONFIG_HEADER "$VERSION"
-            _t CONFIG_SEPARATOR
-            if [[ -f "$CONFIG_FILE" ]]; then
-                _t CONFIG_FILE_PATH "$CONFIG_FILE"
-            else
-                _t CONFIG_FILE_NONE
-            fi
-            echo ""
-            echo "  region                = $CFG_REGION"
-            echo "  language              = $CFG_LANGUAGE"
-            echo "  ai_backend            = $CFG_AI_BACKEND"
-            echo "  model                 = $CFG_MODEL"
-            echo "  transcribe_languages  = $CFG_TRANSCRIBE_LANGUAGES"
-            echo "  recording_dir         = $CFG_RECORDING_DIR"
-            echo "  max_speakers          = $CFG_MAX_SPEAKERS"
-            echo "  silence_threshold     = $CFG_SILENCE_THRESHOLD"
-            echo "  silence_grace         = $CFG_SILENCE_GRACE"
-            echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
-            echo "  audio_persist         = $CFG_AUDIO_PERSIST"
-            echo "  multi_language        = $CFG_MULTI_LANGUAGE"
-            echo "  visualizer            = $CFG_VISUALIZER"
-            echo "  email                 = ${CFG_EMAIL:-<not set>}"
-            echo "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
-            echo ""
-            _t CONFIG_HINT_INIT
-        fi
+        case "${2:-edit}" in
+            show)
+                _t CONFIG_HEADER "$VERSION"
+                _t CONFIG_SEPARATOR
+                if [[ -f "$CONFIG_FILE" ]]; then
+                    _t CONFIG_FILE_PATH "$CONFIG_FILE"
+                else
+                    _t CONFIG_FILE_NONE
+                fi
+                echo ""
+                echo "  region                = $CFG_REGION"
+                echo "  language              = $CFG_LANGUAGE"
+                echo "  ai_backend            = $CFG_AI_BACKEND"
+                echo "  model                 = $CFG_MODEL"
+                echo "  transcribe_languages  = $CFG_TRANSCRIBE_LANGUAGES"
+                echo "  recording_dir         = $CFG_RECORDING_DIR"
+                echo "  max_speakers          = $CFG_MAX_SPEAKERS"
+                echo "  silence_threshold     = $CFG_SILENCE_THRESHOLD"
+                echo "  silence_grace         = $CFG_SILENCE_GRACE"
+                echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
+                echo "  audio_persist         = $CFG_AUDIO_PERSIST"
+                echo "  multi_language        = $CFG_MULTI_LANGUAGE"
+                echo "  visualizer            = $CFG_VISUALIZER"
+                echo "  email                 = ${CFG_EMAIL:-<not set>}"
+                echo "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
+                echo ""
+                [[ -f "$CONFIG_FILE" ]] && _t CONFIG_RESET_HINT "$CONFIG_FILE"
+                ;;
+            edit|"")
+                # ensure_config already created the file at startup if possible;
+                # if it's still missing (no template found), try once more or bail.
+                if [[ ! -f "$CONFIG_FILE" ]]; then
+                    ensure_config
+                    [[ -f "$CONFIG_FILE" ]] || {
+                        _t CONFIG_NO_TEMPLATE
+                        exit 1
+                    }
+                fi
+                MEETAP_EDITOR="${VISUAL:-${EDITOR:-vi}}"
+                _t CONFIG_OPENING_EDITOR "$MEETAP_EDITOR"
+                exec "$MEETAP_EDITOR" "$CONFIG_FILE"
+                ;;
+            *)
+                echo "Usage: meetap config [edit|show]" >&2
+                exit 1
+                ;;
+        esac
         ;;
     -v|--version|version)
         _t VERSION_LINE "$VERSION"
@@ -1394,7 +1388,7 @@ CFGEOF
         _t USAGE_STATUS
         _t USAGE_SETUP
         _t USAGE_CONFIG
-        _t USAGE_CONFIG_INIT
+        _t USAGE_CONFIG_SHOW
         _t USAGE_VERSION
         echo ""
         _t USAGE_HINT
