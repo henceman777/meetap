@@ -34,7 +34,10 @@ silence_threshold = -50
 silence_grace = 120
 
 # ── Display ──────────────────────────────────────────────────
-# CLI display language (en-US | zh-CN | ja-JP | ...)
+# CLI display language (en-US | zh-CN)
+# Only affects terminal output, notifications, and help text.
+# Meeting notes are always generated in Chinese regardless of this setting;
+# transcripts remain in the meeting's original language.
 language = zh-CN
 # Audio visualizer style: dot | bar | spectrum (color bars) | block
 visualizer = dot

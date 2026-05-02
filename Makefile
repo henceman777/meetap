@@ -19,6 +19,8 @@ install: all
 	cp $(BUILD)/audio-multi-output $(PREFIX)/audio-multi-output
 	cp $(BUILD)/audio-monitor $(PREFIX)/audio-monitor
 	chmod +x $(PREFIX)/meetap
+	mkdir -p $(PREFIX)/i18n
+	cp src/i18n/*.sh $(PREFIX)/i18n/
 	@CONFIG_DIR="$${XDG_CONFIG_HOME:-$(HOME)/.config}/meetap"; \
 	if [ ! -f "$$CONFIG_DIR/config" ]; then \
 		mkdir -p "$$CONFIG_DIR"; \

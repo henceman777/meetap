@@ -58,6 +58,41 @@ load_config() {
 load_config
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && cd "$(dirname "$(readlink "$(basename "$0")" || echo "$(basename "$0")")")" && pwd)"
+
+# --- i18n (CLI display only; meeting notes are always Chinese) ---
+load_i18n() {
+    local i18n_dir=""
+    # Look for i18n/ next to the script (dev or installed layout)
+    for d in "$SCRIPT_DIR/i18n" "$SCRIPT_DIR/../src/i18n"; do
+        [[ -d "$d" ]] && { i18n_dir="$d"; break; }
+    done
+    [[ -z "$i18n_dir" ]] && return 0
+
+    local lang="${CFG_LANGUAGE:-zh-CN}"
+    local msg_file="$i18n_dir/messages-${lang}.sh"
+    [[ -f "$msg_file" ]] || msg_file="$i18n_dir/messages-zh-CN.sh"
+    [[ -f "$msg_file" ]] && source "$msg_file"
+}
+
+# _t KEY [args...]  →  look up MSG_<KEY> and print with trailing newline
+_t() {
+    local key="MSG_$1"; shift
+    local template="${!key}"
+    [[ -z "$template" ]] && template="<missing:${key#MSG_}>"
+    # shellcheck disable=SC2059
+    printf "$template\n" "$@"
+}
+
+# _tn KEY [args...]  →  like _t but without trailing newline (for embedding)
+_tn() {
+    local key="MSG_$1"; shift
+    local template="${!key}"
+    [[ -z "$template" ]] && template="<missing:${key#MSG_}>"
+    # shellcheck disable=SC2059
+    printf "$template" "$@"
+}
+
+load_i18n
 TOOL="$SCRIPT_DIR/audio-multi-output"
 MONITOR="$SCRIPT_DIR/audio-monitor"
 VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
@@ -206,7 +241,7 @@ autostop_daemon() {
             fi
             local elapsed=$(( $(date +%s) - silence_start ))
             if [[ $elapsed -ge $CFG_SILENCE_GRACE ]]; then
-                osascript -e "display notification \"持续静音 ${CFG_SILENCE_GRACE} 秒，自动停止录制\" with title \"MeeTap\"" 2>/dev/null
+                osascript -e "display notification \"$(_tn AUTOSTOP_NOTIFY "$CFG_SILENCE_GRACE")\" with title \"MeeTap\"" 2>/dev/null
                 "$0" stop
                 break
             fi
@@ -233,17 +268,17 @@ transcribe_recording() {
     fi
 
     exec > "$LOG_FILE" 2>&1
-    echo "[$(date '+%H:%M:%S')] Transcription started"
+    echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
 
     if ! command -v aws &>/dev/null; then
-        echo "❌ AWS CLI not found, skipping transcription"
+        _t ERR_AWS_CLI_MISSING
         return 1
     fi
 
     local ACCOUNT_ID
     ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
     if [[ -z "$ACCOUNT_ID" ]]; then
-        echo "❌ AWS credentials not configured"
+        _t ERR_AWS_CREDS_MISSING
         return 1
     fi
 
@@ -256,15 +291,15 @@ transcribe_recording() {
     aws s3 mb "s3://${BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
 
     # Upload
-    echo "[$(date '+%H:%M:%S')] Uploading audio..."
+    echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"
     if ! aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_BASENAME}" --region "$AWS_REGION"; then
-        echo "❌ Upload failed"
+        _t ERR_UPLOAD_FAILED
         return 1
     fi
 
     if [[ "$CFG_AUDIO_PERSIST" != "true" && ! -f "$STATE_DIR/test-mode" ]]; then
         rm -f "$AUDIO_FILE"
-        echo "[$(date '+%H:%M:%S')] 🗑️ Local audio deleted (audio_persist=false)"
+        echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
     fi
 
     # Start transcription
@@ -272,7 +307,7 @@ transcribe_recording() {
     if [[ "$CFG_MULTI_LANGUAGE" == "true" ]]; then
         LANG_FLAG="--identify-multiple-languages"
     fi
-    echo "[$(date '+%H:%M:%S')] Starting transcription job: $JOB_NAME"
+    echo "[$(date '+%H:%M:%S')] $(_tn START_JOB "$JOB_NAME")"
     aws transcribe start-transcription-job \
         --transcription-job-name "$JOB_NAME" \
         $LANG_FLAG \
@@ -295,16 +330,16 @@ transcribe_recording() {
             --output text 2>/dev/null)
         if [[ -z "$STATUS" ]]; then
             POLL_ERRORS=$((POLL_ERRORS + 1))
-            echo "[$(date '+%H:%M:%S')] ⚠ Status query failed (${POLL_ERRORS}/5), retrying..."
+            echo "[$(date '+%H:%M:%S')] $(_tn STATUS_QUERY_RETRY "$POLL_ERRORS")"
             if [[ $POLL_ERRORS -ge 5 ]]; then
-                echo "❌ Status query failed 5 times consecutively, aborting"
+                _t STATUS_QUERY_ABORT
                 break
             fi
             sleep 10
             continue
         fi
         POLL_ERRORS=0
-        echo "[$(date '+%H:%M:%S')] Status: $STATUS"
+        echo "[$(date '+%H:%M:%S')] $(_tn STATUS_LINE "$STATUS")"
         [[ "$STATUS" != "IN_PROGRESS" ]] && break
         sleep 10
     done
@@ -316,15 +351,15 @@ transcribe_recording() {
             --region "$AWS_REGION" \
             --query 'TranscriptionJob.FailureReason' \
             --output text 2>/dev/null)
-        echo "❌ Transcription failed: ${STATUS:-empty} ${REASON:+— $REASON}"
+        _t ERR_TRANSCRIBE_FAILED "${STATUS:-empty} ${REASON:+— $REASON}"
         aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
         aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
-        osascript -e "display notification \"转录失败，请查看日志\" with title \"MeeTap\"" 2>/dev/null
+        osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
         return 1
     fi
 
     # Download result
-    echo "[$(date '+%H:%M:%S')] Downloading transcript..."
+    echo "[$(date '+%H:%M:%S')] $(_tn DOWNLOADING)"
     aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$LOG_DIR/transcribe-raw.json" --region "$AWS_REGION"
 
     # Extract transcript with speaker labels
@@ -407,8 +442,8 @@ with open(stats_file, "w") as f:
 print(f"Speaker stats saved: {stats_file}")
 PYEOF
 
-    echo "[$(date '+%H:%M:%S')] ✅ Transcription complete: $LOG_DIR/transcript.txt"
-    osascript -e "display notification \"转录完成，正在整理会议纪要...\" with title \"MeeTap\"" 2>/dev/null
+    echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_DONE "$LOG_DIR/transcript.txt")"
+    osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_DONE)\" with title \"MeeTap\"" 2>/dev/null
 
     # Generate meeting notes via Bedrock
     summarize_transcript "$SESSION_DIR"
@@ -608,7 +643,7 @@ summarize_via_claude_code() {
     local OUTPUT="$2"
 
     if ! command -v claude &>/dev/null; then
-        echo "[$(date '+%H:%M:%S')] ⚠️ claude CLI not found, falling back to bedrock"
+        echo "[$(date '+%H:%M:%S')] $(_tn CLAUDE_CLI_MISSING_FALLBACK)"
         summarize_via_bedrock "$PROMPT_FILE" "$OUTPUT"
         return
     fi
@@ -616,7 +651,7 @@ summarize_via_claude_code() {
     claude -p "$(cat "$PROMPT_FILE")" > "$OUTPUT" 2>/dev/null
 
     if [[ ! -s "$OUTPUT" ]]; then
-        echo "[$(date '+%H:%M:%S')] ⚠️ claude-code returned empty output, falling back to bedrock"
+        echo "[$(date '+%H:%M:%S')] $(_tn CLAUDE_EMPTY_FALLBACK)"
         rm -f "$OUTPUT"
         summarize_via_bedrock "$PROMPT_FILE" "$OUTPUT"
     fi
@@ -628,16 +663,16 @@ send_meeting_notes() {
 
     [[ -z "$CFG_EMAIL" ]] && return 0
     [[ -z "$CFG_EMAIL_SENDER" ]] && {
-        echo "[$(date '+%H:%M:%S')] ⚠️ email_sender not configured, skipping email"
+        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_SENDER_MISSING)"
         return 1
     }
     [[ ! -x "$VENV_PYTHON" ]] && {
-        echo "[$(date '+%H:%M:%S')] ⚠️ Python venv not found, skipping email"
+        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
         return 1
     }
 
     local PDF_FILE="${NOTES_FILE%.md}.pdf"
-    echo "[$(date '+%H:%M:%S')] 📧 Converting to PDF and sending email..."
+    echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_CONVERTING)"
 
     "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$CFG_EMAIL" "$CFG_EMAIL_SENDER" "$CFG_REGION" <<'PYEOF'
 import sys, os, re, boto3
@@ -767,9 +802,9 @@ finally:
 PYEOF
 
     if [[ $? -eq 0 ]]; then
-        echo "[$(date '+%H:%M:%S')] ✅ Email sent to: $CFG_EMAIL"
+        echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_SENT "$CFG_EMAIL")"
     else
-        echo "[$(date '+%H:%M:%S')] ⚠️ Email sending failed (notes still available locally)"
+        echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_FAILED)"
     fi
 }
 
@@ -781,11 +816,11 @@ summarize_transcript() {
     local PROMPT_FILE="$LOG_DIR/.prompt.tmp"
 
     if [[ ! -f "$TRANSCRIPT" ]]; then
-        echo "[$(date '+%H:%M:%S')] ⚠️ transcript.txt not found in log/, skipping summarization"
+        echo "[$(date '+%H:%M:%S')] $(_tn ERR_TRANSCRIPT_MISSING)"
         return 1
     fi
 
-    echo "[$(date '+%H:%M:%S')] 📝 Generating meeting notes via $CFG_AI_BACKEND..."
+    echo "[$(date '+%H:%M:%S')] $(_tn GENERATING_NOTES "$CFG_AI_BACKEND")"
 
     build_prompt "$SESSION_DIR" > "$PROMPT_FILE"
 
@@ -795,7 +830,7 @@ summarize_transcript() {
             ;;
         bedrock|*)
             if [[ ! -x "$VENV_PYTHON" ]]; then
-                echo "[$(date '+%H:%M:%S')] ⚠️ Python venv not found: $VENV_PYTHON, skipping summarization"
+                echo "[$(date '+%H:%M:%S')] $(_tn ERR_VENV_MISSING "$VENV_PYTHON")"
                 rm -f "$PROMPT_FILE"
                 return 1
             fi
@@ -806,12 +841,12 @@ summarize_transcript() {
     rm -f "$PROMPT_FILE"
 
     if [[ -f "$OUTPUT" ]]; then
-        echo "[$(date '+%H:%M:%S')] ✅ Meeting notes generated: $OUTPUT"
-        osascript -e "display notification \"会议纪要已生成: meeting-notes.md\" with title \"MeeTap\"" 2>/dev/null
+        echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$OUTPUT")"
+        osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE)\" with title \"MeeTap\"" 2>/dev/null
         send_meeting_notes "$OUTPUT" "$SESSION_DIR"
     else
-        echo "[$(date '+%H:%M:%S')] ⚠️ Meeting notes generation failed, transcript.txt is still available"
-        osascript -e "display notification \"纪要生成失败，转录文件可用\" with title \"MeeTap\"" 2>/dev/null
+        echo "[$(date '+%H:%M:%S')] $(_tn NOTES_FAILED)"
+        osascript -e "display notification \"$(_tn NOTIFY_NOTES_FAILED)\" with title \"MeeTap\"" 2>/dev/null
     fi
 }
 
@@ -826,8 +861,8 @@ start_recording() {
 
     # 检查是否已在录制
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "⚠️  已有录制进程在运行 (PID: $(cat "$PID_FILE"))"
-        echo "   如需重新开始，请先执行: $0 stop"
+        _t ERR_ALREADY_RECORDING "$(cat "$PID_FILE")"
+        _t HINT_STOP_FIRST "$0"
         exit 1
     fi
     # 清理残留状态
@@ -835,23 +870,23 @@ start_recording() {
 
     # 检查依赖
     if [[ ! -x "$TOOL" ]]; then
-        echo "❌ 未找到 audio-multi-output 工具: $TOOL"
+        _t ERR_TOOL_MISSING "$TOOL"
         exit 1
     fi
     if [[ ! -x "$MONITOR" ]]; then
-        echo "❌ 未找到 audio-monitor 工具: $MONITOR"
+        _t ERR_MONITOR_MISSING "$MONITOR"
         exit 1
     fi
     if ! command -v ffmpeg &>/dev/null; then
-        echo "❌ 未找到 ffmpeg，请运行: brew install ffmpeg"
+        _t ERR_FFMPEG_MISSING
         exit 1
     fi
 
     # 检查 BlackHole
     BH_UID=$("$TOOL" blackhole-uid 2>/dev/null)
     if [[ -z "$BH_UID" ]]; then
-        echo "❌ 未找到 BlackHole 2ch"
-        echo "   安装: brew install blackhole-2ch"
+        _t ERR_BLACKHOLE_MISSING
+        _t HINT_INSTALL_BLACKHOLE
         exit 1
     fi
 
@@ -864,28 +899,28 @@ start_recording() {
         if [[ -f "$ORIGINAL_UID_FILE" ]]; then
             ORIG_UID=$(cat "$ORIGINAL_UID_FILE")
             ORIG_NAME=$(cat "$ORIGINAL_NAME_FILE" 2>/dev/null || echo "$ORIG_UID")
-            $VERBOSE && echo "📍 当前音频输出: BlackHole (实际设备: $ORIG_NAME)"
+            $VERBOSE && _t CUR_OUTPUT_BH "$ORIG_NAME"
         else
-            echo "⚠️  当前输出是 BlackHole，请先切回正常扬声器/耳机"
+            _t ERR_OUTPUT_IS_BH
             exit 1
         fi
     else
-        $VERBOSE && echo "📍 当前音频输出: $ORIG_NAME"
+        $VERBOSE && _t CUR_OUTPUT "$ORIG_NAME"
     fi
 
     echo "$ORIG_UID" > "$ORIGINAL_UID_FILE"
     echo "$ORIG_NAME" > "$ORIGINAL_NAME_FILE"
 
     # 切换系统输出到 BlackHole
-    $VERBOSE && echo "🔧 切换系统输出到 BlackHole 2ch ..."
+    $VERBOSE && _t SWITCHING_TO_BH
     if ! SwitchAudioSource -s "BlackHole 2ch" -t output &>/dev/null; then
-        echo "❌ 无法切换到 BlackHole"
+        _t ERR_CANT_SWITCH_BH
         exit 1
     fi
-    $VERBOSE && echo "✅ 系统输出已切换到: BlackHole 2ch"
+    $VERBOSE && _t SWITCHED_TO_BH
 
     # 启动 audio-monitor：BlackHole → 原始设备（实时转发，用户能听到）
-    $VERBOSE && echo "🔧 启动音频转发: BlackHole → $ORIG_NAME ..."
+    $VERBOSE && _t STARTING_MONITOR "$ORIG_NAME"
     "$MONITOR" "$BH_UID" "$ORIG_UID" > "$STATE_DIR/monitor.log" 2>&1 &
     MONITOR_PID=$!
     echo $MONITOR_PID > "$MONITOR_PID_FILE"
@@ -893,13 +928,13 @@ start_recording() {
     sleep 1
 
     if ! kill -0 $MONITOR_PID 2>/dev/null; then
-        echo "❌ audio-monitor 启动失败:"
+        _t ERR_MONITOR_FAIL
         cat "$STATE_DIR/monitor.log"
         SwitchAudioSource -s "$ORIG_NAME" -t output &>/dev/null
         rm -f "$MONITOR_PID_FILE"
         exit 1
     fi
-    $VERBOSE && echo "✅ 音频转发已启动 → $ORIG_NAME"
+    $VERBOSE && _t MONITOR_STARTED "$ORIG_NAME"
 
     # 创建本次录制的会话目录
     SESSION_DIR="$RECORDING_DIR/$(date +"%Y%m%d_%H%M")"
@@ -914,7 +949,7 @@ start_recording() {
     # 开始录制（系统音频 + 麦克风混录）
     local MIC_NAME
     MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
-    $VERBOSE && echo "🎤 麦克风: $MIC_NAME"
+    $VERBOSE && _t MIC_DEVICE "$MIC_NAME"
     ffmpeg -f avfoundation -i ":BlackHole 2ch" \
         -f avfoundation -i ":default" \
         -filter_complex amix=inputs=2:duration=longest \
@@ -936,11 +971,11 @@ start_recording() {
         disown $AUTOSTOP_PID
 
         echo ""
-        echo "🎙️  录制已开始"
-        $VERBOSE && echo "   文件: $OUTPUT_FILE"
-        echo "   播放: $ORIG_NAME"
-        echo "   自动停止: 持续静音 2 分钟后"
-        echo "   停止录制: $0 stop"
+        _t RECORDING_STARTED
+        $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
+        _t FIELD_PLAYBACK "$ORIG_NAME"
+        _t FIELD_AUTOSTOP
+        _t FIELD_STOP_CMD "$0"
         echo ""
 
         local TTY_DEV
@@ -953,7 +988,7 @@ start_recording() {
             disown $!
         fi
     else
-        echo "❌ ffmpeg 启动失败:"
+        _t ERR_FFMPEG_FAIL
         cat "$STATE_DIR/ffmpeg.log"
         # 回滚
         kill $MONITOR_PID 2>/dev/null
@@ -975,7 +1010,7 @@ stop_recording() {
     fi
 
     if [[ ! -f "$PID_FILE" ]]; then
-        echo "⚠️  没有正在进行的录制"
+        _t ERR_NO_ACTIVE_RECORDING
         exit 1
     fi
 
@@ -984,14 +1019,14 @@ stop_recording() {
     # 停止 ffmpeg
     if kill -0 "$FFMPEG_PID" 2>/dev/null; then
         kill -INT "$FFMPEG_PID"
-        echo "⏳ 等待录制完成..."
+        _t WAITING_RECORDING
         for i in $(seq 1 15); do
             kill -0 "$FFMPEG_PID" 2>/dev/null || break
             sleep 1
         done
         # 如果 15 秒后仍未退出，强制终止
         if kill -0 "$FFMPEG_PID" 2>/dev/null; then
-            echo "⚠️  ffmpeg 未响应 SIGINT，强制终止..."
+            _t FFMPEG_FORCE_KILL
             kill -9 "$FFMPEG_PID" 2>/dev/null
             sleep 1
         fi
@@ -1009,11 +1044,11 @@ stop_recording() {
     if [[ -f "$ORIGINAL_NAME_FILE" ]]; then
         ORIG_NAME=$(cat "$ORIGINAL_NAME_FILE")
         if SwitchAudioSource -s "$ORIG_NAME" -t output &>/dev/null; then
-            echo "🔊 音频输出已恢复: $ORIG_NAME"
+            _t OUTPUT_RESTORED "$ORIG_NAME"
         elif SwitchAudioSource -s "MacBook Pro Speakers" -t output &>/dev/null; then
-            echo "⚠️  原始设备 ($ORIG_NAME) 已断开，已切换到: MacBook Pro Speakers"
+            _t ORIG_DEVICE_DISCONNECTED_FALLBACK "$ORIG_NAME"
         else
-            echo "⚠️  原始设备 ($ORIG_NAME) 已断开，请手动选择输出设备"
+            _t ORIG_DEVICE_DISCONNECTED_MANUAL "$ORIG_NAME"
         fi
         rm -f "$ORIGINAL_UID_FILE" "$ORIGINAL_NAME_FILE"
     fi
@@ -1032,21 +1067,21 @@ stop_recording() {
                 SECS=$((DURATION % 60))
                 echo ""
                 if $VERBOSE; then
-                    echo "✅ 录制已保存"
-                    echo "   文件: $OUTPUT_FILE"
-                    echo "   大小: $FILE_SIZE"
-                    echo "   时长: ${MINS}分${SECS}秒"
+                    _t RECORDING_SAVED
+                    _t FIELD_FILE "$OUTPUT_FILE"
+                    _t FIELD_SIZE "$FILE_SIZE"
+                    _t FIELD_DURATION "$MINS" "$SECS"
                 else
-                    echo "✅ 会议采样成功"
+                    _t RECORDING_SUCCESS
                 fi
             else
                 echo ""
                 if $VERBOSE; then
-                    echo "✅ 录制已保存"
-                    echo "   文件: $OUTPUT_FILE"
-                    echo "   大小: $FILE_SIZE"
+                    _t RECORDING_SAVED
+                    _t FIELD_FILE "$OUTPUT_FILE"
+                    _t FIELD_SIZE "$FILE_SIZE"
                 else
-                    echo "✅ 会议采样成功"
+                    _t RECORDING_SUCCESS
                 fi
             fi
         fi
@@ -1058,10 +1093,10 @@ stop_recording() {
         rm -f "$STATE_DIR/session-dir"
         if [[ -d "$SESSION_DIR" ]] && [ -z "$(ls -A "$SESSION_DIR")" ]; then
             rmdir "$SESSION_DIR"
-            echo "🗑️  未产生录音文件，已删除空目录: $SESSION_DIR"
+            _t EMPTY_SESSION_REMOVED "$SESSION_DIR"
         elif [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
             echo ""
-            echo "📝 后台转录已启动（完成后会收到通知）"
+            _t TRANSCRIBE_BACKGROUND
             transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" &
             disown
         fi
@@ -1077,20 +1112,20 @@ show_status() {
             local secs=$(( $(date +%s) - start_time ))
             elapsed=$(printf " (%02d:%02d)" $((secs/60)) $((secs%60)))
         fi
-        echo "🎙️  录制中${elapsed}"
-        [[ -f "$OUTPUT_FILE_MARKER" ]] && echo "   文件: $(cat "$OUTPUT_FILE_MARKER")"
-        [[ -f "$ORIGINAL_NAME_FILE" ]] && echo "   播放设备: $(cat "$ORIGINAL_NAME_FILE")"
+        _t STATUS_RECORDING "$elapsed"
+        [[ -f "$OUTPUT_FILE_MARKER" ]] && _t STATUS_FILE "$(cat "$OUTPUT_FILE_MARKER")"
+        [[ -f "$ORIGINAL_NAME_FILE" ]] && _t STATUS_PLAYBACK "$(cat "$ORIGINAL_NAME_FILE")"
         if [[ -f "$AUTOSTOP_PID_FILE" ]] && kill -0 "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null; then
-            echo "   自动停止: 已启用"
+            _t STATUS_AUTOSTOP_ON
         fi
         if [[ -f "$MONITOR_PID_FILE" ]] && kill -0 "$(cat "$MONITOR_PID_FILE")" 2>/dev/null; then
-            echo "   音频转发: 运行中"
+            _t STATUS_MONITOR_RUN
         fi
         if [[ -f "$VISUALIZER_PID_FILE" ]] && kill -0 "$(cat "$VISUALIZER_PID_FILE")" 2>/dev/null; then
-            echo "   波形显示: 运行中（终端底部）"
+            _t STATUS_VISUALIZER_RUN
         fi
     else
-        echo "⏹️  未在录制"
+        _t STATUS_IDLE
         rm -f "$PID_FILE"
     fi
 }
@@ -1100,7 +1135,7 @@ setup_zoom() {
     local SYSTEM_HEX="53616d652061732053797374656d"  # "Same as System" in hex
 
     if [[ ! -f "$VIPER_INI" ]]; then
-        echo "⚠️  未找到 Zoom 配置文件，请先运行一次 Zoom"
+        _t SETUP_ZOOM_NO_CONFIG
         return 1
     fi
 
@@ -1108,17 +1143,17 @@ setup_zoom() {
     local CURRENT_SPK
     CURRENT_SPK=$(grep "^AECSPK=" "$VIPER_INI" | cut -d= -f2)
     if [[ "$CURRENT_SPK" == "$SYSTEM_HEX" ]]; then
-        echo "✅ Zoom 扬声器已是 Same as System，无需修改"
+        _t SETUP_ZOOM_ALREADY_OK
         return 0
     fi
 
     local CURRENT_NAME
     CURRENT_NAME=$(echo -n "$CURRENT_SPK" | xxd -r -p 2>/dev/null)
-    echo "📍 Zoom 当前扬声器: $CURRENT_NAME"
+    _t SETUP_ZOOM_CUR_SPK "$CURRENT_NAME"
 
     # Zoom 运行时修改会被覆盖，需要先退出
     if pgrep -x "zoom.us" >/dev/null; then
-        echo "⏳ 正在退出 Zoom（修改后会自动重新打开）..."
+        _t SETUP_ZOOM_QUITTING
         osascript -e 'tell application "zoom.us" to quit' 2>/dev/null
         # 等待完全退出
         for i in {1..10}; do
@@ -1126,7 +1161,7 @@ setup_zoom() {
             sleep 1
         done
         if pgrep -x "zoom.us" >/dev/null; then
-            echo "❌ Zoom 无法正常退出，请手动关闭后重试"
+            _t SETUP_ZOOM_CANT_QUIT
             return 1
         fi
         local REOPEN_ZOOM=1
@@ -1140,11 +1175,11 @@ setup_zoom() {
         sed -i '' "s/^AECBSSPK=.*/AECBSSPK=$SYSTEM_HEX/" "$VIPER_INI"
     fi
 
-    echo "✅ Zoom 扬声器已设为: Same as System"
+    _t SETUP_ZOOM_DONE
 
     # 重新打开 Zoom
     if [[ "${REOPEN_ZOOM:-0}" == "1" ]]; then
-        echo "🔄 正在重新打开 Zoom..."
+        _t SETUP_ZOOM_REOPENING
         open -a "zoom.us"
     fi
 }
@@ -1155,28 +1190,28 @@ setup_teams() {
 
     BH_UID=$("$TOOL" blackhole-uid 2>/dev/null)
     if [[ -z "$BH_UID" ]]; then
-        echo "❌ 未找到 BlackHole 2ch"
+        _t ERR_BLACKHOLE_MISSING
         return 1
     fi
 
     # 打开 Teams 设备设置页面
     if ! pgrep -f "Microsoft Teams" >/dev/null; then
-        echo "⏳ 正在打开 Teams..."
+        _t SETUP_TEAMS_OPENING
         open -a "Microsoft Teams"
         sleep 3
     fi
 
-    echo "🔧 正在打开 Teams 设备设置..."
+    _t SETUP_TEAMS_OPEN_SETTINGS
     open "msteams://settings/devices" 2>/dev/null
 
     echo ""
-    echo "📋 请在 Teams 设置页面中:"
-    echo "   Speaker → 选择「BlackHole 2ch」"
+    _t SETUP_TEAMS_INSTRUCT_HEADER
+    _t SETUP_TEAMS_INSTRUCT_SPEAKER
     echo ""
-    echo "   ⚠️  只需设置一次"
+    _t SETUP_ONCE_NOTE
     echo ""
-    read -p "   设置完成后按 Enter 继续..."
-    echo "✅ Teams 设置完成"
+    read -p "$(_tn SETUP_PRESS_ENTER)"
+    _t SETUP_TEAMS_DONE
 }
 
 setup_wemeet() {
@@ -1185,53 +1220,53 @@ setup_wemeet() {
 
     BH_UID=$("$TOOL" blackhole-uid 2>/dev/null)
     if [[ -z "$BH_UID" ]]; then
-        echo "❌ 未找到 BlackHole 2ch"
+        _t ERR_BLACKHOLE_MISSING
         return 1
     fi
 
     # 打开腾讯会议
     if ! pgrep -f "TencentMeeting" >/dev/null; then
-        echo "⏳ 正在打开腾讯会议..."
+        _t SETUP_WEMEET_OPENING
         open -a "TencentMeeting"
         sleep 3
     fi
 
     echo ""
-    echo "📋 请在腾讯会议中手动设置:"
-    echo "   1. 点击头像 → 设置 → 音频"
-    echo "   2. 扬声器 → 选择「BlackHole 2ch」"
+    _t SETUP_WEMEET_INSTRUCT_HEADER
+    _t SETUP_WEMEET_STEP1
+    _t SETUP_WEMEET_STEP2
     echo ""
-    echo "   ⚠️  只需设置一次"
+    _t SETUP_ONCE_NOTE
     echo ""
-    read -p "   设置完成后按 Enter 继续..."
-    echo "✅ 腾讯会议设置完成"
+    read -p "$(_tn SETUP_PRESS_ENTER)"
+    _t SETUP_WEMEET_DONE
 }
 
 setup_apps() {
-    echo "==============================="
-    echo " 会议 App 扬声器一键配置"
-    echo "==============================="
+    _t SETUP_HEADER
+    _t SETUP_TITLE
+    _t SETUP_HEADER
     echo ""
 
-    echo "【1/3】配置 Zoom"
-    echo "---"
+    _t SETUP_STEP_ZOOM
+    _t SETUP_DIVIDER
     setup_zoom
     echo ""
 
-    echo "【2/3】配置 Teams"
-    echo "---"
+    _t SETUP_STEP_TEAMS
+    _t SETUP_DIVIDER
     setup_teams
     echo ""
 
-    echo "【3/3】配置腾讯会议"
-    echo "---"
+    _t SETUP_STEP_WEMEET
+    _t SETUP_DIVIDER
     setup_wemeet
     echo ""
 
-    echo "==============================="
-    echo "✅ 配置完成！现在可以使用 $0 start 录制会议了"
-    echo "   此配置只需执行一次，除非你在 App 中手动改回。"
-    echo "==============================="
+    _t SETUP_HEADER
+    _t SETUP_ALL_DONE "$0"
+    _t SETUP_ALL_DONE_HINT
+    _t SETUP_HEADER
 }
 
 case "${1:-}" in
@@ -1261,8 +1296,8 @@ case "${1:-}" in
             config_dir="$(dirname "$CONFIG_FILE")"
             mkdir -p "$config_dir"
             if [[ -f "$CONFIG_FILE" ]]; then
-                echo "⚠️  Config file already exists: $CONFIG_FILE"
-                echo "   Delete it first and re-run 'meetap config init' to reset"
+                _t CONFIG_EXISTS "$CONFIG_FILE"
+                _t CONFIG_EXISTS_HINT
             else
                 cat > "$CONFIG_FILE" <<'CFGEOF'
 # MeeTap Configuration
@@ -1301,7 +1336,10 @@ silence_threshold = -50
 silence_grace = 120
 
 # ── Display ──────────────────────────────────────────────────
-# CLI display language (en-US | zh-CN | ja-JP | ...)
+# CLI display language (en-US | zh-CN)
+# Only affects terminal output, notifications, and help text.
+# Meeting notes are always generated in Chinese regardless of this setting;
+# transcripts remain in the meeting's original language.
 language = zh-CN
 # Audio visualizer style: dot | bar | spectrum (color bars) | block
 visualizer = dot
@@ -1312,16 +1350,16 @@ visualizer = dot
 # SES verified sender address (required if email is set)
 # email_sender = meetap@example.com
 CFGEOF
-                echo "✅ Config file created: $CONFIG_FILE"
-                echo "   Edit to customize: $CONFIG_FILE"
+                _t CONFIG_CREATED "$CONFIG_FILE"
+                _t CONFIG_CREATED_HINT "$CONFIG_FILE"
             fi
         else
-            echo "MeeTap v${VERSION} Configuration"
-            echo "================================="
+            _t CONFIG_HEADER "$VERSION"
+            _t CONFIG_SEPARATOR
             if [[ -f "$CONFIG_FILE" ]]; then
-                echo "Config file: $CONFIG_FILE"
+                _t CONFIG_FILE_PATH "$CONFIG_FILE"
             else
-                echo "Config file: (not created, using defaults)"
+                _t CONFIG_FILE_NONE
             fi
             echo ""
             echo "  region                = $CFG_REGION"
@@ -1340,25 +1378,25 @@ CFGEOF
             echo "  email                 = ${CFG_EMAIL:-<not set>}"
             echo "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
             echo ""
-            echo "Run 'meetap config init' to generate config file"
+            _t CONFIG_HINT_INIT
         fi
         ;;
     -v|--version|version)
-        echo "MeeTap v${VERSION}"
+        _t VERSION_LINE "$VERSION"
         ;;
     *)
-        echo "MeeTap v${VERSION} - macOS 会议录制 + 自动转录"
+        _t USAGE_HEADER "$VERSION"
         echo ""
-        echo "用法: meetap {start|stop|status|setup|config|version}"
+        _t USAGE_LINE
         echo ""
-        echo "  start [-t]   开始录制（-t 显示详细设备信息）"
-        echo "  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
-        echo "  status       查看当前录制状态"
-        echo "  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
-        echo "  config       显示当前配置"
-        echo "  config init  生成默认配置文件"
-        echo "  version      显示版本号"
+        _t USAGE_START
+        _t USAGE_STOP
+        _t USAGE_STATUS
+        _t USAGE_SETUP
+        _t USAGE_CONFIG
+        _t USAGE_CONFIG_INIT
+        _t USAGE_VERSION
         echo ""
-        echo "首次使用请先运行: meetap setup"
+        _t USAGE_HINT
         ;;
 esac
