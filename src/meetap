@@ -1100,7 +1100,6 @@ stop_recording() {
             if [[ -n "$DURATION" && "$DURATION" -gt 0 ]]; then
                 MINS=$((DURATION / 60))
                 SECS=$((DURATION % 60))
-                echo ""
                 if $VERBOSE; then
                     _t RECORDING_SAVED
                     _t FIELD_FILE "$OUTPUT_FILE"
@@ -1110,7 +1109,6 @@ stop_recording() {
                     _t RECORDING_SUCCESS
                 fi
             else
-                echo ""
                 if $VERBOSE; then
                     _t RECORDING_SAVED
                     _t FIELD_FILE "$OUTPUT_FILE"
@@ -1130,7 +1128,6 @@ stop_recording() {
             rmdir "$SESSION_DIR"
             _t EMPTY_SESSION_REMOVED "$SESSION_DIR"
         elif [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
-            echo ""
             _t TRANSCRIBE_BACKGROUND
             transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" &
             disown

@@ -221,7 +221,7 @@ flowchart TB
 
 ### 6.2 云端处理：客户端直连 4 个托管服务
 
-音频文件已经在本地后，meetap CLI 作为唯一控制面，在一次 `meetap stop` 的命令生命周期内：上传、转录、生成纪要、（可选）发邮件、清理——**没有 Lambda、没有常驻基础设施，账户里不留临时资源**。
+音频采集到本地后，meetap CLI 作为唯一控制面，在一次 `meetap stop` 的命令生命周期内：上传、转录、生成纪要、（可选）发邮件、清理——**没有 Lambda、没有常驻基础设施，账户里不留临时资源**。
 
 ![MeeTap AWS 架构图](docs/assets/aws-architecture.png)
 

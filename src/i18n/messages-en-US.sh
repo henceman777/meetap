@@ -76,7 +76,7 @@ MSG_ORIG_DEVICE_DISCONNECTED_MANUAL="⚠️  Original device (%s) disconnected, 
 MSG_RECORDING_SAVED="✅ Recording saved"
 MSG_FIELD_SIZE="   Size: %s"
 MSG_FIELD_DURATION="   Duration: %sm%ss"
-MSG_RECORDING_SUCCESS="✅ Meeting captured successfully"
+MSG_RECORDING_SUCCESS="✅ Audio captured successfully"
 MSG_EMPTY_SESSION_REMOVED="🗑️  No audio captured, removed empty directory: %s"
 MSG_TRANSCRIBE_BACKGROUND="📝 Background transcription started (you'll be notified when done)"
 
