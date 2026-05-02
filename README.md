@@ -261,7 +261,7 @@ sequenceDiagram
     participant TX as Amazon Transcribe
     participant BR as Amazon Bedrock
 
-    U->>S3: ① 上传 meeting.m4a
+    U->>S3: ① 上传采集的音频
     U->>TX: ② StartTranscriptionJob
     loop 每 10 秒轮询
         U->>TX: GetTranscriptionJob
