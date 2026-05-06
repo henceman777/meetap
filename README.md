@@ -357,7 +357,7 @@ sequenceDiagram
 | SES | 前 62,000 封/月免费 | ≈ $0 |
 | **合计** | | **≈ $0.73** |
 
-换用 Claude Sonnet 4 成本约 $0.05，总计约 $0.77。
+换用 DeepSeek v3.2 可进一步降低纪要生成成本，具体以 [Bedrock 当前定价](https://aws.amazon.com/bedrock/pricing/) 为准。
 
 ---
 
