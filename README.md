@@ -53,10 +53,20 @@
 ### 方式 A：Homebrew Tap（推荐）
 
 ```bash
-brew install henceman777/tap/meetap
+# 一次性 tap（只需做一次）
+brew tap henceman777/tap
+
+# 之后这样安装和升级
+brew install meetap
+brew upgrade meetap
 # 自动安装依赖：blackhole-2ch, ffmpeg, switchaudio-osx
 # 自动重启 coreaudiod 让系统识别 BlackHole（音频会断 2–3 秒）
 ```
+
+> 也可以一行搞定（自动 tap + install，但命令较长）：
+> ```bash
+> brew install henceman777/tap/meetap
+> ```
 
 ### 方式 B：从源码构建
 
