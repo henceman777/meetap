@@ -317,13 +317,23 @@ transcribe_recording() {
         return 1
     fi
 
-    local BUCKET="meetap-transcribe-${ACCOUNT_ID}-${AWS_REGION}"
+    # 用 Account ID 短哈希代替明文，避免桶名泄露 AWS 账户 ID（桶名仍全局唯一且稳定）
+    local ACCOUNT_HASH
+    ACCOUNT_HASH=$(printf '%s' "$ACCOUNT_ID" | shasum -a 256 | cut -c1-12)
+    local BUCKET="meetap-transcribe-${ACCOUNT_HASH}-${AWS_REGION}"
     local AUDIO_BASENAME
     AUDIO_BASENAME=$(basename "$AUDIO_FILE")
     local JOB_NAME="meetap-$(date +%Y%m%d-%H%M%S)-$$"
 
     # Create bucket if not exists
     aws s3 mb "s3://${BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
+
+    # 锁死公共访问，兜底防止误配导致内容泄露
+    aws s3api put-public-access-block \
+        --bucket "$BUCKET" \
+        --public-access-block-configuration \
+        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
+        --region "$AWS_REGION" 2>/dev/null || true
 
     # Upload
     echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"

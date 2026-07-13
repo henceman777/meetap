@@ -1,3 +1,16 @@
+# Copyright 2026 henceman777
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # MeeTap — 中文 (zh-CN) CLI 消息表
 # 仅覆盖 CLI 显示范围：终端输出、系统通知、帮助文案
 # 不包括：会议纪要（永远中文）、transcript（会议原语）、AWS SDK 错误

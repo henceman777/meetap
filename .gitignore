@@ -8,3 +8,6 @@ build/
 *.m4a
 *.json
 transcribe.log
+
+# ProtoShield scan artifacts
+.protoshield/
