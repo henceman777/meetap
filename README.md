@@ -315,7 +315,7 @@ sequenceDiagram
         "s3:PutObject",
         "s3:GetObject",
         "s3:DeleteObject",
-        "s3:ListBucket"
+        "s3:PutBucketPublicAccessBlock"
       ],
       "Resource": [
         "arn:aws:s3:::meetap-transcribe-*",
@@ -323,24 +323,29 @@ sequenceDiagram
       ]
     },
     {
-      "Sid": "TranscribeJobs",
+      "Sid": "TranscribeStartJob",
       "Effect": "Allow",
-      "Action": [
-        "transcribe:StartTranscriptionJob",
-        "transcribe:GetTranscriptionJob",
-        "transcribe:DeleteTranscriptionJob"
-      ],
+      "Action": ["transcribe:StartTranscriptionJob"],
       "Resource": "*",
       "Condition": {
         "StringEquals": { "aws:RequestedRegion": "us-east-1" }
       }
     },
     {
+      "Sid": "TranscribeGetDeleteJob",
+      "Effect": "Allow",
+      "Action": [
+        "transcribe:GetTranscriptionJob",
+        "transcribe:DeleteTranscriptionJob"
+      ],
+      "Resource": "arn:aws:transcribe:us-east-1:*:transcription-job/meetap-*"
+    },
+    {
       "Sid": "BedrockInvoke",
       "Effect": "Allow",
       "Action": ["bedrock:InvokeModelWithResponseStream"],
       "Resource": [
-        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-*",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-*",
         "arn:aws:bedrock:us-east-1:*:inference-profile/us.anthropic.claude-sonnet-4-*"
       ]
     },
@@ -348,7 +353,7 @@ sequenceDiagram
       "Sid": "SESSendFromConfiguredSender",
       "Effect": "Allow",
       "Action": ["ses:SendRawEmail"],
-      "Resource": "*",
+      "Resource": "arn:aws:ses:us-east-1:*:identity/noreply@example.com",
       "Condition": {
         "StringEquals": {
           "ses:FromAddress": "noreply@example.com"
@@ -359,11 +364,11 @@ sequenceDiagram
 }
 ```
 
-> **最小权限说明**（按 ProtoShield 扫描建议收紧）：
-> - **S3**：已移除 `s3:CreateBucket`（该动作无法按桶名限定，写在这里无效）。请在首次运行前**手动预建桶**，桶名格式为 `meetap-transcribe-<AccountID 短哈希>-<region>`（哈希由 `echo -n <AccountID> | shasum -a 256 | cut -c1-12` 计算），或临时附加一个带 `s3:CreateBucket` 的宽松策略跑一次后再收回。
-> - **Transcribe**：Transcribe 不支持资源级 ARN，故用 `aws:RequestedRegion` 条件锁定 region。若切换 region，请同步修改（可用数组，如 `["us-east-1", "cn-northwest-1"]`）。
-> - **Bedrock**：已从 `foundation-model/*` 收窄到 Claude Sonnet 4 系列。若改用其他模型（Nova / Llama / DeepSeek 等），请相应追加对应的 model / inference-profile ARN。
-> - **SES**：请将 `noreply@example.com` 替换为你 `email_sender` 配置的实际发件地址；若发件人不固定，可改用 `"ses:FromDomain": "example.com"` 按域限制。
+> **最小权限说明**（依据 AWS Service Authorization Reference 逐动作核实后收紧）：
+> - **S3**：移除了无效的 `s3:CreateBucket`（该动作不支持按桶名限定资源，写在此处无效）和代码未调用的 `s3:ListBucket`；补充了代码实际调用的 `s3:PutBucketPublicAccessBlock`。请在首次运行前**手动预建桶**，桶名格式为 `meetap-transcribe-<AccountID 短哈希>-<region>`（哈希由 `echo -n <AccountID> | shasum -a 256 | cut -c1-12` 计算），或临时附加带 `s3:CreateBucket` 的宽松策略跑一次后收回。
+> - **Transcribe**：`StartTranscriptionJob` 是创建型动作，**官方不支持资源级 ARN**（Resource types 列为空），只能用 `Resource: "*"` + `aws:RequestedRegion` 条件锁定 region——强行给它加 ARN 会导致启动转录被拒。`GetTranscriptionJob` / `DeleteTranscriptionJob` 支持资源级 ARN，已收窄到 `transcription-job/meetap-*`（匹配代码里的 `meetap-<时间戳>-<PID>` 任务名）。切换 region 时两处都要同步修改。
+> - **Bedrock**：`foundation-model` 与 `inference-profile` ARN 均已锁定 `us-east-1`。若切 region 或改用其他模型（Nova / Llama / DeepSeek 等），请同步调整 ARN。
+> - **SES**：`Resource` 已收窄到发件人 identity ARN，并保留 `ses:FromAddress` 条件双重限制。请将两处 `noreply@example.com` 替换为你 `email_sender` 配置的实际发件地址；若用整个域发信，可改用域 identity ARN + `"ses:FromDomain"` 条件。
 
 **建议**：同时在 [AWS Budgets](https://console.aws.amazon.com/cost-management/home#/budgets) 设一个 $10/月 的告警，防止异常用量。
 
