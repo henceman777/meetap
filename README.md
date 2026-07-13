@@ -309,9 +309,9 @@ sequenceDiagram
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "S3ObjectOps",
       "Effect": "Allow",
       "Action": [
-        "s3:CreateBucket",
         "s3:PutObject",
         "s3:GetObject",
         "s3:DeleteObject",
@@ -323,27 +323,47 @@ sequenceDiagram
       ]
     },
     {
+      "Sid": "TranscribeJobs",
       "Effect": "Allow",
       "Action": [
         "transcribe:StartTranscriptionJob",
         "transcribe:GetTranscriptionJob",
         "transcribe:DeleteTranscriptionJob"
       ],
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": "us-east-1" }
+      }
     },
     {
+      "Sid": "BedrockInvoke",
       "Effect": "Allow",
       "Action": ["bedrock:InvokeModelWithResponseStream"],
-      "Resource": "arn:aws:bedrock:*::foundation-model/*"
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-*",
+        "arn:aws:bedrock:us-east-1:*:inference-profile/us.anthropic.claude-sonnet-4-*"
+      ]
     },
     {
+      "Sid": "SESSendFromConfiguredSender",
       "Effect": "Allow",
       "Action": ["ses:SendRawEmail"],
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ses:FromAddress": "noreply@example.com"
+        }
+      }
     }
   ]
 }
 ```
+
+> **最小权限说明**（按 ProtoShield 扫描建议收紧）：
+> - **S3**：已移除 `s3:CreateBucket`（该动作无法按桶名限定，写在这里无效）。请在首次运行前**手动预建桶**，桶名格式为 `meetap-transcribe-<AccountID 短哈希>-<region>`（哈希由 `echo -n <AccountID> | shasum -a 256 | cut -c1-12` 计算），或临时附加一个带 `s3:CreateBucket` 的宽松策略跑一次后再收回。
+> - **Transcribe**：Transcribe 不支持资源级 ARN，故用 `aws:RequestedRegion` 条件锁定 region。若切换 region，请同步修改（可用数组，如 `["us-east-1", "cn-northwest-1"]`）。
+> - **Bedrock**：已从 `foundation-model/*` 收窄到 Claude Sonnet 4 系列。若改用其他模型（Nova / Llama / DeepSeek 等），请相应追加对应的 model / inference-profile ARN。
+> - **SES**：请将 `noreply@example.com` 替换为你 `email_sender` 配置的实际发件地址；若发件人不固定，可改用 `"ses:FromDomain": "example.com"` 按域限制。
 
 **建议**：同时在 [AWS Budgets](https://console.aws.amazon.com/cost-management/home#/budgets) 设一个 $10/月 的告警，防止异常用量。
 
