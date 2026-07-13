@@ -368,7 +368,10 @@ sequenceDiagram
 > - **S3**：移除了无效的 `s3:CreateBucket`（该动作不支持按桶名限定资源，写在此处无效）和代码未调用的 `s3:ListBucket`；补充了代码实际调用的 `s3:PutBucketPublicAccessBlock`。请在首次运行前**手动预建桶**，桶名格式为 `meetap-transcribe-<AccountID 短哈希>-<region>`（哈希由 `echo -n <AccountID> | shasum -a 256 | cut -c1-12` 计算），或临时附加带 `s3:CreateBucket` 的宽松策略跑一次后收回。
 > - **Transcribe**：`StartTranscriptionJob` 是创建型动作，**官方不支持资源级 ARN**（Resource types 列为空），只能用 `Resource: "*"` + `aws:RequestedRegion` 条件锁定 region——强行给它加 ARN 会导致启动转录被拒。`GetTranscriptionJob` / `DeleteTranscriptionJob` 支持资源级 ARN，已收窄到 `transcription-job/meetap-*`（匹配代码里的 `meetap-<时间戳>-<PID>` 任务名）。切换 region 时两处都要同步修改。
 > - **Bedrock**：`foundation-model` 与 `inference-profile` ARN 均已锁定 `us-east-1`。若切 region 或改用其他模型（Nova / Llama / DeepSeek 等），请同步调整 ARN。
-> - **SES**：`Resource` 已收窄到发件人 identity ARN，并保留 `ses:FromAddress` 条件双重限制。请将两处 `noreply@example.com` 替换为你 `email_sender` 配置的实际发件地址；若用整个域发信，可改用域 identity ARN + `"ses:FromDomain"` 条件。
+> - **SES**：`Resource` 已收窄到发件人 identity ARN，并保留 `ses:FromAddress` 条件双重限制。使用前请注意三点：
+>   1. **identity 必须已在 SES 验证**，且 ARN 里的 **region 要与你验证 identity 的 region 一致**（未必是 `us-east-1`——SES identity 是按 region 独立验证的）；ARN region 与 `email_sender` 实际发信 region 不匹配会导致 IAM 拒绝、邮件发不出。
+>   2. 将两处 `noreply@example.com` 替换为你验证的实际发件地址。**若验证的是邮箱**，`identity/` 后写完整邮箱；**若验证的是整个域**，改用域 identity ARN（`identity/example.com`）并保留 `ses:FromAddress` 条件锁定具体发件人——域验证方式对未单独验证的邮箱也生效，更通用。
+>   3. **新账户 SES 默认处于 sandbox**，只能发给已验证的收件地址；要给任意与会者发送需先在 SES 控制台申请生产访问（Production Access）。
 
 **建议**：同时在 [AWS Budgets](https://console.aws.amazon.com/cost-management/home#/budgets) 设一个 $10/月 的告警，防止异常用量。
 
