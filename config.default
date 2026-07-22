@@ -8,7 +8,7 @@ region = us-east-1
 # Backend for meeting notes generation (bedrock | claude-code)
 ai_backend = bedrock
 # Bedrock model (only used when ai_backend = bedrock)
-model = us.anthropic.claude-sonnet-4-6
+model = global.anthropic.claude-sonnet-5
 
 # ── Transcription ────────────────────────────────────────────
 # Languages (space-separated, priority order, AWS Transcribe codes)

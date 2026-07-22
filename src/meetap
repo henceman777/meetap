@@ -8,7 +8,7 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
 # Defaults
 CFG_REGION="us-east-1"
 CFG_LANGUAGE="zh-CN"
-CFG_MODEL="us.anthropic.claude-sonnet-4-6"
+CFG_MODEL="global.anthropic.claude-sonnet-5"
 CFG_TRANSCRIBE_LANGUAGES="en-US zh-CN ja-JP"
 CFG_RECORDING_DIR="$HOME/Record"
 CFG_MAX_SPEAKERS=10
