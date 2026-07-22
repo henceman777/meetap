@@ -11,3 +11,6 @@ transcribe.log
 
 # ProtoShield scan artifacts
 .protoshield/
+
+# 轨道3 黄金样本回归测试的生成物（可由 test/track3-golden-test.sh 重新生成）
+test/golden-*.txt

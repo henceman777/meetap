@@ -23,6 +23,8 @@ install: all
 	cp src/i18n/*.sh $(PREFIX)/i18n/
 	mkdir -p $(PREFIX)/share/meetap
 	cp config.default $(PREFIX)/share/meetap/config.default
+	mkdir -p $(PREFIX)/share/meetap/prompts
+	cp share/meetap/prompts/*.md $(PREFIX)/share/meetap/prompts/
 	@if [ ! -d "$(PREFIX)/meetap-venv" ]; then \
 		echo "Creating Python venv for boto3..."; \
 		python3 -m venv $(PREFIX)/meetap-venv; \
