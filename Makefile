@@ -21,6 +21,8 @@ install: all
 	chmod +x $(PREFIX)/meetap
 	mkdir -p $(PREFIX)/i18n
 	cp src/i18n/*.sh $(PREFIX)/i18n/
+	mkdir -p $(PREFIX)/lib
+	cp src/lib/ui.sh $(PREFIX)/lib/
 	mkdir -p $(PREFIX)/share/meetap
 	cp config.default $(PREFIX)/share/meetap/config.default
 	mkdir -p $(PREFIX)/share/meetap/prompts

@@ -128,6 +128,22 @@ _tn() {
 }
 
 load_i18n
+
+# --- UI 抽象层（gum 可选依赖；无 gum / 无 TTY 时自动降级为纯文本）---
+for _ui_path in "$SCRIPT_DIR/lib/ui.sh" "$SCRIPT_DIR/../src/lib/ui.sh"; do
+    [[ -f "$_ui_path" ]] && { source "$_ui_path"; break; }
+done
+unset _ui_path
+# 兜底：ui.sh 缺失时提供纯文本实现，保证脚本可用
+if ! declare -F ui_confirm >/dev/null; then
+    ui_confirm() {
+        local prompt="${1:-确认?}" yn=""
+        IFS= read -rp "$prompt [y/N]: " yn || yn=""
+        [[ "$yn" =~ ^[Yy] ]]
+    }
+    ui_card() { printf '%s\n' "$@"; }
+fi
+
 TOOL="$SCRIPT_DIR/audio-multi-output"
 MONITOR="$SCRIPT_DIR/audio-monitor"
 VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
@@ -1230,20 +1246,23 @@ show_status() {
             local secs=$(( $(date +%s) - start_time ))
             elapsed=$(printf " (%02d:%02d)" $((secs/60)) $((secs%60)))
         fi
-        _t STATUS_RECORDING "$elapsed"
-        [[ -f "$OUTPUT_FILE_MARKER" ]] && _t STATUS_FILE "$(cat "$OUTPUT_FILE_MARKER")"
-        [[ -f "$ORIGINAL_NAME_FILE" ]] && _t STATUS_PLAYBACK "$(cat "$ORIGINAL_NAME_FILE")"
+        # 逐行收集状态信息，最后用 ui_card 统一渲染（无 gum 时逐行原样打印）
+        local status_lines=()
+        status_lines+=("$(_tn STATUS_RECORDING "$elapsed")")
+        [[ -f "$OUTPUT_FILE_MARKER" ]] && status_lines+=("$(_tn STATUS_FILE "$(cat "$OUTPUT_FILE_MARKER")")")
+        [[ -f "$ORIGINAL_NAME_FILE" ]] && status_lines+=("$(_tn STATUS_PLAYBACK "$(cat "$ORIGINAL_NAME_FILE")")")
         if [[ -f "$AUTOSTOP_PID_FILE" ]] && kill -0 "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null; then
-            _t STATUS_AUTOSTOP_ON
+            status_lines+=("$(_tn STATUS_AUTOSTOP_ON)")
         fi
         if [[ -f "$MONITOR_PID_FILE" ]] && kill -0 "$(cat "$MONITOR_PID_FILE")" 2>/dev/null; then
-            _t STATUS_MONITOR_RUN
+            status_lines+=("$(_tn STATUS_MONITOR_RUN)")
         fi
         if [[ -f "$VISUALIZER_PID_FILE" ]] && kill -0 "$(cat "$VISUALIZER_PID_FILE")" 2>/dev/null; then
-            _t STATUS_VISUALIZER_RUN
+            status_lines+=("$(_tn STATUS_VISUALIZER_RUN)")
         fi
+        ui_card "${status_lines[@]}"
     else
-        _t STATUS_IDLE
+        ui_card "$(_tn STATUS_IDLE)"
         rm -f "$PID_FILE"
     fi
 }
@@ -1328,7 +1347,7 @@ setup_teams() {
     echo ""
     _t SETUP_ONCE_NOTE
     echo ""
-    read -p "$(_tn SETUP_PRESS_ENTER)"
+    ui_confirm "$(_tn SETUP_PRESS_ENTER)" || true
     _t SETUP_TEAMS_DONE
 }
 
@@ -1356,7 +1375,7 @@ setup_wemeet() {
     echo ""
     _t SETUP_ONCE_NOTE
     echo ""
-    read -p "$(_tn SETUP_PRESS_ENTER)"
+    ui_confirm "$(_tn SETUP_PRESS_ENTER)" || true
     _t SETUP_WEMEET_DONE
 }
 
@@ -1420,21 +1439,23 @@ case "${1:-}" in
                     _t CONFIG_FILE_NONE
                 fi
                 echo ""
-                echo "  region                = $CFG_REGION"
-                echo "  language              = $CFG_LANGUAGE"
-                echo "  ai_backend            = $CFG_AI_BACKEND"
-                echo "  model                 = $CFG_MODEL"
-                echo "  transcribe_languages  = $CFG_TRANSCRIBE_LANGUAGES"
-                echo "  recording_dir         = $CFG_RECORDING_DIR"
-                echo "  max_speakers          = $CFG_MAX_SPEAKERS"
-                echo "  silence_threshold     = $CFG_SILENCE_THRESHOLD"
-                echo "  silence_grace         = $CFG_SILENCE_GRACE"
-                echo "  audio_bitrate         = $CFG_AUDIO_BITRATE"
-                echo "  audio_persist         = $CFG_AUDIO_PERSIST"
-                echo "  multi_language        = $CFG_MULTI_LANGUAGE"
-                echo "  visualizer            = $CFG_VISUALIZER"
-                echo "  email                 = ${CFG_EMAIL:-<not set>}"
-                echo "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
+                # 配置列表用 ui_card 渲染（无 gum 时逐行原样打印，内容不变）
+                ui_card \
+                    "  region                = $CFG_REGION" \
+                    "  language              = $CFG_LANGUAGE" \
+                    "  ai_backend            = $CFG_AI_BACKEND" \
+                    "  model                 = $CFG_MODEL" \
+                    "  transcribe_languages  = $CFG_TRANSCRIBE_LANGUAGES" \
+                    "  recording_dir         = $CFG_RECORDING_DIR" \
+                    "  max_speakers          = $CFG_MAX_SPEAKERS" \
+                    "  silence_threshold     = $CFG_SILENCE_THRESHOLD" \
+                    "  silence_grace         = $CFG_SILENCE_GRACE" \
+                    "  audio_bitrate         = $CFG_AUDIO_BITRATE" \
+                    "  audio_persist         = $CFG_AUDIO_PERSIST" \
+                    "  multi_language        = $CFG_MULTI_LANGUAGE" \
+                    "  visualizer            = $CFG_VISUALIZER" \
+                    "  email                 = ${CFG_EMAIL:-<not set>}" \
+                    "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
                 echo ""
                 [[ -f "$CONFIG_FILE" ]] && _t CONFIG_RESET_HINT "$CONFIG_FILE"
                 ;;
