@@ -79,7 +79,7 @@ MSG_MIC_DEVICE="🎤 Microphone: %s"
 MSG_RECORDING_STARTED="🎙️  Recording started"
 MSG_FIELD_FILE="   File: %s"
 MSG_FIELD_PLAYBACK="   Playback: %s"
-MSG_FIELD_AUTOSTOP="   Auto-stop: after 2 minutes of silence"
+MSG_FIELD_AUTOSTOP="   Auto-stop: after %s of silence"
 MSG_FIELD_STOP_CMD="   Stop recording: %s stop"
 MSG_ERR_FFMPEG_FAIL="❌ Failed to start ffmpeg:"
 

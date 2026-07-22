@@ -1116,7 +1116,16 @@ start_recording() {
         _t RECORDING_STARTED
         $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
         _t FIELD_PLAYBACK "$ORIG_NAME"
-        _t FIELD_AUTOSTOP
+        # 格式化 silence_grace 秒数为人类可读(秒/分钟/小时)
+        local _grace_display
+        if (( CFG_SILENCE_GRACE >= 3600 )); then
+            _grace_display="$((CFG_SILENCE_GRACE / 3600)) 小时"
+        elif (( CFG_SILENCE_GRACE >= 60 )); then
+            _grace_display="$((CFG_SILENCE_GRACE / 60)) 分钟"
+        else
+            _grace_display="${CFG_SILENCE_GRACE} 秒"
+        fi
+        _t FIELD_AUTOSTOP "$_grace_display"
         _t FIELD_STOP_CMD "$0"
         echo ""
 
