@@ -296,11 +296,7 @@ transcribe_recording() {
     local LOG_FILE="$LOG_DIR/meetap.log"
     local AWS_REGION="$CFG_REGION"
 
-    # Move audio file into log/
-    if [[ -f "$AUDIO_FILE" && "$(dirname "$AUDIO_FILE")" != "$LOG_DIR" ]]; then
-        mv "$AUDIO_FILE" "$LOG_DIR/"
-        AUDIO_FILE="$LOG_DIR/$(basename "$AUDIO_FILE")"
-    fi
+    # 语音文件保留在 session 根目录原位，不再移入 log/（用户要求位置不变动）
 
     exec > "$LOG_FILE" 2>&1
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
@@ -660,21 +656,27 @@ summarize_via_claude_code() {
 send_meeting_notes() {
     local NOTES_FILE="$1"
     local SESSION_DIR="$2"
+    local recipients="$CFG_EMAIL"
+    local sender="$CFG_EMAIL_SENDER"
 
-    [[ -z "$CFG_EMAIL" ]] && return 0
-    [[ -z "$CFG_EMAIL_SENDER" ]] && {
+    # venv 缺失：无法做 HTML 转换；仅在用户配了邮件时才报错提示
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        [[ -n "$recipients" ]] && echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
+        return 1
+    fi
+    # 配了收件人但缺发件人：提示后降级为只生成 HTML 文件、不发送
+    if [[ -n "$recipients" && -z "$sender" ]]; then
         echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_SENDER_MISSING)"
-        return 1
-    }
-    [[ ! -x "$VENV_PYTHON" ]] && {
-        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
-        return 1
-    }
+        recipients=""
+    fi
 
     local PDF_FILE="${NOTES_FILE%.md}.pdf"
+    local HTML_FILE="${NOTES_FILE%.md}.html"
     echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_CONVERTING)"
 
-    "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$CFG_EMAIL" "$CFG_EMAIL_SENDER" "$CFG_REGION" <<'PYEOF'
+    # SCRIPT_DIR 作为 argv 传入：heredoc 运行时 sys.argv[0] 是 '-'，
+    # Python 侧无法自行定位安装目录，必须由 bash 显式传递
+    "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$recipients" "$sender" "$CFG_REGION" "$HTML_FILE" "$SCRIPT_DIR" <<'PYEOF'
 import sys, os, re, boto3
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -685,120 +687,122 @@ pdf_path = sys.argv[2]
 recipients = [r.strip() for r in sys.argv[3].split(",") if r.strip()]
 sender = sys.argv[4]
 region = sys.argv[5]
+html_path = sys.argv[6]
+script_dir = sys.argv[7]   # bash 侧 SCRIPT_DIR：heredoc 下 argv[0] 是 '-'，无法自行定位
+html = None
 
 with open(notes_path, "r") as f:
     md_content = f.read()
 
 # Extract title from first H1
 title = "Meeting Notes"
-# Extract date from metadata block (> **会议时间** ...)
-meeting_date = ""
 for line in md_content.split("\n"):
     if line.startswith("# "):
         title = line[2:].strip()
         break
-for line in md_content.split("\n"):
-    m = re.match(r'>\s*\*\*会议时间\*\*\s*(.+)', line)
-    if m:
-        meeting_date = m.group(1).strip()
-        break
 
-# --- Markdown to HTML: prefer `markdown` library, fallback to regex ---
-body_html = None
-try:
-    import markdown
-    body_html = markdown.markdown(md_content, extensions=['tables', 'fenced_code'])
-except ImportError:
-    pass
+if html is None:
+    # Extract date from metadata block (> **会议时间** ...)
+    meeting_date = ""
+    for line in md_content.split("\n"):
+        m = re.match(r'>\s*\*\*会议时间\*\*\s*(.+)', line)
+        if m:
+            meeting_date = m.group(1).strip()
+            break
 
-if body_html is None:
-    # Fallback: basic regex conversion (legacy, works without markdown lib)
-    body_html = md_content
-    body_html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', body_html, flags=re.MULTILINE)
-    body_html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', body_html, flags=re.MULTILINE)
-    body_html = re.sub(r'^### (.+)$', r'<h3>\1</h3>', body_html, flags=re.MULTILINE)
-    body_html = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', body_html)
-    body_html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', body_html)
-    body_html = re.sub(r'\*(.+?)\*', r'<em>\1</em>', body_html)
-    body_html = re.sub(r'^- \[ \] (.+)$', r'<li>☐ \1</li>', body_html, flags=re.MULTILINE)
-    body_html = re.sub(r'^- \[x\] (.+)$', r'<li>☑ \1</li>', body_html, flags=re.MULTILINE)
-    body_html = re.sub(r'^- (.+)$', r'<li>\1</li>', body_html, flags=re.MULTILINE)
-    body_html = re.sub(r'^---$', r'<hr>', body_html, flags=re.MULTILINE)
-    body_html = re.sub(r'((?:<li>.*?</li>\n?)+)', r'<ul>\1</ul>', body_html)
-    lines = body_html.split('\n')
-    out, buf = [], []
-    for ln in lines:
-        s = ln.strip()
-        if not s:
-            if buf:
-                block = ' '.join(buf)
-                if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
-                    out.append(f'<p>{block}</p>')
-                else:
-                    out.append(block)
-                buf = []
-        else:
-            buf.append(ln)
-    if buf:
-        block = ' '.join(buf)
-        if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
-            out.append(f'<p>{block}</p>')
-        else:
-            out.append(block)
-    body_html = '\n'.join(out)
+    # --- Markdown to HTML: prefer `markdown` library, fallback to regex ---
+    body_html = None
+    try:
+        import markdown
+        body_html = markdown.markdown(md_content, extensions=['tables', 'fenced_code'])
+    except ImportError:
+        pass
 
-# --- Load email template (table layout, Outlook-compatible) ---
-footer_html = ('<em>&mdash; <a href="https://github.com/henceman777/meetap" '
-    'style="color:#4a90d9;text-decoration:none">Meetap</a> &mdash; '
-    'Listen &middot; analyze &middot; recap &middot; refine &middot; yield</em>')
+    if body_html is None:
+        # Fallback: basic regex conversion (legacy, works without markdown lib)
+        body_html = md_content
+        body_html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^### (.+)$', r'<h3>\1</h3>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', body_html)
+        body_html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', body_html)
+        body_html = re.sub(r'\*(.+?)\*', r'<em>\1</em>', body_html)
+        body_html = re.sub(r'^- \[ \] (.+)$', r'<li>☐ \1</li>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^- \[x\] (.+)$', r'<li>☑ \1</li>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^- (.+)$', r'<li>\1</li>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^---$', r'<hr>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'((?:<li>.*?</li>\n?)+)', r'<ul>\1</ul>', body_html)
+        lines = body_html.split('\n')
+        out, buf = [], []
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                if buf:
+                    block = ' '.join(buf)
+                    if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
+                        out.append(f'<p>{block}</p>')
+                    else:
+                        out.append(block)
+                    buf = []
+            else:
+                buf.append(ln)
+        if buf:
+            block = ' '.join(buf)
+            if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
+                out.append(f'<p>{block}</p>')
+            else:
+                out.append(block)
+        body_html = '\n'.join(out)
 
-# Try to find the email.html template
-script_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv[0] != '-' else os.getcwd()
-template_candidates = [
-    os.path.join(script_dir, "..", "share", "meetap", "templates", "email.html"),
-    os.path.join(script_dir, "share", "meetap", "templates", "email.html"),
-]
-template_html = None
-for tp in template_candidates:
-    if os.path.isfile(tp):
-        with open(tp, "r") as f:
-            template_html = f.read()
-        break
+    # 正文里 Claude 按模板要求写了 LARRY 页脚；模板外框会再注入 footer，
+    # 先剥掉正文里的那份，避免邮件出现双页脚
+    body_html = re.sub(r'<p[^>]*>.{0,40}——.{0,200}?[Mm]eetap.{0,200}?——.{0,40}</p>', '', body_html, flags=re.DOTALL)
 
-if template_html:
-    # Inject into the table-layout template (inline CSS, no <style> tag)
-    html = template_html.replace("{{meeting_title}}", title)
-    html = html.replace("{{meeting_date}}", meeting_date)
-    html = html.replace("{{minutes_body}}", body_html)
-    html = html.replace("{{footer}}", footer_html)
-else:
-    # Fallback: wrap body_html in a minimal inline-styled container
-    html = f"""<!DOCTYPE html>
+    # --- Load email template (table layout, email-client compatible) ---
+    footer_html = ('<em>&mdash; <a href="https://github.com/henceman777/meetap" '
+        'style="color:#4a90d9;text-decoration:none">Meetap</a> &mdash; '
+        'Listen &middot; analyze &middot; recap &middot; refine &middot; yield</em>')
+
+    # Locate the email.html template relative to the install dir (passed from bash)
+    template_candidates = [
+        os.path.join(script_dir, "..", "share", "meetap", "templates", "email.html"),
+        os.path.join(script_dir, "share", "meetap", "templates", "email.html"),
+    ]
+    template_html = None
+    for tp in template_candidates:
+        if os.path.isfile(tp):
+            with open(tp, "r") as f:
+                template_html = f.read()
+            break
+
+    if template_html:
+        # Inject into the table-layout template (inline CSS, no <style> tag)
+        html = template_html.replace("{{meeting_title}}", title)
+        html = html.replace("{{meeting_date}}", meeting_date)
+        html = html.replace("{{minutes_body}}", body_html)
+        html = html.replace("{{footer}}", footer_html)
+    else:
+        # Fallback: wrap body_html in a minimal inline-styled container
+        html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:20px;font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.6">
 <div style="max-width:600px;margin:0 auto">{body_html}
 <p style="color:#999;font-size:12px;margin-top:24px;text-align:center">{footer_html}</p>
 </div></body></html>"""
 
-# HTML to PDF via PyMuPDF
+# 落盘 HTML 版本（无论是否发邮件，都在纪要旁生成 .html 文件）
 try:
-    import fitz
-    story = fitz.Story(html)
-    writer = fitz.DocumentWriter(pdf_path)
-    mediabox = fitz.paper_rect("a4")
-    where = mediabox + (36, 36, -36, -36)
-    more = True
-    while more:
-        dev = writer.begin_page(mediabox)
-        more, _ = story.place(where)
-        story.draw(dev)
-        writer.end_page()
-    writer.close()
+    with open(html_path, "w") as f:
+        f.write(html)
+    print(f"HTML saved: {html_path}")
 except Exception as e:
-    print(f"PDF conversion failed: {e}, sending HTML only")
-    pdf_path = None
+    print(f"HTML save failed: {e}")
 
-# Send via SES
+# 未配置收件人 → 只落盘 HTML，不发送
+if not recipients:
+    sys.exit(0)
+
+# Send via SES（正文即 HTML，不再生成/附加 PDF）
 try:
     ses = boto3.client("ses", region_name=region)
     msg = MIMEMultipart("mixed")
@@ -809,12 +813,6 @@ try:
     body = MIMEText(html, "html", "utf-8")
     msg.attach(body)
 
-    if pdf_path and os.path.exists(pdf_path):
-        with open(pdf_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="pdf")
-            att.add_header("Content-Disposition", "attachment", filename=os.path.basename(pdf_path))
-            msg.attach(att)
-
     ses.send_raw_email(
         Source=sender,
         Destinations=recipients,
@@ -824,14 +822,15 @@ try:
 except Exception as e:
     print(f"Email send failed: {e}")
     sys.exit(1)
-finally:
-    pass
 PYEOF
 
-    if [[ $? -eq 0 ]]; then
-        echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_SENT "$CFG_EMAIL")"
-    else
-        echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_FAILED)"
+    local py_rc=$?
+    if [[ -n "$recipients" ]]; then
+        if [[ $py_rc -eq 0 ]]; then
+            echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_SENT "$recipients")"
+        else
+            echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_FAILED)"
+        fi
     fi
 }
 
