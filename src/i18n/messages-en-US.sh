@@ -44,6 +44,7 @@ MSG_ERR_PROMPT_TEMPLATE_MISSING="❌ Prompt template meeting-notes.md not found 
 MSG_WARN_PROMPT_TEMPLATE_INVALID="⚠️ Custom template %s is missing required placeholder %s, skipping and falling back to default template"
 MSG_ERR_PROMPT_TEMPLATE_INVALID="❌ Default prompt template %s is missing required placeholder %s, cannot generate notes"
 MSG_NOTES_DONE="✅ Meeting notes generated: %s"
+MSG_NOTES_NAMED="📄 Smart-named notes copy created: %s"
 MSG_NOTIFY_NOTES_DONE="Meeting notes ready: meeting-notes.md"
 MSG_NOTES_FAILED="⚠️ Meeting notes generation failed, transcript.txt is still available"
 MSG_NOTIFY_NOTES_FAILED="Notes generation failed, transcript available"

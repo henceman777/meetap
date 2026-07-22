@@ -805,6 +805,69 @@ PYEOF
     fi
 }
 
+# 清洗标题为合法文件名片段：白名单只保留 中文/字母/数字/-/_，其余（含 / : | 空格、
+# emoji、控制字符等）一律转 -；连续 - 合并；去首尾 -；按「字符」截断到 20。
+# 用 perl -CS 在 UTF-8 字符层面处理，中文算 1 个字符，绝不会截出半个多字节字符。
+# 清洗后为空时兜底返回 meeting。
+sanitize_title() {
+    local raw="$1" cleaned
+    cleaned=$(printf '%s' "$raw" | perl -CS -pe '
+        s/[^\p{Han}A-Za-z0-9_-]/-/g;   # 白名单外全部替换为 -
+        s/-+/-/g;                       # 连续 - 合并
+        s/^-+|-+$//g;                   # 去首尾 -
+        $_ = substr($_, 0, 20);         # 按字符截断（-CS 下已解码为字符）
+        s/-+$//;                        # 截断后可能重新露出尾部 -
+    ')
+    [[ -z "$cleaned" ]] && cleaned="meeting"
+    printf '%s' "$cleaned"
+}
+
+# 纪要智能命名：解析 meeting-notes.md 首行的 <!-- meetap-title: XXX --> 元数据，
+# 生成「YYYY-MM-DD_HHMM_主题.md」副本（cp，原 meeting-notes.md 保持固定名不动）。
+# 解析到标题行后会把该注释行从原文件删掉（它只用于命名，不该进正文/邮件）。
+# 首行不是标题格式属于预期内降级：静默用兜底名 meeting，且不修改原文件。
+smart_name_notes() {
+    local OUTPUT="$1"
+    local SESSION_DIR="$2"
+    local SESSION_NAME first_line title=""
+    SESSION_NAME=$(basename "$SESSION_DIR")
+
+    IFS= read -r first_line < "$OUTPUT" || true
+    if [[ "$first_line" == "<!-- meetap-title:"* && "$first_line" == *"-->"* ]]; then
+        title="${first_line#<!-- meetap-title:}"
+        title="${title%%-->*}"
+        # 去首尾空白
+        title="${title#"${title%%[![:space:]]*}"}"
+        title="${title%"${title##*[![:space:]]}"}"
+        # 删除元数据注释行（写临时文件后覆盖，避免读写同一文件）
+        local tmp
+        tmp=$(mktemp "$SESSION_DIR/.notes.XXXXXX") || return 0
+        tail -n +2 "$OUTPUT" > "$tmp" && mv "$tmp" "$OUTPUT" || { rm -f "$tmp"; return 0; }
+    fi
+
+    title=$(sanitize_title "$title")
+
+    # 日期时间前缀从 SESSION_DIR 目录名解析（与 build_prompt 的两个分支对应）：
+    # 标准 20250715_1430 → 2025-07-15_1430；非标准格式直接用目录名原样做前缀
+    local prefix
+    if [[ "$SESSION_NAME" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{4})$ ]]; then
+        prefix="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}_${BASH_REMATCH[4]}"
+    else
+        prefix="$SESSION_NAME"
+    fi
+
+    # 防碰撞：已存在则追加 _2、_3…，绝不静默覆盖
+    local target="$SESSION_DIR/${prefix}_${title}.md"
+    if [[ -e "$target" ]]; then
+        local n=2
+        while [[ -e "$SESSION_DIR/${prefix}_${title}_${n}.md" ]]; do ((n++)); done
+        target="$SESSION_DIR/${prefix}_${title}_${n}.md"
+    fi
+
+    cp "$OUTPUT" "$target" || return 0
+    echo "[$(date '+%H:%M:%S')] $(_tn NOTES_NAMED "$(basename "$target")")"
+}
+
 summarize_transcript() {
     local SESSION_DIR="$1"
     local LOG_DIR="$SESSION_DIR/log"
@@ -844,6 +907,7 @@ summarize_transcript() {
 
     if [[ -f "$OUTPUT" ]]; then
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$OUTPUT")"
+        smart_name_notes "$OUTPUT" "$SESSION_DIR"
         osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE)\" with title \"MeeTap\"" 2>/dev/null
         send_meeting_notes "$OUTPUT" "$SESSION_DIR"
     else
