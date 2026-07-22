@@ -760,8 +760,9 @@ if html is None:
         body_html = '\n'.join(out)
 
     # 正文里 Claude 按模板要求写了 LARRY 页脚；模板外框会再注入 footer，
-    # 先剥掉正文里的那份，避免邮件出现双页脚
-    body_html = re.sub(r'<p[^>]*>.{0,40}——.{0,200}?[Mm]eetap.{0,200}?——.{0,40}</p>', '', body_html, flags=re.DOTALL)
+    # 先剥掉正文里的那份，避免邮件出现双页脚；连同落款上方的分割线 <hr> 一起剥
+    # （模板 footer 自带浅灰细线，md 的 --- 转成的黑色 <hr> 会重复且突兀）
+    body_html = re.sub(r'(<hr\s*/?>\s*)?<p[^>]*>.{0,40}——.{0,200}?[Mm]eetap.{0,200}?——.{0,40}</p>', '', body_html, flags=re.DOTALL)
 
     # --- Load email template (table layout, email-client compatible) ---
     # 标志性 LARRY 落款，与 md 版一致（首字母大写体现藏头）；nowrap+小字号保证单行
