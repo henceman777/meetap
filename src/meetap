@@ -887,17 +887,16 @@ smart_name_notes() {
 
     # 日期时间前缀从 SESSION_DIR 目录名解析（与 build_prompt 的分支对应）：
     # 标准 20250715_1430[_会议名] → 2025-07-15_1430；非标准格式直接用目录名原样做前缀。
-    # 目录名第三段存在 → 用户在 start 时给了会议名，命名优先用它（不走 Claude 短标题）
+    # 分工：目录名（含用户在 start 时给的名字）只提供日期时间前缀；
+    # 文件名的主题只用 Claude 从内容生成的短标题，拿不到才兜底 meeting。
     local prefix
     if [[ "$SESSION_NAME" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{4})(_(.+))?$ ]]; then
         prefix="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}_${BASH_REMATCH[4]}"
-        title="${BASH_REMATCH[6]}"
     else
         prefix="$SESSION_NAME"
     fi
-    [[ -z "$title" ]] && title="$claude_title"
 
-    title=$(sanitize_title "$title")
+    title=$(sanitize_title "$claude_title")
 
     # 防碰撞：已存在则追加 _2、_3…，绝不静默覆盖
     local target="$SESSION_DIR/${prefix}_${title}.md"
