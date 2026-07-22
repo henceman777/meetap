@@ -139,7 +139,7 @@ ${speaker_stats}
 
 [以下落款行是 Meetap 的标志性签名，**必须原样输出在纪要最末尾，不可省略、不可改写**——即使前面有章节被省略：]
 
-*—— **L**isten · **a**nalyze · **r**ecap · **r**efine · **y**ield  —  [Meetap](https://github.com/henceman777/meetap)  —  **Y**our **a**udio **n**otes **g**enerator ——*
+_—— **L**isten · **a**nalyze · **r**ecap · **r**efine · **y**ield  —  [Meetap](https://github.com/henceman777/meetap)  —  **Y**our **a**udio **n**otes **g**enerator ——_
 
 <div style="height:1.5em"></div>
 
