@@ -759,15 +759,12 @@ if html is None:
     body_html = re.sub(r'<p[^>]*>.{0,40}——.{0,200}?[Mm]eetap.{0,200}?——.{0,40}</p>', '', body_html, flags=re.DOTALL)
 
     # --- Load email template (table layout, email-client compatible) ---
-    # 标志性 LARRY 落款，与 md 版一致；nowrap+小字号保证 600px 容器内单行放下
+    # 标志性 LARRY 落款，与 md 版一致（首字母大写体现藏头）；nowrap+小字号保证单行
     footer_html = ('<span style="white-space:nowrap;font-size:11px"><em>&mdash;&mdash; '
-        '<strong>L</strong>isten &middot; <strong>a</strong>nalyze &middot; '
-        '<strong>r</strong>ecap &middot; <strong>r</strong>efine &middot; '
-        '<strong>y</strong>ield &mdash; '
+        'Listen &middot; Analyze &middot; Recap &middot; Refine &middot; Yield &mdash; '
         '<a href="https://github.com/henceman777/meetap" '
         'style="color:#4a90d9;text-decoration:none">Meetap</a> &mdash; '
-        '<strong>Y</strong>our <strong>a</strong>udio <strong>n</strong>otes '
-        '<strong>g</strong>enerator &mdash;&mdash;</em></span>')
+        'Your Audio Notes Generator &mdash;&mdash;</em></span>')
 
     # Locate the email.html template relative to the install dir (passed from bash)
     template_candidates = [
