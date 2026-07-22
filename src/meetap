@@ -535,8 +535,6 @@ build_prompt() {
         "$user_template"                                           # 用户级：全局自定义
         "$SCRIPT_DIR/../share/meetap/prompts/meeting-notes.md"    # dev 源码树 / 标准 prefix
         "$SCRIPT_DIR/share/meetap/prompts/meeting-notes.md"       # make install (PREFIX=~/bin)
-        "/opt/homebrew/share/meetap/prompts/meeting-notes.md"     # Homebrew (Apple Silicon)
-        "/usr/local/share/meetap/prompts/meeting-notes.md"        # Homebrew (Intel)
     )
     local p
     for p in "${candidates[@]}"; do
