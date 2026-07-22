@@ -70,8 +70,6 @@ ${speaker_stats}
 
 # [用一句话概括核心议题的中文标题]
 
-**[English Subtitle — Translated from the Chinese Title Above]**
-
 ---
 
 > **会议时间** ${SESSION_DATE}，时长约 [N] 分钟
