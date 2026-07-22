@@ -97,7 +97,6 @@ MSG_FIELD_DURATION="   时长: %s分%s秒"
 MSG_RECORDING_SUCCESS="✅ 音频采样成功"
 MSG_EMPTY_SESSION_REMOVED="🗑️  未产生录音文件，已删除空目录: %s"
 MSG_TRANSCRIBE_BACKGROUND="📝 后台转录已启动（完成后会收到通知）"
-MSG_OUTLOOK_FETCHED="📅 已抓取日历会议信息: %s"
 
 # ── 状态 ──
 MSG_STATUS_RECORDING="🎙️  录制中%s"

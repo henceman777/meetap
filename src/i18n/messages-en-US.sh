@@ -96,7 +96,6 @@ MSG_FIELD_DURATION="   Duration: %sm%ss"
 MSG_RECORDING_SUCCESS="✅ Audio captured successfully"
 MSG_EMPTY_SESSION_REMOVED="🗑️  No audio captured, removed empty directory: %s"
 MSG_TRANSCRIBE_BACKGROUND="📝 Background transcription started (you'll be notified when done)"
-MSG_OUTLOOK_FETCHED="📅 Calendar meeting info fetched: %s"
 
 # ── Status ──
 MSG_STATUS_RECORDING="🎙️  Recording%s"
