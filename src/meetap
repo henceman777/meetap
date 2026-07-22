@@ -710,6 +710,11 @@ if html is None:
             meeting_date = m.group(1).strip()
             break
 
+    # 邮件版去掉「## 目录」整节（邮件一屏可读不需要跳转目录；md 文件保留）
+    md_content = re.sub(r'^## 目录\s*\n.*?(?=^## )', '', md_content, flags=re.MULTILINE | re.DOTALL)
+    # 去掉章节间的间距 div，让邮件上下更紧凑（md 文件保留）
+    md_content = re.sub(r'^<div style="height:[^"]*"></div>\s*$', '', md_content, flags=re.MULTILINE)
+
     # --- Markdown to HTML: prefer `markdown` library, fallback to regex ---
     body_html = None
     try:
