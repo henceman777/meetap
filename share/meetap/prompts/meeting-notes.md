@@ -139,7 +139,7 @@ ${speaker_stats}
 
 ---
 
-*—— **L**isten · **a**nalyze · **r**ecap · **r**efine · **y**ield  —  [Meetap](https://github.com/henceman777/meetap)  —  **Y**our **a**udio **n**otes **g**enerator ——*
+<p align="center"><em>—— <strong>L</strong>isten · <strong>a</strong>nalyze · <strong>r</strong>ecap · <strong>r</strong>efine · <strong>y</strong>ield — <a href="https://github.com/henceman777/meetap">Meetap</a> — <strong>Y</strong>our <strong>a</strong>udio <strong>n</strong>otes <strong>g</strong>enerator ——</em></p>
 
 <div style="height:1.5em"></div>
 
