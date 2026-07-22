@@ -26,7 +26,7 @@ install: all
 	@if [ ! -d "$(PREFIX)/meetap-venv" ]; then \
 		echo "Creating Python venv for boto3..."; \
 		python3 -m venv $(PREFIX)/meetap-venv; \
-		$(PREFIX)/meetap-venv/bin/pip install -q boto3; \
+		$(PREFIX)/meetap-venv/bin/pip install -q boto3==1.40.0; \
 	fi
 	@echo ""
 	@echo "Installed. A default config will be created in ~/.config/meetap/"
