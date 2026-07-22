@@ -528,7 +528,8 @@ build_prompt() {
     [[ -f "$SPEAKER_STATS" ]] && speaker_stats=$(cat "$SPEAKER_STATS")
 
     # 三级模板查找：会话级 > 用户级 > 默认级（复用 SCRIPT_DIR 的多路径查找）
-    local template=""
+    # kinds 与 candidates 一一对应，标记模板来源：override=用户可编辑的覆盖模板，
+    # default=随工具分发的默认模板。校验失败时按 kind 决定「警告回退」还是「硬错误」。
     local user_template="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/prompts/meeting-notes.md"
     local candidates=(
         "$SESSION_DIR/prompt.md"                                   # 会话级：本次会议专属
@@ -536,9 +537,36 @@ build_prompt() {
         "$SCRIPT_DIR/../share/meetap/prompts/meeting-notes.md"    # dev 源码树 / 标准 prefix
         "$SCRIPT_DIR/share/meetap/prompts/meeting-notes.md"       # make install (PREFIX=~/bin)
     )
-    local p
-    for p in "${candidates[@]}"; do
-        [[ -f "$p" ]] && { template="$p"; break; }
+    local kinds=(override override default default)
+
+    # 模板必须包含的三个占位符（缺任何一个都算损坏）
+    local required=('${SESSION_DATE}' '${speaker_stats}' '${transcript}')
+
+    local template="" i
+    for i in "${!candidates[@]}"; do
+        local p="${candidates[$i]}"
+        [[ -f "$p" ]] || continue
+
+        # 校验：逐个检查必需占位符是否存在（-F 固定字符串，$ { } 不被当正则）
+        local missing="" ph
+        for ph in "${required[@]}"; do
+            grep -qF "$ph" "$p" || { missing="$ph"; break; }
+        done
+
+        if [[ -n "$missing" ]]; then
+            if [[ "${kinds[$i]}" == "override" ]]; then
+                # 用户改坏了覆盖模板：警告并继续往后找默认模板
+                echo "$(_tn WARN_PROMPT_TEMPLATE_INVALID "$p" "$missing")" >&2
+                continue
+            else
+                # 默认模板损坏：分发出了问题，硬错误
+                echo "$(_tn ERR_PROMPT_TEMPLATE_INVALID "$p" "$missing")" >&2
+                return 1
+            fi
+        fi
+
+        template="$p"
+        break
     done
 
     if [[ -z "$template" ]]; then
