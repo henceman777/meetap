@@ -131,13 +131,15 @@ ${speaker_stats}
 
 [如有后续合作、跟进计划，在此单独列出。如没有则省略此章节。]
 
-<div style="height:2em"></div>
-
-<p align="center"><em>—— <strong>L</strong>isten · <strong>a</strong>nalyze · <strong>r</strong>ecap · <strong>r</strong>efine · <strong>y</strong>ield — <a href="https://github.com/henceman777/meetap">Meetap</a> — <strong>Y</strong>our <strong>a</strong>udio <strong>n</strong>otes <strong>g</strong>enerator ——</em></p>
-
 ## 专有名词修正
 
 [如果在转录中发现音译错误的人名或术语，在此列出修正清单供核对，格式如：原文→修正。不要在正文中静默替换。如无修正则省略此章节。]
+
+<div style="height:2em"></div>
+
+[以下落款行是 Meetap 的标志性签名，**必须原样输出在纪要最末尾，不可省略、不可改写**——即使前面有章节被省略：]
+
+<p align="center"><em>—— <strong>L</strong>isten · <strong>a</strong>nalyze · <strong>r</strong>ecap · <strong>r</strong>efine · <strong>y</strong>ield — <a href="https://github.com/henceman777/meetap">Meetap</a> — <strong>Y</strong>our <strong>a</strong>udio <strong>n</strong>otes <strong>g</strong>enerator ——</em></p>
 
 <div style="height:1.5em"></div>
 
