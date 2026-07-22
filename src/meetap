@@ -530,6 +530,11 @@ build_prompt() {
     local speaker_stats=""
     [[ -f "$SPEAKER_STATS" ]] && speaker_stats=$(cat "$SPEAKER_STATS")
 
+    # Outlook 会议背景信息（可选）：fetch_outlook_context 抓取的日历事件，
+    # 文件不存在则为空字符串，模板里的 ${outlook_context} 被替换为空
+    local outlook_context=""
+    [[ -f "$LOG_DIR/outlook/meeting.md" ]] && outlook_context=$(cat "$LOG_DIR/outlook/meeting.md")
+
     # 三级模板查找：会话级 > 用户级 > 默认级（复用 SCRIPT_DIR 的多路径查找）
     # 前两条是 override（用户可编辑的覆盖模板），其余是 default（随工具分发）。
     # 校验失败时按来源决定「警告回退」还是「硬错误」。
@@ -579,13 +584,15 @@ build_prompt() {
         return 1
     fi
 
-    # 变量注入：只替换白名单三个占位符，值来自环境变量，作为纯字面量替换。
+    # 变量注入：只替换白名单四个占位符，值来自环境变量，作为纯字面量替换。
     # 用 perl 而非 eval/envsubst——perl 把值当普通字符串写回，
     # transcript 里的 $(...)、反引号、${foo} 等 shell 元字符不会被执行或二次替换。
-    # 单次遍历同时替换三者，注入值不会被后续 pass 再次匹配（保持与旧 heredoc 一致的语义）。
+    # 单次遍历同时替换，注入值不会被后续 pass 再次匹配（保持与旧 heredoc 一致的语义）。
+    # outlook_context 是可选占位符：模板里有就替换（可能为空），没有也不报错。
     SESSION_DATE="$SESSION_DATE" speaker_stats="$speaker_stats" transcript="$transcript" \
+    outlook_context="$outlook_context" \
     perl -pe '
-        s/\$\{(SESSION_DATE|speaker_stats|transcript)\}/$ENV{$1}/g;
+        s/\$\{(SESSION_DATE|speaker_stats|transcript|outlook_context)\}/$ENV{$1}/g;
     ' "$template"
 }
 
@@ -1081,6 +1088,132 @@ start_recording() {
     fi
 }
 
+# 从本地 Outlook 桌面 App 抓取与会话时间窗重叠的会议信息，写入
+# <SESSION_DIR>/log/outlook/meeting.md，供 build_prompt 注入为纪要辅助上下文。
+#
+# 隐私说明：抓取内容包含公司内部信息（会议主题、参会人、议程正文），
+# 仅本地存储于 session 目录内，请勿外传或上传到外部服务。
+#
+# 降级策略：任何前置条件不满足（无 osascript / 未装 Outlook / 目录名不含
+# 时间戳）、AppleScript 出错或超过 15 秒、时间窗内无会议——一律静默 return 0，
+# 不影响主流程。
+fetch_outlook_context() {
+    local SESSION_DIR="$1"
+    local SESSION_NAME
+    SESSION_NAME=$(basename "$SESSION_DIR")
+
+    # --- 计算会话时间窗：开始时间从目录名解析（20250715_1430[_会议名]） ---
+    # 目录名可能带会议名后缀，取第一段做日期、第二段做时间（与 build_prompt 一致）
+    local folder_base="${SESSION_NAME%%_*}"
+    local folder_time="${SESSION_NAME#*_}"
+    folder_time="${folder_time%%_*}"
+    [[ "$folder_base" =~ ^[0-9]{8}$ && "$folder_time" =~ ^[0-9]{4}$ ]] || return 0
+
+    local start_epoch now_epoch start_ago
+    start_epoch=$(date -j -f "%Y%m%d%H%M%S" "${folder_base}${folder_time}00" +%s 2>/dev/null) || return 0
+    now_epoch=$(date +%s)
+    start_ago=$((now_epoch - start_epoch))
+    # 开始时间在未来（目录名异常/时钟漂移）→ 放弃
+    (( start_ago > 0 )) || return 0
+
+    # --- 前置检查：osascript 存在 + Outlook 已安装（不启动 App 的探测方式） ---
+    command -v osascript &>/dev/null || return 0
+    if [[ ! -d "/Applications/Microsoft Outlook.app" ]]; then
+        local found
+        found=$(mdfind "kMDItemCFBundleIdentifier == 'com.microsoft.Outlook'" 2>/dev/null | head -1)
+        [[ -n "$found" ]] || return 0
+    fi
+
+    # --- AppleScript：查询与 [会话开始, 现在] 重叠的日历事件 ---
+    # 日期构造用 (current date) - 秒数偏移，纯算术运算，不经过字符串解析，
+    # 因此不受系统 locale / 日期格式设置影响（date "..." 字符串形式会受影响）。
+    # 时间窗重叠判定：start time < 窗口结束 AND end time > 窗口开始。
+    local osa_script='on run argv
+    set startAgo to (item 1 of argv) as integer
+    set winEnd to current date
+    set winStart to winEnd - startAgo
+    set out to ""
+    tell application "Microsoft Outlook"
+        set evtList to (every calendar event whose start time < winEnd and end time > winStart)
+        repeat with evt in evtList
+            set evtSubject to ""
+            try
+                set evtSubject to subject of evt
+                if evtSubject is missing value then set evtSubject to ""
+            end try
+            set evtStart to ""
+            try
+                set evtStart to (start time of evt) as text
+            end try
+            set evtEnd to ""
+            try
+                set evtEnd to (end time of evt) as text
+            end try
+            set evtOrganizer to ""
+            try
+                set evtOrganizer to (organizer of evt) as text
+                if evtOrganizer is missing value then set evtOrganizer to ""
+            end try
+            set attText to ""
+            try
+                repeat with att in (required attendees of evt)
+                    set attName to ""
+                    try
+                        set ea to email address of att
+                        set attName to name of ea
+                        if attName is missing value or attName is "" then set attName to address of ea
+                    end try
+                    if attName is not "" then
+                        if attText is "" then
+                            set attText to attName
+                        else
+                            set attText to attText & ", " & attName
+                        end if
+                    end if
+                end repeat
+            end try
+            set evtBody to ""
+            try
+                set evtBody to plain text content of evt
+                if evtBody is missing value then set evtBody to ""
+                if (length of evtBody) > 2000 then set evtBody to (text 1 thru 2000 of evtBody) & "..."
+            end try
+            if out is not "" then set out to out & linefeed & "---" & linefeed & linefeed
+            set out to out & "### " & evtSubject & linefeed
+            set out to out & "- 开始时间: " & evtStart & linefeed
+            set out to out & "- 结束时间: " & evtEnd & linefeed
+            if evtOrganizer is not "" then set out to out & "- 组织者: " & evtOrganizer & linefeed
+            if attText is not "" then set out to out & "- 参会人: " & attText & linefeed
+            if evtBody is not "" then set out to out & linefeed & evtBody & linefeed
+        end repeat
+    end tell
+    return out
+end run'
+
+    # 超时保护：macOS 无 GNU timeout，用 perl fork + alarm 实现——子进程 setpgrp
+    # 自立进程组后 exec osascript，父进程 15 秒后对整个进程组发 SIGKILL 并以 124
+    # 退出（TEST_AND_RISK 硬要求）。杀进程组而非单个 pid：确保 osascript 的任何
+    # 子进程也被终止，不会因残留进程持有 stdout 管道导致命令替换继续阻塞。
+    # 不用「alarm; exec」单进程方案：若被 exec 的进程延迟处理 SIGALRM 则超时失效。
+    # 任何失败（含超时）静默放弃。
+    local result
+    result=$(printf '%s' "$osa_script" | perl -e '
+        my $pid = fork() // exit 1;
+        if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127; }
+        $SIG{ALRM} = sub { kill "KILL", -$pid; waitpid($pid, 0); exit 124 };
+        alarm 15;
+        waitpid($pid, 0);
+        exit($? ? (($? >> 8) || 1) : 0);
+    ' -- osascript - "$start_ago" 2>/dev/null) || return 0
+
+    # 时间窗内无会议（结果为空白）→ 不写文件
+    [[ -n "${result//[[:space:]]/}" ]] || return 0
+
+    mkdir -p "$SESSION_DIR/log/outlook" || return 0
+    printf '%s\n' "$result" > "$SESSION_DIR/log/outlook/meeting.md"
+    _t OUTLOOK_FETCHED "$SESSION_DIR/log/outlook/meeting.md"
+}
+
 stop_recording() {
     local VERBOSE=false
     [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]] && VERBOSE=true
@@ -1176,6 +1309,8 @@ stop_recording() {
             rmdir "$SESSION_DIR"
             _t EMPTY_SESSION_REMOVED "$SESSION_DIR"
         elif [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
+            # 同步抓取 Outlook 会议信息（15 秒超时上限），确保转录/纪要生成前文件已就位
+            fetch_outlook_context "$SESSION_DIR"
             _t TRANSCRIBE_BACKGROUND
             transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" &
             disown
