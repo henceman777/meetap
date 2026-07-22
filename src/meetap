@@ -528,8 +528,8 @@ build_prompt() {
     [[ -f "$SPEAKER_STATS" ]] && speaker_stats=$(cat "$SPEAKER_STATS")
 
     # 三级模板查找：会话级 > 用户级 > 默认级（复用 SCRIPT_DIR 的多路径查找）
-    # kinds 与 candidates 一一对应，标记模板来源：override=用户可编辑的覆盖模板，
-    # default=随工具分发的默认模板。校验失败时按 kind 决定「警告回退」还是「硬错误」。
+    # 前两条是 override（用户可编辑的覆盖模板），其余是 default（随工具分发）。
+    # 校验失败时按来源决定「警告回退」还是「硬错误」。
     local user_template="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/prompts/meeting-notes.md"
     local candidates=(
         "$SESSION_DIR/prompt.md"                                   # 会话级：本次会议专属
@@ -537,7 +537,6 @@ build_prompt() {
         "$SCRIPT_DIR/../share/meetap/prompts/meeting-notes.md"    # dev 源码树 / 标准 prefix
         "$SCRIPT_DIR/share/meetap/prompts/meeting-notes.md"       # make install (PREFIX=~/bin)
     )
-    local kinds=(override override default default)
 
     # 模板必须包含的三个占位符（缺任何一个都算损坏）
     local required=('${SESSION_DATE}' '${speaker_stats}' '${transcript}')
@@ -554,7 +553,10 @@ build_prompt() {
         done
 
         if [[ -n "$missing" ]]; then
-            if [[ "${kinds[$i]}" == "override" ]]; then
+            # 由索引推导来源：前两条 candidate 是 override，后面的是 default
+            local kind
+            if [[ $i -lt 2 ]]; then kind=override; else kind=default; fi
+            if [[ "$kind" == "override" ]]; then
                 # 用户改坏了覆盖模板：警告并继续往后找默认模板
                 echo "$(_tn WARN_PROMPT_TEMPLATE_INVALID "$p" "$missing")" >&2
                 continue
@@ -817,7 +819,12 @@ summarize_transcript() {
 
     echo "[$(date '+%H:%M:%S')] $(_tn GENERATING_NOTES "$CFG_AI_BACKEND")"
 
-    build_prompt "$SESSION_DIR" > "$PROMPT_FILE"
+    # build_prompt 失败（模板缺失/损坏）时中止：删掉已被截断的空 prompt 文件，
+    # 避免把空 prompt 发给 AI 后端浪费一次调用
+    if ! build_prompt "$SESSION_DIR" > "$PROMPT_FILE"; then
+        rm -f "$PROMPT_FILE"
+        return 1
+    fi
 
     case "$CFG_AI_BACKEND" in
         claude-code)
