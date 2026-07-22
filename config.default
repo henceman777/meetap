@@ -25,7 +25,7 @@ recording_dir = ~/Record
 # Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
 audio_bitrate = 128k
 # Keep local audio file after S3 upload (true=keep, false=delete after upload)
-audio_persist = false
+audio_persist = true
 
 # ── Auto-stop ────────────────────────────────────────────────
 # Silence detection threshold (dB)
