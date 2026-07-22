@@ -49,6 +49,20 @@ ui_confirm() {
     fi
 }
 
+# ui_pause [提示语]  →  暂停等待任意确认（"按 Enter 继续"语义），永远返回 0
+# gum 路径：单按钮 confirm（negative 置空只剩「继续」按钮）；Esc 取消也照样继续
+# 降级：read 等 Enter；EOF/管道 不挂起
+ui_pause() {
+    local prompt="${1:-按 Enter 继续...}"
+    if _ui_can_prompt; then
+        gum confirm --affirmative="继续" --negative="" "$prompt" || true
+    else
+        local _discard
+        IFS= read -rp "$prompt" _discard || true
+    fi
+    return 0
+}
+
 # ui_spin 标题 命令 [参数...]  →  执行命令，期间显示 spinner
 # 降级：先打印标题（stderr），再直接执行命令；返回命令退出码
 ui_spin() {
