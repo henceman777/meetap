@@ -8,7 +8,7 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
 # Defaults
 CFG_REGION="us-east-1"
 CFG_LANGUAGE="zh-CN"
-CFG_MODEL="us.anthropic.claude-sonnet-4-6"
+CFG_MODEL="global.anthropic.claude-sonnet-5"
 CFG_TRANSCRIBE_LANGUAGES="en-US zh-CN ja-JP"
 CFG_RECORDING_DIR="$HOME/Record"
 CFG_MAX_SPEAKERS=10
@@ -18,7 +18,7 @@ CFG_AUDIO_BITRATE="128k"
 CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
 CFG_VISUALIZER="dot"
-CFG_AUDIO_PERSIST=false
+CFG_AUDIO_PERSIST=true
 CFG_EMAIL=""
 CFG_EMAIL_SENDER=""
 
@@ -296,11 +296,7 @@ transcribe_recording() {
     local LOG_FILE="$LOG_DIR/meetap.log"
     local AWS_REGION="$CFG_REGION"
 
-    # Move audio file into log/
-    if [[ -f "$AUDIO_FILE" && "$(dirname "$AUDIO_FILE")" != "$LOG_DIR" ]]; then
-        mv "$AUDIO_FILE" "$LOG_DIR/"
-        AUDIO_FILE="$LOG_DIR/$(basename "$AUDIO_FILE")"
-    fi
+    # 语音文件保留在 session 根目录原位，不再移入 log/（用户要求位置不变动）
 
     exec > "$LOG_FILE" 2>&1
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
@@ -504,7 +500,10 @@ build_prompt() {
 
     local SESSION_DATE
     local folder_base="${SESSION_NAME%%_*}"
-    local folder_time="${SESSION_NAME##*_}"
+    # 取第二段做时间：目录名可能带用户会议名后缀（20250715_1430_季度架构评审），
+    # 不能用 ##*_ 取最后一段，先去掉第一段再取剩余的第一段
+    local folder_time="${SESSION_NAME#*_}"
+    folder_time="${folder_time%%_*}"
     if [[ ${#folder_base} -eq 8 ]]; then
         local y="${folder_base:0:4}" m="${folder_base:4:2}" d="${folder_base:6:2}"
         local weekday
@@ -527,111 +526,63 @@ build_prompt() {
     local speaker_stats=""
     [[ -f "$SPEAKER_STATS" ]] && speaker_stats=$(cat "$SPEAKER_STATS")
 
-    cat <<PROMPT_EOF
-你是一位参加了这场会议的资深同事。现在会后，你要用人话给没参会的队友讲清楚：这场会上到底聊了什么、为什么重要、接下来该干嘛。
+    # 三级模板查找：会话级 > 用户级 > 默认级（复用 SCRIPT_DIR 的多路径查找）
+    # 前两条是 override（用户可编辑的覆盖模板），其余是 default（随工具分发）。
+    # 校验失败时按来源决定「警告回退」还是「硬错误」。
+    local user_template="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/prompts/meeting-notes.md"
+    local candidates=(
+        "$SESSION_DIR/prompt.md"                                   # 会话级：本次会议专属
+        "$user_template"                                           # 用户级：全局自定义
+        "$SCRIPT_DIR/../share/meetap/prompts/meeting-notes.md"    # dev 源码树 / 标准 prefix
+        "$SCRIPT_DIR/share/meetap/prompts/meeting-notes.md"       # make install (PREFIX=~/bin)
+    )
 
-## 你的风格
+    # 模板必须包含的三个占位符（缺任何一个都算损坏）
+    local required=('${SESSION_DATE}' '${speaker_stats}' '${transcript}')
 
-- **像人说话，不像机器填表**。用自然的中文叙述，有观点、有判断、有轻重缓急
-- **大胆过滤**。寒暄、重复、跑题、车轱辘话——全部丢掉。只留真正推动事情前进的内容
-- **每个要点都回答 "so what"**。不只记录"讨论了X"，要说清"X的结论是什么、对谁有影响、下一步是什么"
-- **保留有温度的细节**。争论的焦点、有人改变立场的瞬间、那些让大家笑出来或沉默的时刻——这些比流水账更能还原会议的真实面貌
-- **语音识别错误自行修正**，不要标注出来，读者不需要知道原始转录有误
+    local template="" i
+    for i in "${!candidates[@]}"; do
+        local p="${candidates[$i]}"
+        [[ -f "$p" ]] || continue
 
-## 发言人
+        # 校验：逐个检查必需占位符是否存在（-F 固定字符串，$ { } 不被当正则）
+        local missing="" ph
+        for ph in "${required[@]}"; do
+            grep -qF "$ph" "$p" || { missing="$ph"; break; }
+        done
 
-根据对话内容推断每个人的姓名和角色，用真实称呼替代 spk_0/spk_1。如果无法确定姓名，用角色描述（如"技术负责人""产品经理"）。
+        if [[ -n "$missing" ]]; then
+            # 由索引推导来源：前两条 candidate 是 override，后面的是 default
+            local kind
+            if [[ $i -lt 2 ]]; then kind=override; else kind=default; fi
+            if [[ "$kind" == "override" ]]; then
+                # 用户改坏了覆盖模板：警告并继续往后找默认模板
+                echo "$(_tn WARN_PROMPT_TEMPLATE_INVALID "$p" "$missing")" >&2
+                continue
+            else
+                # 默认模板损坏：分发出了问题，硬错误
+                echo "$(_tn ERR_PROMPT_TEMPLATE_INVALID "$p" "$missing")" >&2
+                return 1
+            fi
+        fi
 
-发言人统计（从音频分析得出）：
+        template="$p"
+        break
+    done
 
-${speaker_stats}
+    if [[ -z "$template" ]]; then
+        echo "$(_tn ERR_PROMPT_TEMPLATE_MISSING)" >&2
+        return 1
+    fi
 
-## 输出结构
-
-只输出 markdown 正文，不要代码块包裹。没有内容的章节直接省略，不要写"无"或"本次会议未产生..."。善用表格呈现结构化信息（对比、参数、多维度归纳等），让信息密度更高、阅读更快。
-
----
-
-# [用一句话概括核心议题的中文标题]
-
-**[English Subtitle — Translated from the Chinese Title Above]**
-
----
-
-|  |  |
-|---|---|
-| **会议时间** | ${SESSION_DATE}，时长约 [N] 分钟 |
-| **会议性质** | [一句话描述会议类型，如"XX 团队与 YY 团队的技术对齐会"] |
-| **关键词** | [5-10 个关键术语，用逗号分隔] |
-
----
-
-## 与会人员
-
-[用表格列出，按发言占比降序。发言极少的人可合并。]
-
-| 角色 | 代号 | 身份 | 发言占比 | 关注领域 |
-|:---:|:---:|------|:------:|--------|
-| [如：核心讲解] | [姓名 (spk_N)] | [组织+职位] | [N%] | [本次关注的具体话题] |
-
----
-
-## 摘要 (Abstract)
-
-[一段话概述：这场会解决了什么问题？做了什么决定？留下了什么悬念？写给完全不了解背景的人看，3-5 句话，读完就能跟上后续讨论。]
-
----
-
-## 目录
-
-[列出下方所有一级和二级章节标题，带 markdown 锚点链接，使读者可以快速跳转。]
-
----
-
-## 1 关键结论
-
-[用编号加粗标题格式逐条列出。每条要具体，不要"讨论了XX方案"，要"决定采用XX方案，因为..."。如果有分歧，写清楚分歧点和各方立场。格式如：]
-
-**结论 1 — [简短标题]。** [具体内容，含结论、影响和依据。]
-
-**结论 2 — [简短标题]。** [具体内容。]
-
-## 2 会议详情
-
-[按议题分节展开，使用二级编号（2.1、2.2...）。每个议题用叙述的方式写，像在给同事讲故事：]
-[- 背景是什么、为什么要讨论这个]
-[- 谁说了什么、核心观点和论据]
-[- 讨论过程中有没有转折、争论、新发现]
-[- 最后的结论或走向]
-
-[保留具体的数字、案例、客户名称、技术细节。当存在多维度对比、参数列表或分类归纳时，用表格呈现并加编号标题（如"表 1：XXX"）。]
-
-## 3 待办事项
-
-[用表格呈现。只列会上明确提出的，不要自行推导。]
-
-| 状态 | 责任方 | 事项 | 时限 |
-|:----:|:------:|------|:----:|
-| ☐ | [负责人] | [具体事项] | [截止时间] |
-
-## 4 悬而未决问题
-
-[用编号加粗标题格式。会上提出但没有结论的问题。写清楚卡在哪里、需要什么条件才能推进。格式如：]
-
-**问题 1 — [简短标题]。** [具体内容，含卡点和推进条件。]
-
-## 5 后续合作意向
-
-[如有后续合作、跟进计划，在此单独列出。如没有则省略此章节。]
-
----
-
-*—— **L**isten · **a**nalyze · **r**ecap · **r**efine · **y**ield  —  [Meetap](https://github.com/henceman777/meetap)  —  **Y**our **a**udio **n**otes **g**enerator ——*
-
-## 转录原文
-
-${transcript}
-PROMPT_EOF
+    # 变量注入：只替换白名单三个占位符，值来自环境变量，作为纯字面量替换。
+    # 用 perl 而非 eval/envsubst——perl 把值当普通字符串写回，
+    # transcript 里的 $(...)、反引号、${foo} 等 shell 元字符不会被执行或二次替换。
+    # 单次遍历同时替换三者，注入值不会被后续 pass 再次匹配（保持与旧 heredoc 一致的语义）。
+    SESSION_DATE="$SESSION_DATE" speaker_stats="$speaker_stats" transcript="$transcript" \
+    perl -pe '
+        s/\$\{(SESSION_DATE|speaker_stats|transcript)\}/$ENV{$1}/g;
+    ' "$template"
 }
 
 summarize_via_bedrock() {
@@ -705,21 +656,27 @@ summarize_via_claude_code() {
 send_meeting_notes() {
     local NOTES_FILE="$1"
     local SESSION_DIR="$2"
+    local recipients="$CFG_EMAIL"
+    local sender="$CFG_EMAIL_SENDER"
 
-    [[ -z "$CFG_EMAIL" ]] && return 0
-    [[ -z "$CFG_EMAIL_SENDER" ]] && {
+    # venv 缺失：无法做 HTML 转换；仅在用户配了邮件时才报错提示
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        [[ -n "$recipients" ]] && echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
+        return 1
+    fi
+    # 配了收件人但缺发件人：提示后降级为只生成 HTML 文件、不发送
+    if [[ -n "$recipients" && -z "$sender" ]]; then
         echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_SENDER_MISSING)"
-        return 1
-    }
-    [[ ! -x "$VENV_PYTHON" ]] && {
-        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
-        return 1
-    }
+        recipients=""
+    fi
 
     local PDF_FILE="${NOTES_FILE%.md}.pdf"
+    local HTML_FILE="${NOTES_FILE%.md}.html"
     echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_CONVERTING)"
 
-    "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$CFG_EMAIL" "$CFG_EMAIL_SENDER" "$CFG_REGION" <<'PYEOF'
+    # SCRIPT_DIR 作为 argv 传入：heredoc 运行时 sys.argv[0] 是 '-'，
+    # Python 侧无法自行定位安装目录，必须由 bash 显式传递
+    "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$recipients" "$sender" "$CFG_REGION" "$HTML_FILE" "$SCRIPT_DIR" <<'PYEOF'
 import sys, os, re, boto3
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -730,6 +687,9 @@ pdf_path = sys.argv[2]
 recipients = [r.strip() for r in sys.argv[3].split(",") if r.strip()]
 sender = sys.argv[4]
 region = sys.argv[5]
+html_path = sys.argv[6]
+script_dir = sys.argv[7]   # bash 侧 SCRIPT_DIR：heredoc 下 argv[0] 是 '-'，无法自行定位
+html = None
 
 with open(notes_path, "r") as f:
     md_content = f.read()
@@ -741,82 +701,117 @@ for line in md_content.split("\n"):
         title = line[2:].strip()
         break
 
-# Markdown to HTML
-html = md_content
-html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
-html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
-html = re.sub(r'^### (.+)$', r'<h3>\1</h3>', html, flags=re.MULTILINE)
-html = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', html)
-html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html)
-html = re.sub(r'\*(.+?)\*', r'<em>\1</em>', html)
-html = re.sub(r'^- \[ \] (.+)$', r'<li>☐ \1</li>', html, flags=re.MULTILINE)
-html = re.sub(r'^- \[x\] (.+)$', r'<li>☑ \1</li>', html, flags=re.MULTILINE)
-html = re.sub(r'^- (.+)$', r'<li>\1</li>', html, flags=re.MULTILINE)
-html = re.sub(r'^---$', r'<hr>', html, flags=re.MULTILINE)
-# Wrap consecutive <li> in <ul>
-html = re.sub(r'((?:<li>.*?</li>\n?)+)', r'<ul>\1</ul>', html)
-# Wrap plain-text blocks in <p>
-lines = html.split('\n')
-out, buf = [], []
-for ln in lines:
-    s = ln.strip()
-    if not s:
+if html is None:
+    # Extract date from metadata block (> **会议时间** ...)
+    meeting_date = ""
+    for line in md_content.split("\n"):
+        m = re.match(r'>\s*\*\*会议时间\*\*\s*(.+)', line)
+        if m:
+            meeting_date = m.group(1).strip()
+            break
+
+    # 邮件版去掉「## 目录」整节（邮件一屏可读不需要跳转目录；md 文件保留）
+    md_content = re.sub(r'^## 目录\s*\n.*?(?=^## )', '', md_content, flags=re.MULTILINE | re.DOTALL)
+    # 去掉章节间的间距 div，让邮件上下更紧凑（md 文件保留）
+    md_content = re.sub(r'^<div style="height:[^"]*"></div>\s*$', '', md_content, flags=re.MULTILINE)
+
+    # --- Markdown to HTML: prefer `markdown` library, fallback to regex ---
+    body_html = None
+    try:
+        import markdown
+        body_html = markdown.markdown(md_content, extensions=['tables', 'fenced_code'])
+    except ImportError:
+        pass
+
+    if body_html is None:
+        # Fallback: basic regex conversion (legacy, works without markdown lib)
+        body_html = md_content
+        body_html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^### (.+)$', r'<h3>\1</h3>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', body_html)
+        body_html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', body_html)
+        body_html = re.sub(r'\*(.+?)\*', r'<em>\1</em>', body_html)
+        body_html = re.sub(r'^- \[ \] (.+)$', r'<li>☐ \1</li>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^- \[x\] (.+)$', r'<li>☑ \1</li>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^- (.+)$', r'<li>\1</li>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'^---$', r'<hr>', body_html, flags=re.MULTILINE)
+        body_html = re.sub(r'((?:<li>.*?</li>\n?)+)', r'<ul>\1</ul>', body_html)
+        lines = body_html.split('\n')
+        out, buf = [], []
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                if buf:
+                    block = ' '.join(buf)
+                    if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
+                        out.append(f'<p>{block}</p>')
+                    else:
+                        out.append(block)
+                    buf = []
+            else:
+                buf.append(ln)
         if buf:
             block = ' '.join(buf)
             if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
                 out.append(f'<p>{block}</p>')
             else:
                 out.append(block)
-            buf = []
-    else:
-        buf.append(ln)
-if buf:
-    block = ' '.join(buf)
-    if not re.match(r'<(h[1-3]|li|ul|/ul|hr|p)', block):
-        out.append(f'<p>{block}</p>')
-    else:
-        out.append(block)
-html = '\n'.join(out)
-# Signature line: match any Meetap footer and render as styled HTML
-sig_html = ('<p style="color:#888;margin-top:24px;font-style:italic">'
-    '—— <a href="https://github.com/henceman777/meetap" style="color:#4a90d9">Meetap</a>'
-    ' —— <strong>L</strong>isten · <strong>a</strong>nalyze · <strong>r</strong>ecap · '
-    '<strong>r</strong>efine · <strong>y</strong>ield , '
-    '<strong>Y</strong>our <strong>a</strong>udio <strong>n</strong>otes '
-    '<strong>g</strong>enerator</p>')
-html = re.sub(r'<p>.*?——.*?[Mm]eetap.*?——.*?</p>', sig_html, html)
-html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 0 auto; padding: 0 20px; line-height: 1.5; color: #333; font-size: 14px; }}
-h1 {{ color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 6px; margin: 16px 0 8px; font-size: 20px; }}
-h2 {{ color: #2c3e50; margin: 18px 0 6px; font-size: 16px; }}
-h3 {{ color: #34495e; margin: 14px 0 4px; font-size: 15px; }}
-p {{ margin: 6px 0; }}
-ul {{ margin: 4px 0; padding-left: 20px; }}
-li {{ margin: 2px 0; list-style: none; }}
-hr {{ border: none; border-top: 1px solid #ddd; margin: 12px 0; }}
-</style></head><body>{html}</body></html>"""
+        body_html = '\n'.join(out)
 
-# HTML to PDF via PyMuPDF
+    # 正文里 Claude 按模板要求写了 LARRY 页脚；模板外框会再注入 footer，
+    # 先剥掉正文里的那份，避免邮件出现双页脚；连同落款上方的分割线 <hr> 一起剥
+    # （模板 footer 自带浅灰细线，md 的 --- 转成的黑色 <hr> 会重复且突兀）
+    body_html = re.sub(r'(<hr\s*/?>\s*)?<p[^>]*>.{0,40}——.{0,200}?[Mm]eetap.{0,200}?——.{0,40}</p>', '', body_html, flags=re.DOTALL)
+
+    # --- Load email template (table layout, email-client compatible) ---
+    # 标志性 LARRY 落款，与 md 版一致（首字母大写体现藏头）；nowrap+小字号保证单行
+    footer_html = ('<span style="white-space:nowrap;font-size:11px"><em>&mdash;&mdash; '
+        'Listen &middot; Analyze &middot; Recap &middot; Refine &middot; Yield &mdash; '
+        '<a href="https://github.com/henceman777/meetap" '
+        'style="color:#4a90d9;text-decoration:none">Meetap</a> &mdash; '
+        'Your Audio Notes Generator &mdash;&mdash;</em></span>')
+
+    # Locate the email.html template relative to the install dir (passed from bash)
+    template_candidates = [
+        os.path.join(script_dir, "..", "share", "meetap", "templates", "email.html"),
+        os.path.join(script_dir, "share", "meetap", "templates", "email.html"),
+    ]
+    template_html = None
+    for tp in template_candidates:
+        if os.path.isfile(tp):
+            with open(tp, "r") as f:
+                template_html = f.read()
+            break
+
+    if template_html:
+        # Inject into the table-layout template (inline CSS, no <style> tag)
+        html = template_html.replace("{{meeting_title}}", title)
+        html = html.replace("{{meeting_date}}", meeting_date)
+        html = html.replace("{{minutes_body}}", body_html)
+        html = html.replace("{{footer}}", footer_html)
+    else:
+        # Fallback: wrap body_html in a minimal inline-styled container
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:20px;font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.6">
+<div style="max-width:600px;margin:0 auto">{body_html}
+<p style="color:#999;font-size:12px;margin-top:24px;text-align:center">{footer_html}</p>
+</div></body></html>"""
+
+# 落盘 HTML 版本（无论是否发邮件，都在纪要旁生成 .html 文件）
 try:
-    import fitz
-    story = fitz.Story(html)
-    writer = fitz.DocumentWriter(pdf_path)
-    mediabox = fitz.paper_rect("a4")
-    where = mediabox + (36, 36, -36, -36)
-    more = True
-    while more:
-        dev = writer.begin_page(mediabox)
-        more, _ = story.place(where)
-        story.draw(dev)
-        writer.end_page()
-    writer.close()
+    with open(html_path, "w") as f:
+        f.write(html)
+    print(f"HTML saved: {html_path}")
 except Exception as e:
-    print(f"PDF conversion failed: {e}, sending HTML only")
-    pdf_path = None
+    print(f"HTML save failed: {e}")
 
-# Send via SES
+# 未配置收件人 → 只落盘 HTML，不发送
+if not recipients:
+    sys.exit(0)
+
+# Send via SES（正文即 HTML，不再生成/附加 PDF）
 try:
     ses = boto3.client("ses", region_name=region)
     msg = MIMEMultipart("mixed")
@@ -827,12 +822,6 @@ try:
     body = MIMEText(html, "html", "utf-8")
     msg.attach(body)
 
-    if pdf_path and os.path.exists(pdf_path):
-        with open(pdf_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="pdf")
-            att.add_header("Content-Disposition", "attachment", filename=os.path.basename(pdf_path))
-            msg.attach(att)
-
     ses.send_raw_email(
         Source=sender,
         Destinations=recipients,
@@ -842,15 +831,86 @@ try:
 except Exception as e:
     print(f"Email send failed: {e}")
     sys.exit(1)
-finally:
-    pass
 PYEOF
 
-    if [[ $? -eq 0 ]]; then
-        echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_SENT "$CFG_EMAIL")"
-    else
-        echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_FAILED)"
+    local py_rc=$?
+    if [[ -n "$recipients" ]]; then
+        if [[ $py_rc -eq 0 ]]; then
+            echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_SENT "$recipients")"
+        else
+            echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_FAILED)"
+        fi
     fi
+}
+
+# 清洗标题为合法文件名片段：白名单只保留 中文/字母/数字/-/_，其余（含 / : | 空格、
+# emoji、控制字符等）一律转 -；连续 - 合并；去首尾 -；按「字符」截断到 20。
+# 用 perl -CS 在 UTF-8 字符层面处理，中文算 1 个字符，绝不会截出半个多字节字符。
+# 清洗后为空时兜底返回 meeting。
+sanitize_title() {
+    local raw="$1" cleaned
+    cleaned=$(printf '%s' "$raw" | perl -CS -pe '
+        s/[^\p{Han}A-Za-z0-9_-]/-/g;   # 白名单外全部替换为 -
+        s/-+/-/g;                       # 连续 - 合并
+        s/^-+|-+$//g;                   # 去首尾 -
+        $_ = substr($_, 0, 20);         # 按字符截断（-CS 下已解码为字符）
+        s/-+$//;                        # 截断后可能重新露出尾部 -
+    ')
+    [[ -z "$cleaned" ]] && cleaned="meeting"
+    printf '%s' "$cleaned"
+}
+
+# 纪要智能命名：把 meeting-notes.md **重命名**为「YYYY-MM-DD_HHMM_主题.md」
+# （mv，不留固定名文件；最终产物只有 <智能命名>.md 与配套 .html）。
+# 主题只用 meeting-notes.md 首行 <!-- meetap-title: XXX --> 元数据（Claude 生成），
+# 拿不到则兜底 meeting；目录名（含用户 start 时给的会议名）只提供日期时间前缀。
+# 标题注释行只要存在就从文件里删掉（它只是元数据，不该进正文/邮件）。
+# 最终文件路径写到 stdout 供调用方接住；提示消息走 stderr 避免污染路径输出。
+# 任何失败都回退输出原路径，保证调用方始终拿到一个存在的文件。
+smart_name_notes() {
+    local OUTPUT="$1"
+    local SESSION_DIR="$2"
+    local SESSION_NAME first_line title="" claude_title=""
+    SESSION_NAME=$(basename "$SESSION_DIR")
+
+    # 解析首行元数据；匹配到就删除该注释行（写临时文件后覆盖，避免读写同一文件）
+    IFS= read -r first_line < "$OUTPUT" || true
+    if [[ "$first_line" == "<!-- meetap-title:"* && "$first_line" == *"-->"* ]]; then
+        claude_title="${first_line#<!-- meetap-title:}"
+        claude_title="${claude_title%%-->*}"
+        # 去首尾空白
+        claude_title="${claude_title#"${claude_title%%[![:space:]]*}"}"
+        claude_title="${claude_title%"${claude_title##*[![:space:]]}"}"
+        local tmp
+        tmp=$(mktemp "$SESSION_DIR/.notes.XXXXXX") || { printf '%s' "$OUTPUT"; return 0; }
+        tail -n +2 "$OUTPUT" > "$tmp" && mv "$tmp" "$OUTPUT" || { rm -f "$tmp"; printf '%s' "$OUTPUT"; return 0; }
+    fi
+
+    # 日期时间前缀从 SESSION_DIR 目录名解析（与 build_prompt 的分支对应）：
+    # 标准 20250715_1430[_会议名] → 2025-07-15_1430；非标准格式直接用目录名原样做前缀。
+    local prefix
+    if [[ "$SESSION_NAME" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{4})(_(.+))?$ ]]; then
+        prefix="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}_${BASH_REMATCH[4]}"
+    else
+        prefix="$SESSION_NAME"
+    fi
+
+    title=$(sanitize_title "$claude_title")
+
+    # 防碰撞：已存在则追加 _2、_3…，绝不静默覆盖
+    local target="$SESSION_DIR/${prefix}_${title}.md"
+    if [[ -e "$target" ]]; then
+        local n=2
+        while [[ -e "$SESSION_DIR/${prefix}_${title}_${n}.md" ]]; do ((n++)); done
+        target="$SESSION_DIR/${prefix}_${title}_${n}.md"
+    fi
+
+    # 末尾补两个空行：Typora 类编辑器打开时光标落在文件末尾，
+    # 若末行是落款，其所在行会显示为 Markdown 源码；空行让光标落在空白处
+    printf '\n\n' >> "$OUTPUT"
+    mv "$OUTPUT" "$target" || { printf '%s' "$OUTPUT"; return 0; }
+    echo "[$(date '+%H:%M:%S')] $(_tn NOTES_NAMED "$(basename "$target")")" >&2
+    printf '%s' "$target"
 }
 
 summarize_transcript() {
@@ -867,7 +927,12 @@ summarize_transcript() {
 
     echo "[$(date '+%H:%M:%S')] $(_tn GENERATING_NOTES "$CFG_AI_BACKEND")"
 
-    build_prompt "$SESSION_DIR" > "$PROMPT_FILE"
+    # build_prompt 失败（模板缺失/损坏）时中止：删掉已被截断的空 prompt 文件，
+    # 避免把空 prompt 发给 AI 后端浪费一次调用
+    if ! build_prompt "$SESSION_DIR" > "$PROMPT_FILE"; then
+        rm -f "$PROMPT_FILE"
+        return 1
+    fi
 
     case "$CFG_AI_BACKEND" in
         claude-code)
@@ -886,9 +951,12 @@ summarize_transcript() {
     rm -f "$PROMPT_FILE"
 
     if [[ -f "$OUTPUT" ]]; then
-        echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$OUTPUT")"
+        # smart_name_notes 把 meeting-notes.md 重命名为智能名,返回最终路径
+        local FINAL_OUTPUT
+        FINAL_OUTPUT=$(smart_name_notes "$OUTPUT" "$SESSION_DIR")
+        echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$FINAL_OUTPUT")"
         osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE)\" with title \"MeeTap\"" 2>/dev/null
-        send_meeting_notes "$OUTPUT" "$SESSION_DIR"
+        send_meeting_notes "$FINAL_OUTPUT" "$SESSION_DIR"
     else
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_FAILED)"
         osascript -e "display notification \"$(_tn NOTIFY_NOTES_FAILED)\" with title \"MeeTap\"" 2>/dev/null
@@ -900,9 +968,12 @@ start_recording() {
     if [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]]; then
         VERBOSE=true
         echo "true" > "$STATE_DIR/test-mode"
+        shift
     else
         rm -f "$STATE_DIR/test-mode"
     fi
+    # 可选位置参数：会议名称（meetap start 季度架构评审）
+    local MEETING_NAME="${1:-}"
 
     # 检查是否已在录制
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -981,8 +1052,13 @@ start_recording() {
     fi
     $VERBOSE && _t MONITOR_STARTED "$ORIG_NAME"
 
-    # 创建本次录制的会话目录
-    SESSION_DIR="$RECORDING_DIR/$(date +"%Y%m%d_%H%M")"
+    # 创建本次录制的会话目录：默认 日期_时间；给了会议名则追加清洗后的名称段
+    local session_base
+    session_base="$(date +"%Y%m%d_%H%M")"
+    if [[ -n "$MEETING_NAME" ]]; then
+        session_base="${session_base}_$(sanitize_title "$MEETING_NAME")"
+    fi
+    SESSION_DIR="$RECORDING_DIR/$session_base"
     mkdir -p "$SESSION_DIR"
     echo "$SESSION_DIR" > "$STATE_DIR/session-dir"
 
@@ -1313,7 +1389,7 @@ setup_apps() {
 
 case "${1:-}" in
     start)
-        start_recording "${2:-}"
+        start_recording "${@:2}"
         ;;
     stop)
         stop_recording "${2:-}"
