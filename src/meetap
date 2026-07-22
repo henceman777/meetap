@@ -904,6 +904,9 @@ smart_name_notes() {
         target="$SESSION_DIR/${prefix}_${title}_${n}.md"
     fi
 
+    # 末尾补两个空行：Typora 类编辑器打开时光标落在文件末尾，
+    # 若末行是落款，其所在行会显示为 Markdown 源码；空行让光标落在空白处
+    printf '\n\n' >> "$OUTPUT"
     mv "$OUTPUT" "$target" || { printf '%s' "$OUTPUT"; return 0; }
     echo "[$(date '+%H:%M:%S')] $(_tn NOTES_NAMED "$(basename "$target")")" >&2
     printf '%s' "$target"
