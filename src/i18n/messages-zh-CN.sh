@@ -80,7 +80,7 @@ MSG_MIC_DEVICE="🎤 麦克风: %s"
 MSG_RECORDING_STARTED="🎙️  录制已开始"
 MSG_FIELD_FILE="   文件: %s"
 MSG_FIELD_PLAYBACK="   播放: %s"
-MSG_FIELD_AUTOSTOP="   自动停止: 持续静音 2 分钟后"
+MSG_FIELD_AUTOSTOP="   自动停止: 持续静音 %s 后"
 MSG_FIELD_STOP_CMD="   停止录制: %s stop"
 MSG_ERR_FFMPEG_FAIL="❌ ffmpeg 启动失败:"
 
