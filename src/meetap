@@ -219,14 +219,27 @@ start_visualizer() {
     local ROWS
     ROWS=$(tput lines 2>/dev/null < "$tty_dev" || echo 24)
 
-    # 电平来源双模式：tap 模式读 audio-tap --level-file 写的电平文件（0.4s 更新）；
-    # BlackHole 模式沿用 ffmpeg 短采样。tap 模式音频不经过 BlackHole，旧方式采不到。
+    # 电平来源双模式：
+    # - tap 模式：读 audio-tap --level-file 电平文件（系统音）+ 并发短采样麦克风
+    #   （输入设备共享模式，与录制 ffmpeg 不冲突），两者取较大者合成一条波形。
+    #   波形反映「录到的一切」；静音自停判定(is_audio_silent)仍只看系统音。
+    # - BlackHole 模式：ffmpeg 采样混录信号（本身已含系统音+麦克风）。
     local LEVEL_FILE="$STATE_DIR/tap-level"
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
         local max_vol
         if [[ -f "$LEVEL_FILE" ]]; then
-            max_vol=$(cat "$LEVEL_FILE" 2>/dev/null)
-            sleep 0.4
+            local sys_vol mic_vol
+            sys_vol=$(cat "$LEVEL_FILE" 2>/dev/null)
+            # 麦克风短采样 0.4s，兼作循环节流（与旧 BlackHole 采样节奏一致）
+            mic_vol=$(ffmpeg -nostdin -f avfoundation -i ":default" -t 0.4 \
+                -af volumedetect -f null /dev/null 2>&1 \
+                | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
+            # 合成：取两路较大者（dBFS 负值，数值大 = 声音响）
+            max_vol="${sys_vol:--91}"
+            if [[ -n "$mic_vol" ]]; then
+                local s=${max_vol%%.*} m=${mic_vol%%.*}
+                [[ ${m:--91} -gt ${s:--91} ]] && max_vol="$mic_vol"
+            fi
         else
             max_vol=$(ffmpeg -nostdin -f avfoundation -i ":BlackHole 2ch" -t 0.4 \
                 -af volumedetect -f null /dev/null 2>&1 \
