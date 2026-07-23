@@ -232,7 +232,10 @@ start_visualizer() {
     local MIC_LEVEL_FILE="$STATE_DIR/mic-level"
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
         local max_vol
-        if [[ -f "$LEVEL_FILE" ]]; then
+        # tap 模式判定用 TAP_PID_FILE（start 先写、必定存在），绝不能用
+        # tap-level 文件存在性——启动后 0.4s 内文件未生成会误走 ffmpeg 回退，
+        # 该 ffmpeg 与录制 ffmpeg 的 avfoundation 初始化撞车 → 录制卡死。
+        if [[ -f "$TAP_PID_FILE" ]]; then
             local sys_vol mic_vol
             sys_vol=$(cat "$LEVEL_FILE" 2>/dev/null)
             # mic-level 是 ametadata 追加格式，取最后一行 Peak_level 值
@@ -305,7 +308,7 @@ is_audio_silent() {
     # 覆盖现场会议/演讲场景：系统音全程静音，人声只进麦克风，不该自停。
     # 门限拦掉环境底噪，避免嘈杂环境永不自停。
     # BlackHole 模式：沿用 ffmpeg 采样混录信号（本身已含麦克风）。
-    if [[ -f "$STATE_DIR/tap-level" ]]; then
+    if [[ -f "$TAP_PID_FILE" ]]; then
         local max="-91" v
         for _ in 1 2 3 4 5; do
             v=$(cat "$STATE_DIR/tap-level" 2>/dev/null)
