@@ -1030,6 +1030,19 @@ start_recording() {
         fi
     fi
 
+    # 会话目录 + 录音文件名（两个捕获分支共用，必须在分支前生成）
+    local session_base
+    session_base="$(date +"%Y%m%d_%H%M")"
+    if [[ -n "$MEETING_NAME" ]]; then
+        session_base="${session_base}_$(sanitize_title "$MEETING_NAME")"
+    fi
+    SESSION_DIR="$RECORDING_DIR/$session_base"
+    mkdir -p "$SESSION_DIR"
+    echo "$SESSION_DIR" > "$STATE_DIR/session-dir"
+    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+    OUTPUT_FILE="$SESSION_DIR/meeting_${TIMESTAMP}.m4a"
+    echo "$OUTPUT_FILE" > "$OUTPUT_FILE_MARKER"
+
     if [[ "$use_tap" == "true" ]]; then
         # --- Process Tap 分支 ---
         # 不切设备、不需要 BlackHole/audio-monitor,用户听到原声
@@ -1041,14 +1054,18 @@ start_recording() {
 
         # audio-tap tap-start 输出 Float32 LE mono PCM 到 stdout
         # ffmpeg 从 stdin 读系统音 + avfoundation 读麦克风,混录输出
+        # 注意1：ffmpeg 的 stdin(pipe:0) 就是 audio-tap 的 PCM 数据管道，
+        # 绝不能加 < /dev/null（会覆盖管道 → tap 收 EPIPE 秒退 → 录音全空）。
+        # 注意2：avfoundation 自带挂钟时间戳而 pipe 从 0 开始，两路直接 amix
+        # 会因时间轴永不对齐而输出 0 字节——必须先 asetpts=PTS-STARTPTS 归零。
         "$TAP_TOOL" tap-start 2>"$STATE_DIR/tap.log" | \
         ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i pipe:0 \
             -f avfoundation -i ":default" \
-            -filter_complex amix=inputs=2:duration=longest \
+            -filter_complex "[0:a]asetpts=PTS-STARTPTS[a0];[1:a]asetpts=PTS-STARTPTS[a1];[a0][a1]amix=inputs=2:duration=longest" \
             -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
             -movflags frag_keyframe+empty_moov \
             "$OUTPUT_FILE" \
-            < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
+            > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
         FFMPEG_PID=$!
         echo $FFMPEG_PID > "$PID_FILE"
@@ -1138,22 +1155,8 @@ start_recording() {
     fi
     $VERBOSE && _t MONITOR_STARTED "$ORIG_NAME"
 
-    # 创建本次录制的会话目录：默认 日期_时间；给了会议名则追加清洗后的名称段
-    local session_base
-    session_base="$(date +"%Y%m%d_%H%M")"
-    if [[ -n "$MEETING_NAME" ]]; then
-        session_base="${session_base}_$(sanitize_title "$MEETING_NAME")"
-    fi
-    SESSION_DIR="$RECORDING_DIR/$session_base"
-    mkdir -p "$SESSION_DIR"
-    echo "$SESSION_DIR" > "$STATE_DIR/session-dir"
-
-    # 生成录音文件名
-    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-    OUTPUT_FILE="$SESSION_DIR/meeting_${TIMESTAMP}.m4a"
-    echo "$OUTPUT_FILE" > "$OUTPUT_FILE_MARKER"
-
     # 开始录制（系统音频 + 麦克风混录）
+    # 会话目录与 OUTPUT_FILE 已在捕获方式分支前生成（两分支共用）
     local MIC_NAME
     MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
     $VERBOSE && _t MIC_DEVICE "$MIC_NAME"
