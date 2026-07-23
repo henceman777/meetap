@@ -313,19 +313,19 @@ is_audio_silent() {
     # 门限拦掉环境底噪，避免嘈杂环境永不自停。
     # BlackHole 模式：沿用 ffmpeg 采样混录信号（本身已含麦克风）。
     if [[ -f "$TAP_PID_FILE" ]]; then
-        local max="-91" v
+        # 系统音与麦克风在同一 5s 窗口内各采 5 次取峰值（电平文件 0.4s 更新）
+        local max="-91" mic_max="-91" v m
         for _ in 1 2 3 4 5; do
             v=$(cat "$STATE_DIR/tap-level" 2>/dev/null)
             [[ -n "$v" ]] && (( $(printf '%.0f' "$v") > $(printf '%.0f' "$max") )) && max="$v"
+            m=$(cat "$STATE_DIR/mic-level" 2>/dev/null)
+            [[ -n "$m" && "$m" != "-inf" ]] && (( $(printf '%.0f' "$m") > $(printf '%.0f' "$mic_max") )) && mic_max="$m"
             sleep 1
         done
         mean_vol="$max"
-
-        # 麦克风电平读 mic-level 文件（audio-tap 写，单行 dBFS）
-        local mic_vol
-        mic_vol=$(cat "$STATE_DIR/mic-level" 2>/dev/null)
-        if [[ -n "$mic_vol" && "$mic_vol" != "-inf" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
-            return 1   # 麦克风检测到人声级别的声音 → 不静音
+        # 麦克风超过人声门限 → 有人在讲话 → 不静音（门限拦环境底噪）
+        if (( ${mic_max%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
+            return 1
         fi
     else
         mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t 5 \
@@ -1049,7 +1049,17 @@ start_recording() {
     else
         rm -f "$STATE_DIR/test-mode"
     fi
-    # 可选位置参数：会议名称（meetap start 季度架构评审）
+    # 可选参数：-g/--grace N 覆盖静默自停秒数；位置参数为会议名称
+    # （meetap start -g 300 季度架构评审）
+    while [[ "${1:-}" == "-g" || "${1:-}" == "--grace" ]]; do
+        if [[ "${2:-}" =~ ^[0-9]+$ ]] && (( $2 > 0 )); then
+            CFG_SILENCE_GRACE="$2"
+            shift 2
+        else
+            _t ERR_BAD_GRACE "${2:-}"
+            exit 1
+        fi
+    done
     local MEETING_NAME="${1:-}"
 
     # 检查是否已在录制
@@ -1150,14 +1160,28 @@ start_recording() {
 
         sleep 1
         if kill -0 $FFMPEG_PID 2>/dev/null; then
-            # tap 模式不启用静音自停：混音后单路 PCM 无法区分系统音/麦克风，
-            # 麦克风持续收到环境音会让"静音"永不成立（用户决策：显式 stop）
+            # 静默自停：聚合语音（系统音 tap-level + 麦克风 mic-level，麦克风
+            # 过 mic_threshold 门限拦底噪）持续静默超过 silence_grace 秒自动停止。
+            # 时长可用 meetap start -g N 覆盖，默认读 config silence_grace。
+            autostop_daemon &
+            AUTOSTOP_PID=$!
+            echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
+            disown $AUTOSTOP_PID
+
             echo ""
             _t RECORDING_STARTED
             $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
             _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
-            _t FIELD_STOP_MANUAL
             _t FIELD_STOP_CMD "$0"
+            local _grace_display
+            if (( CFG_SILENCE_GRACE >= 3600 )); then
+                _grace_display="$((CFG_SILENCE_GRACE / 3600)) 小时"
+            elif (( CFG_SILENCE_GRACE >= 60 )); then
+                _grace_display="$((CFG_SILENCE_GRACE / 60)) 分钟"
+            else
+                _grace_display="${CFG_SILENCE_GRACE} 秒"
+            fi
+            _t FIELD_SILENCE_AUTOSTOP "$_grace_display"
             echo ""
 
             # 点阵波形 + 状态栏（与 BlackHole 分支一致；电平来自 tap-level 文件）
