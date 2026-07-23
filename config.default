@@ -35,6 +35,12 @@ audio_capture = auto
 silence_threshold = -50
 # Stop after N seconds of continuous silence
 silence_grace = 120
+# Mic gate threshold (dBFS, tap mode only): mic louder than this counts as
+# "someone is speaking" — feeds the waveform and resets the silence timer
+# (for in-person meetings where system audio stays silent).
+# Typical speech: -10~-25; room noise: below -35. Raise if noisy environment
+# keeps recording alive; lower if soft speech gets ignored.
+mic_threshold = -30
 
 # ── Display ──────────────────────────────────────────────────
 # CLI display language (en-US | zh-CN)

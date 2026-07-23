@@ -14,6 +14,7 @@ CFG_RECORDING_DIR="$HOME/Record"
 CFG_MAX_SPEAKERS=10
 CFG_SILENCE_THRESHOLD=-50
 CFG_SILENCE_GRACE=120
+CFG_MIC_THRESHOLD=-30
 CFG_AUDIO_BITRATE="128k"
 CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
@@ -76,6 +77,7 @@ load_config() {
             max_speakers)          CFG_MAX_SPEAKERS="$val" ;;
             silence_threshold)     CFG_SILENCE_THRESHOLD="$val" ;;
             silence_grace)         CFG_SILENCE_GRACE="$val" ;;
+            mic_threshold)         CFG_MIC_THRESHOLD="$val" ;;
             audio_bitrate)         CFG_AUDIO_BITRATE="$val" ;;
             multi_language)        CFG_MULTI_LANGUAGE="$val" ;;
             ai_backend)            CFG_AI_BACKEND="$val" ;;
@@ -234,11 +236,12 @@ start_visualizer() {
             mic_vol=$(ffmpeg -nostdin -f avfoundation -i ":default" -t 0.4 \
                 -af volumedetect -f null /dev/null 2>&1 \
                 | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
-            # 合成：取两路较大者（dBFS 负值，数值大 = 声音响）
+            # 合成：麦克风超过人声门限（mic_threshold）才参与，拦掉环境底噪；
+            # 之后取两路较大者（dBFS 负值，数值大 = 声音响）
             max_vol="${sys_vol:--91}"
-            if [[ -n "$mic_vol" ]]; then
-                local s=${max_vol%%.*} m=${mic_vol%%.*}
-                [[ ${m:--91} -gt ${s:--91} ]] && max_vol="$mic_vol"
+            if [[ -n "$mic_vol" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
+                local s=${max_vol%%.*}
+                [[ ${mic_vol%%.*} -gt ${s:--91} ]] && max_vol="$mic_vol"
             fi
         else
             max_vol=$(ffmpeg -nostdin -f avfoundation -i ":BlackHole 2ch" -t 0.4 \
@@ -296,8 +299,11 @@ stop_visualizer() {
 
 is_audio_silent() {
     local mean_vol
-    # tap 模式：读 audio-tap 电平文件（0.4s 窗口峰值 dBFS），采样 5 次取最大值
-    # 近似 5 秒窗口；BlackHole 模式：沿用 ffmpeg 采样（与波形 start_visualizer 同策略）
+    # tap 模式：系统音读电平文件（5 次取峰值，近似 5s 窗口）；
+    # 另采样麦克风一次，超过 mic_threshold（人声门限）即视为「有人在讲话」——
+    # 覆盖现场会议/演讲场景：系统音全程静音，人声只进麦克风，不该自停。
+    # 门限拦掉环境底噪，避免嘈杂环境永不自停。
+    # BlackHole 模式：沿用 ffmpeg 采样混录信号（本身已含麦克风）。
     if [[ -f "$STATE_DIR/tap-level" ]]; then
         local max="-91" v
         for _ in 1 2 3 4 5; do
@@ -306,6 +312,14 @@ is_audio_silent() {
             sleep 1
         done
         mean_vol="$max"
+
+        local mic_vol
+        mic_vol=$(ffmpeg -nostdin -f avfoundation -i ":default" -t 0.4 \
+            -af volumedetect -f null /dev/null 2>&1 \
+            | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
+        if [[ -n "$mic_vol" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
+            return 1   # 麦克风检测到人声级别的声音 → 不静音
+        fi
     else
         mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t 5 \
             -af volumedetect -f null /dev/null 2>&1 \
