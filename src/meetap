@@ -14,7 +14,7 @@ CFG_RECORDING_DIR="$HOME/Record"
 CFG_MAX_SPEAKERS=10
 CFG_SILENCE_THRESHOLD=-50
 CFG_SILENCE_GRACE=120
-CFG_MIC_THRESHOLD=-42
+CFG_MIC_THRESHOLD=-47
 CFG_AUDIO_BITRATE="128k"
 CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
@@ -253,12 +253,17 @@ start_visualizer() {
         fi
         [[ -z "$max_vol" ]] && max_vol="-91"
 
+        # dBFS → 档位映射：窗口收窄到人声实际动态范围（门限 ~ -12dB），
+        # 全 0~-80 平铺会把人声(-30~-50)压在低档区，波形一排平点没有起伏。
+        # 下界跟随 mic_threshold（低于门限=0 档），上界 -12（响亮人声顶格）。
         local vi=${max_vol%%.*}
         vi=${vi#-}
+        local lo=${CFG_MIC_THRESHOLD#-}   # 如 47（绝对值）
+        local hi=12
         local level
-        if [[ $vi -ge 80 ]]; then level=0
-        elif [[ $vi -le 3 ]]; then level=$MAX_IDX
-        else level=$(( (80 - vi) * MAX_IDX / 77 )); fi
+        if [[ $vi -ge $lo ]]; then level=0
+        elif [[ $vi -le $hi ]]; then level=$MAX_IDX
+        else level=$(( (lo - vi) * MAX_IDX / (lo - hi) )); fi
 
         history=("${history[@]:1}" "$level")
 
