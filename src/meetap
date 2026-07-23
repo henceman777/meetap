@@ -222,24 +222,24 @@ start_visualizer() {
     ROWS=$(tput lines 2>/dev/null < "$tty_dev" || echo 24)
 
     # 电平来源双模式：
-    # - tap 模式：读 audio-tap --level-file 电平文件（系统音）+ 并发短采样麦克风
-    #   （输入设备共享模式，与录制 ffmpeg 不冲突），两者取较大者合成一条波形。
-    #   波形反映「录到的一切」；静音自停判定(is_audio_silent)仍只看系统音。
+    # - tap 模式：系统音读 tap-level（audio-tap 写）；麦克风读 mic-level
+    #   （录制 ffmpeg 的 astats 滤镜写，0.4s 窗口追加）。两个都是文件读取，
+    #   零额外设备占用（严禁并发开第二个 ffmpeg 采 :default，会抢占输入设备）。
+    #   麦克风超过人声门限(mic_threshold)才参与合成，取两路较大者。
     # - BlackHole 模式：ffmpeg 采样混录信号（本身已含系统音+麦克风）。
     local LEVEL_FILE="$STATE_DIR/tap-level"
+    local MIC_LEVEL_FILE="$STATE_DIR/mic-level"
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
         local max_vol
         if [[ -f "$LEVEL_FILE" ]]; then
             local sys_vol mic_vol
             sys_vol=$(cat "$LEVEL_FILE" 2>/dev/null)
-            # 麦克风短采样 0.4s，兼作循环节流（与旧 BlackHole 采样节奏一致）
-            mic_vol=$(ffmpeg -nostdin -f avfoundation -i ":default" -t 0.4 \
-                -af volumedetect -f null /dev/null 2>&1 \
-                | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
-            # 合成：麦克风超过人声门限（mic_threshold）才参与，拦掉环境底噪；
-            # 之后取两路较大者（dBFS 负值，数值大 = 声音响）
+            # mic-level 是 ametadata 追加格式，取最后一行 Peak_level 值
+            mic_vol=$(tail -2 "$MIC_LEVEL_FILE" 2>/dev/null \
+                | sed -n 's/.*Peak_level=\(-\{0,1\}[0-9.]*\).*/\1/p' | tail -1)
+            sleep 0.4
             max_vol="${sys_vol:--91}"
-            if [[ -n "$mic_vol" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
+            if [[ -n "$mic_vol" && "$mic_vol" != "-inf" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
                 local s=${max_vol%%.*}
                 [[ ${mic_vol%%.*} -gt ${s:--91} ]] && max_vol="$mic_vol"
             fi
@@ -313,11 +313,11 @@ is_audio_silent() {
         done
         mean_vol="$max"
 
+        # 麦克风电平读 mic-level 文件（录制 ffmpeg astats 写，勿开新 ffmpeg 抢设备）
         local mic_vol
-        mic_vol=$(ffmpeg -nostdin -f avfoundation -i ":default" -t 0.4 \
-            -af volumedetect -f null /dev/null 2>&1 \
-            | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
-        if [[ -n "$mic_vol" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
+        mic_vol=$(tail -2 "$STATE_DIR/mic-level" 2>/dev/null \
+            | sed -n 's/.*Peak_level=\(-\{0,1\}[0-9.]*\).*/\1/p' | tail -1)
+        if [[ -n "$mic_vol" && "$mic_vol" != "-inf" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
             return 1   # 麦克风检测到人声级别的声音 → 不静音
         fi
     else
@@ -1105,14 +1105,18 @@ start_recording() {
         # 绝不能加 < /dev/null（会覆盖管道 → tap 收 EPIPE 秒退 → 录音全空）。
         # 注意2：avfoundation 自带挂钟时间戳而 pipe 从 0 开始，两路直接 amix
         # 会因时间轴永不对齐而输出 0 字节——必须先 asetpts=PTS-STARTPTS 归零。
-        rm -f "$STATE_DIR/tap-level"
+        # 注意3：麦克风电平由本 ffmpeg 的 astats 滤镜写 mic-level 文件——
+        # 绝不能开第二个 ffmpeg 并发采样 :default（输入设备被抢占会导致
+        # 录制输入卡死、SIGINT 失效、录音全丢）。波形/静音检测只读该文件。
+        rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level"
         "$TAP_TOOL" tap-start --level-file "$STATE_DIR/tap-level" 2>"$STATE_DIR/tap.log" | \
         ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i pipe:0 \
             -f avfoundation -i ":default" \
-            -filter_complex "[0:a]asetpts=PTS-STARTPTS[a0];[1:a]asetpts=PTS-STARTPTS[a1];[a0][a1]amix=inputs=2:duration=longest" \
-            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
+            -filter_complex "[1:a]asplit=2[micrec][micmeter];[0:a]asetpts=PTS-STARTPTS[a0];[micrec]asetpts=PTS-STARTPTS[a1];[a0][a1]amix=inputs=2:duration=longest[out];[micmeter]asetnsamples=n=19200,astats=metadata=1:reset=1,ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:file=${STATE_DIR}/mic-level:direct=1[meter]" \
+            -map "[out]" -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
             -movflags frag_keyframe+empty_moov \
             "$OUTPUT_FILE" \
+            -map "[meter]" -f null /dev/null \
             > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
         FFMPEG_PID=$!
@@ -1320,8 +1324,8 @@ stop_recording() {
         rm -f "$MONITOR_PID_FILE"
     fi
 
-    # 清理 tap 电平文件（tap 进程随 ffmpeg 退出收 EPIPE 自行退出，无需 kill）
-    rm -f "$STATE_DIR/tap-level" "$STATE_DIR/tap-level.tmp"
+    # 清理 tap/mic 电平文件（tap 进程随 ffmpeg 退出收 EPIPE 自行退出，无需 kill）
+    rm -f "$STATE_DIR/tap-level" "$STATE_DIR/tap-level.tmp" "$STATE_DIR/mic-level"
 
     # 恢复原始输出设备
     if [[ -f "$ORIGINAL_NAME_FILE" ]]; then
