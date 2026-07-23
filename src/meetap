@@ -117,7 +117,7 @@ _t() {
     local template="${!key}"
     [[ -z "$template" ]] && template="<missing:${key#MSG_}>"
     # shellcheck disable=SC2059
-    printf "$template\n" "$@"
+    printf -- "$template\n" "$@"   # `--` 防模板以 - 开头（如 "---" 分隔线）被当成选项
 }
 
 # _tn KEY [args...]  →  like _t but without trailing newline (for embedding)
@@ -126,7 +126,7 @@ _tn() {
     local template="${!key}"
     [[ -z "$template" ]] && template="<missing:${key#MSG_}>"
     # shellcheck disable=SC2059
-    printf "$template" "$@"
+    printf -- "$template" "$@"
 }
 
 load_i18n
@@ -1463,10 +1463,68 @@ setup_wemeet() {
     _t SETUP_WEMEET_DONE
 }
 
+# Process Tap 授权检测与引导。
+# macOS 的 TCC 对系统音频捕获有个陷阱：宿主终端 App（如 Ghostty）若未声明
+# NSAudioCaptureUsageDescription，授权框永远不弹、tap 静默输出全零——
+# 用户毫无感知。所以 setup 必须主动做「录 2 秒 + 播提示音 + 验非零」的实测，
+# 全零则引导用户去系统设置手动添加终端 App，再复测确认。
+setup_tap() {
+    local TAP_TOOL="$SCRIPT_DIR/audio-tap"
+
+    if [[ ! -x "$TAP_TOOL" ]] || ! "$TAP_TOOL" tap-supported &>/dev/null; then
+        _t SETUP_TAP_UNSUPPORTED
+        return 0   # 不支持则走 BlackHole，不算 setup 失败
+    fi
+
+    # 静音自测：后台播提示音，tap 录 2 秒，检查是否全零
+    _tap_probe() {
+        local pcm="$STATE_DIR/tap-probe.pcm"
+        ( sleep 0.6 && afplay /System/Library/Sounds/Glass.aiff ) &>/dev/null &
+        "$TAP_TOOL" tap-start --duration 2 > "$pcm" 2>/dev/null
+        # 全零检测：删除所有 0x00 后剩余字节数 >0 即有信号。
+        # 不能用 head -c1|grep .（首个非零字节若是 0x0A 换行会被 grep 误判为空）
+        [[ "$(LC_ALL=C tr -d '\0' < "$pcm" | wc -c)" -gt 0 ]] && return 0
+        return 1
+    }
+
+    _t SETUP_TAP_PROBING
+    if _tap_probe; then
+        _t SETUP_TAP_OK
+        return 0
+    fi
+
+    # 全零 → 引导授权
+    echo ""
+    _t SETUP_TAP_SILENT_HEADER
+    _t SETUP_TAP_SILENT_WHY
+    _t SETUP_TAP_GUIDE_1
+    _t SETUP_TAP_GUIDE_2
+    _t SETUP_TAP_GUIDE_3
+    echo ""
+    # 直接打开系统设置对应面板，减少用户找入口的成本
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture" 2>/dev/null
+    ui_pause "$(_tn SETUP_TAP_PRESS_AFTER_GRANT)"
+
+    # 复测（授权改动可能要求重启终端才生效，复测失败时如实告知）
+    _t SETUP_TAP_PROBING
+    if _tap_probe; then
+        _t SETUP_TAP_OK
+    else
+        _t SETUP_TAP_STILL_SILENT
+        _t SETUP_TAP_FALLBACK_NOTE
+    fi
+    return 0
+}
+
 setup_apps() {
     _t SETUP_HEADER
     _t SETUP_TITLE
     _t SETUP_HEADER
+    echo ""
+
+    _t SETUP_STEP_TAP
+    _t SETUP_DIVIDER
+    setup_tap
     echo ""
 
     _t SETUP_STEP_ZOOM
