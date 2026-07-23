@@ -219,11 +219,19 @@ start_visualizer() {
     local ROWS
     ROWS=$(tput lines 2>/dev/null < "$tty_dev" || echo 24)
 
+    # 电平来源双模式：tap 模式读 audio-tap --level-file 写的电平文件（0.4s 更新）；
+    # BlackHole 模式沿用 ffmpeg 短采样。tap 模式音频不经过 BlackHole，旧方式采不到。
+    local LEVEL_FILE="$STATE_DIR/tap-level"
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
         local max_vol
-        max_vol=$(ffmpeg -nostdin -f avfoundation -i ":BlackHole 2ch" -t 0.4 \
-            -af volumedetect -f null /dev/null 2>&1 \
-            | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
+        if [[ -f "$LEVEL_FILE" ]]; then
+            max_vol=$(cat "$LEVEL_FILE" 2>/dev/null)
+            sleep 0.4
+        else
+            max_vol=$(ffmpeg -nostdin -f avfoundation -i ":BlackHole 2ch" -t 0.4 \
+                -af volumedetect -f null /dev/null 2>&1 \
+                | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
+        fi
         [[ -z "$max_vol" ]] && max_vol="-91"
 
         local vi=${max_vol%%.*}
@@ -1058,7 +1066,8 @@ start_recording() {
         # 绝不能加 < /dev/null（会覆盖管道 → tap 收 EPIPE 秒退 → 录音全空）。
         # 注意2：avfoundation 自带挂钟时间戳而 pipe 从 0 开始，两路直接 amix
         # 会因时间轴永不对齐而输出 0 字节——必须先 asetpts=PTS-STARTPTS 归零。
-        "$TAP_TOOL" tap-start 2>"$STATE_DIR/tap.log" | \
+        rm -f "$STATE_DIR/tap-level"
+        "$TAP_TOOL" tap-start --level-file "$STATE_DIR/tap-level" 2>"$STATE_DIR/tap.log" | \
         ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i pipe:0 \
             -f avfoundation -i ":default" \
             -filter_complex "[0:a]asetpts=PTS-STARTPTS[a0];[1:a]asetpts=PTS-STARTPTS[a1];[a0][a1]amix=inputs=2:duration=longest" \
@@ -1260,6 +1269,9 @@ stop_recording() {
         kill "$MONITOR_PID" 2>/dev/null
         rm -f "$MONITOR_PID_FILE"
     fi
+
+    # 清理 tap 电平文件（tap 进程随 ffmpeg 退出收 EPIPE 自行退出，无需 kill）
+    rm -f "$STATE_DIR/tap-level" "$STATE_DIR/tap-level.tmp"
 
     # 恢复原始输出设备
     if [[ -f "$ORIGINAL_NAME_FILE" ]]; then

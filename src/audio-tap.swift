@@ -60,6 +60,12 @@ func nominalSampleRate(_ id: AudioDeviceID) -> Float64? {
 // 写失败（如 ffmpeg 退出导致 EPIPE）时置位，由主线程负责清理退出
 let writeFailedFlag = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
 
+// 电平表（--level-file）：IO 回调更新峰值，主队列定时器每 0.4s 写 dBFS 到文件
+// 供 meetap 点阵波形读取（tap 模式下音频不经过 BlackHole，无法用旧采样方式）
+let meterLock = NSLock()
+var meterPeak: Float = 0
+var meterTimer: DispatchSourceTimer? = nil
+
 func writeAll(fd: Int32, data: UnsafeRawPointer, count: Int) -> Bool {
     var offset = 0
     while offset < count {
@@ -165,6 +171,14 @@ final class TapCapture {
             guard abl.count > 0, !writeFailedFlag.pointee else { return }
             let buf = abl[0]
             guard let data = buf.mData, buf.mDataByteSize > 0 else { return }
+            // 电平表：记录本窗口峰值（Float32 mono PCM）
+            let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
+            let fp = data.assumingMemoryBound(to: Float.self)
+            var peak: Float = 0
+            for i in 0..<n { let a = abs(fp[i]); if a > peak { peak = a } }
+            meterLock.lock()
+            if peak > meterPeak { meterPeak = peak }
+            meterLock.unlock()
             if !writeAll(fd: 1, data: data, count: Int(buf.mDataByteSize)) {
                 // 下游（ffmpeg）已退出：置位并交给主线程清理，不在实时线程里做重活
                 writeFailedFlag.pointee = true
@@ -249,7 +263,7 @@ func runTapRate() -> Never {
     exit(0)
 }
 
-func runTapStart(duration: Double?) -> Never {
+func runTapStart(duration: Double?, levelFile: String?) -> Never {
     guard #available(macOS 14.4, *) else {
         fputs("Error: Process Tap requires macOS 14.4+\n", stderr)
         exit(1)
@@ -289,6 +303,26 @@ func runTapStart(duration: Double?) -> Never {
         DispatchQueue.main.asyncAfter(deadline: .now() + d) { cleanupAndExit(0) }
     }
 
+    // 电平表：每 0.4s 把窗口峰值转 dBFS 写入 levelFile（原子替换，读方不会读到半行）
+    if let lf = levelFile {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 0.4, repeating: 0.4)
+        timer.setEventHandler {
+            meterLock.lock()
+            let peak = meterPeak
+            meterPeak = 0
+            meterLock.unlock()
+            let db = peak > 0 ? max(-91.0, 20.0 * log10(Double(peak))) : -91.0
+            let line = String(format: "%.1f\n", db)
+            let tmp = lf + ".tmp"
+            try? line.write(toFile: tmp, atomically: false, encoding: .utf8)
+            _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: lf),
+                withItemAt: URL(fileURLWithPath: tmp))
+        }
+        timer.resume()
+        meterTimer = timer
+    }
+
     dispatchMain()
 }
 
@@ -302,8 +336,10 @@ guard let cmd = args.first else {
     Commands:
       tap-supported             检测 Process Tap 是否可用（yes / 原因）
       tap-rate                  打印默认输出设备采样率（Hz）
-      tap-start [--duration N]  捕获系统音频，Float32 LE mono PCM 写 stdout
-                                （SIGINT/SIGTERM 停止并清理）
+      tap-start [--duration N] [--level-file PATH]
+                                捕获系统音频，Float32 LE mono PCM 写 stdout
+                                --level-file: 每 0.4s 写当前电平(dBFS)到文件，
+                                供波形显示读取（SIGINT/SIGTERM 停止并清理）
 
     """, stderr)
     exit(1)
@@ -316,17 +352,21 @@ case "tap-rate":
     runTapRate()
 case "tap-start":
     var duration: Double? = nil
+    var levelFile: String? = nil
     var i = 1
     while i < args.count {
         if args[i] == "--duration", i + 1 < args.count, let d = Double(args[i + 1]), d > 0 {
             duration = d
             i += 2
+        } else if args[i] == "--level-file", i + 1 < args.count {
+            levelFile = args[i + 1]
+            i += 2
         } else {
-            fputs("Usage: tap-start [--duration N]\n", stderr)
+            fputs("Usage: tap-start [--duration N] [--level-file PATH]\n", stderr)
             exit(1)
         }
     }
-    runTapStart(duration: duration)
+    runTapStart(duration: duration, levelFile: levelFile)
 default:
     fputs("Unknown command: \(cmd)\n", stderr)
     exit(1)
