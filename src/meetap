@@ -1102,6 +1102,17 @@ start_recording() {
             _t FIELD_AUTOSTOP "$_grace_display"
             _t FIELD_STOP_CMD "$0"
             echo ""
+
+            # 点阵波形 + 状态栏（与 BlackHole 分支一致；电平来自 tap-level 文件）
+            local TTY_DEV
+            TTY_DEV=$(tty 2>/dev/null)
+            if [[ -n "$TTY_DEV" && "$TTY_DEV" != "not a tty" ]]; then
+                sleep 0.1
+                setup_statusbar "$TTY_DEV"
+                start_visualizer "$TTY_DEV" &
+                echo $! > "$VISUALIZER_PID_FILE"
+                disown $!
+            fi
         else
             _t ERR_FFMPEG_FAIL
             cat "$STATE_DIR/ffmpeg.log"
