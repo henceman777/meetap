@@ -283,9 +283,21 @@ stop_visualizer() {
 
 is_audio_silent() {
     local mean_vol
-    mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t 5 \
-        -af volumedetect -f null /dev/null 2>&1 \
-        | sed -n 's/.*mean_volume: \([-0-9.]*\).*/\1/p')
+    # tap 模式：读 audio-tap 电平文件（0.4s 窗口峰值 dBFS），采样 5 次取最大值
+    # 近似 5 秒窗口；BlackHole 模式：沿用 ffmpeg 采样（与波形 start_visualizer 同策略）
+    if [[ -f "$STATE_DIR/tap-level" ]]; then
+        local max="-91" v
+        for _ in 1 2 3 4 5; do
+            v=$(cat "$STATE_DIR/tap-level" 2>/dev/null)
+            [[ -n "$v" ]] && (( $(printf '%.0f' "$v") > $(printf '%.0f' "$max") )) && max="$v"
+            sleep 1
+        done
+        mean_vol="$max"
+    else
+        mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t 5 \
+            -af volumedetect -f null /dev/null 2>&1 \
+            | sed -n 's/.*mean_volume: \([-0-9.]*\).*/\1/p')
+    fi
     if [[ -z "$mean_vol" ]]; then
         return 1
     fi
