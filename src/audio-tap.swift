@@ -60,11 +60,122 @@ func nominalSampleRate(_ id: AudioDeviceID) -> Float64? {
 // 写失败（如 ffmpeg 退出导致 EPIPE）时置位，由主线程负责清理退出
 let writeFailedFlag = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
 
-// 电平表（--level-file）：IO 回调更新峰值，主队列定时器每 0.4s 写 dBFS 到文件
-// 供 meetap 点阵波形读取（tap 模式下音频不经过 BlackHole，无法用旧采样方式）
+// 电平表（--level-file / --mic-level-file）：IO 回调更新峰值，
+// 主队列定时器每 0.4s 写 dBFS 到文件，供 meetap 点阵波形/静音检测读取
 let meterLock = NSLock()
-var meterPeak: Float = 0
+var meterPeak: Float = 0        // 系统音峰值
+var micMeterPeak: Float = 0     // 麦克风峰值
 var meterTimer: DispatchSourceTimer? = nil
+
+// MARK: - 麦克风采集与混音（--with-mic，借鉴 meetily ring-buffer 混音架构）
+// meetily 经验（core_audio.rs / pipeline.rs, MIT）：绝不让外部进程（ffmpeg
+// avfoundation）碰音频设备——tap 采系统音、进程内采麦克风、ring buffer 混音、
+// 单路 PCM 输出。彻底消灭设备抢占/枚举竞态一类问题。
+
+// 麦克风环形缓冲：mic IO 回调写入，tap IO 回调按需读出（tap 作主时钟）
+final class MicRing {
+    private var buf: [Float]
+    private var readIdx = 0, writeIdx = 0, count = 0
+    private let lock = NSLock()
+    init(capacity: Int) { buf = [Float](repeating: 0, count: capacity) }
+    func write(_ data: UnsafePointer<Float>, _ n: Int, stride: Int) {
+        lock.lock(); defer { lock.unlock() }
+        var i = 0
+        while i < n {
+            buf[writeIdx] = data[i]
+            writeIdx = (writeIdx + 1) % buf.count
+            if count < buf.count { count += 1 } else { readIdx = (readIdx + 1) % buf.count }
+            i += stride
+        }
+    }
+    func read(into out: inout [Float], _ n: Int) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let take = min(n, count)
+        for i in 0..<take {
+            out[i] = buf[readIdx]
+            readIdx = (readIdx + 1) % buf.count
+        }
+        count -= take
+        return take
+    }
+}
+
+func defaultInputDevice() -> AudioDeviceID? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var id: AudioDeviceID = 0
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id) == noErr,
+        id != kAudioObjectUnknown else { return nil }
+    return id
+}
+
+// 麦克风采集：默认输入设备上挂 IO proc，Float32 首声道写 ring buffer
+final class MicCapture {
+    private var deviceID = AudioObjectID(kAudioObjectUnknown)
+    private var procID: AudioDeviceIOProcID?
+    private var running = false
+    private let ioQueue = DispatchQueue(label: "meetap.audio-tap.mic")
+    let ring = MicRing(capacity: 96000)  // 2s @48k
+    private(set) var sampleRate: Float64 = 0
+
+    func start() throws {
+        guard let dev = defaultInputDevice() else {
+            throw TapError("cannot get default input device")
+        }
+        deviceID = dev
+        sampleRate = nominalSampleRate(dev) ?? 0
+
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        _ = AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &asbd)
+        // 交错多声道时按 stride 取首声道；CoreAudio 输入默认 Float32
+        let channels = max(1, Int(asbd.mChannelsPerFrame))
+
+        var pid: AudioDeviceIOProcID?
+        let st = AudioDeviceCreateIOProcIDWithBlock(&pid, dev, ioQueue) {
+            [ring] _, inInputData, _, _, _ in
+            let abl = UnsafeMutableAudioBufferListPointer(
+                UnsafeMutablePointer(mutating: inInputData))
+            guard abl.count > 0 else { return }
+            let buf = abl[0]
+            guard let data = buf.mData, buf.mDataByteSize > 0 else { return }
+            let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
+            let fp = data.assumingMemoryBound(to: Float.self)
+            let stride = max(1, Int(buf.mNumberChannels > 0 ? buf.mNumberChannels : UInt32(channels)))
+            ring.write(fp, n, stride: stride)
+            var peak: Float = 0
+            var i = 0
+            while i < n { let a = abs(fp[i]); if a > peak { peak = a }; i += stride }
+            meterLock.lock()
+            if peak > micMeterPeak { micMeterPeak = peak }
+            meterLock.unlock()
+        }
+        guard st == noErr, let createdPid = pid else {
+            throw TapError("mic AudioDeviceCreateIOProcIDWithBlock failed (status \(st))")
+        }
+        procID = createdPid
+        let st2 = AudioDeviceStart(dev, createdPid)
+        guard st2 == noErr else {
+            AudioDeviceDestroyIOProcID(dev, createdPid)
+            procID = nil
+            throw TapError("mic AudioDeviceStart failed (status \(st2))")
+        }
+        running = true
+    }
+
+    func cleanup() {
+        if running, let p = procID { AudioDeviceStop(deviceID, p); running = false }
+        if let p = procID { AudioDeviceDestroyIOProcID(deviceID, p); procID = nil }
+    }
+}
 
 func writeAll(fd: Int32, data: UnsafeRawPointer, count: Int) -> Bool {
     var offset = 0
@@ -90,6 +201,7 @@ final class TapCapture {
     private var procID: AudioDeviceIOProcID?
     private var running = false
     private let ioQueue = DispatchQueue(label: "meetap.audio-tap.io")
+    var micRing: MicRing? = nil  // --with-mic 时由 main 注入；tap 回调里混音
 
     private(set) var sampleRate: Float64 = 0
     private(set) var channels: UInt32 = 1
@@ -164,6 +276,7 @@ final class TapCapture {
         // 4. IO proc：从回调拿 PCM，直接写 stdout。
         //    mono tap → 单 buffer Float32；管道写通常远快于实时音频速率，不会阻塞回调。
         var pid: AudioDeviceIOProcID?
+        let ring = micRing
         st = AudioDeviceCreateIOProcIDWithBlock(&pid, aggregateID, ioQueue) {
             _, inInputData, _, _, _ in
             let abl = UnsafeMutableAudioBufferListPointer(
@@ -171,14 +284,28 @@ final class TapCapture {
             guard abl.count > 0, !writeFailedFlag.pointee else { return }
             let buf = abl[0]
             guard let data = buf.mData, buf.mDataByteSize > 0 else { return }
-            // 电平表：记录本窗口峰值（Float32 mono PCM）
             let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
             let fp = data.assumingMemoryBound(to: Float.self)
+            // 电平表：记录本窗口系统音峰值
             var peak: Float = 0
             for i in 0..<n { let a = abs(fp[i]); if a > peak { peak = a } }
             meterLock.lock()
             if peak > meterPeak { meterPeak = peak }
             meterLock.unlock()
+
+            // --with-mic：tap 作主时钟，从 ring 取等量麦克风样本叠加（进程内混音，
+            // 借鉴 meetily pipeline；简单相加 + 削顶防爆音）
+            if let ring = ring {
+                var mic = [Float](repeating: 0, count: n)
+                let got = ring.read(into: &mic, n)
+                if got > 0 {
+                    for i in 0..<got {
+                        let mixed = fp[i] + mic[i]
+                        fp[i] = max(-1.0, min(1.0, mixed))
+                    }
+                }
+            }
+
             if !writeAll(fd: 1, data: data, count: Int(buf.mDataByteSize)) {
                 // 下游（ffmpeg）已退出：置位并交给主线程清理，不在实时线程里做重活
                 writeFailedFlag.pointee = true
@@ -228,6 +355,7 @@ func cleanupAndExit(_ code: Int32) -> Never {
     if #available(macOS 14.4, *) {
         (activeCapture as? TapCapture)?.cleanup()
     }
+    activeMic?.cleanup()
     exit(code)
 }
 
@@ -263,7 +391,9 @@ func runTapRate() -> Never {
     exit(0)
 }
 
-func runTapStart(duration: Double?, levelFile: String?) -> Never {
+var activeMic: MicCapture? = nil
+
+func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, withMic: Bool) -> Never {
     guard #available(macOS 14.4, *) else {
         fputs("Error: Process Tap requires macOS 14.4+\n", stderr)
         exit(1)
@@ -274,6 +404,20 @@ func runTapStart(duration: Double?, levelFile: String?) -> Never {
 
     let capture = TapCapture()
     activeCapture = capture
+
+    // 麦克风先启动（失败不致命——静默降级为纯系统音，会议不能不录）
+    if withMic {
+        let mic = MicCapture()
+        do {
+            try mic.start()
+            activeMic = mic
+            capture.micRing = mic.ring
+            fputs("MIC=on rate=\(Int(mic.sampleRate))\n", stderr)
+        } catch {
+            fputs("MIC=off (\(error))\n", stderr)
+        }
+    }
+
     do {
         try capture.start()
     } catch let err as TapError {
@@ -303,21 +447,25 @@ func runTapStart(duration: Double?, levelFile: String?) -> Never {
         DispatchQueue.main.asyncAfter(deadline: .now() + d) { cleanupAndExit(0) }
     }
 
-    // 电平表：每 0.4s 把窗口峰值转 dBFS 写入 levelFile（原子替换，读方不会读到半行）
-    if let lf = levelFile {
+    // 电平表：每 0.4s 把窗口峰值转 dBFS 写入文件（原子替换，读方不会读到半行）
+    if levelFile != nil || micLevelFile != nil {
+        func writeLevel(_ path: String, _ peak: Float) {
+            let db = peak > 0 ? max(-91.0, 20.0 * log10(Double(peak))) : -91.0
+            let line = String(format: "%.1f\n", db)
+            let tmp = path + ".tmp"
+            try? line.write(toFile: tmp, atomically: false, encoding: .utf8)
+            _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: path),
+                withItemAt: URL(fileURLWithPath: tmp))
+        }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 0.4, repeating: 0.4)
         timer.setEventHandler {
             meterLock.lock()
-            let peak = meterPeak
-            meterPeak = 0
+            let sysPeak = meterPeak; meterPeak = 0
+            let micPeak = micMeterPeak; micMeterPeak = 0
             meterLock.unlock()
-            let db = peak > 0 ? max(-91.0, 20.0 * log10(Double(peak))) : -91.0
-            let line = String(format: "%.1f\n", db)
-            let tmp = lf + ".tmp"
-            try? line.write(toFile: tmp, atomically: false, encoding: .utf8)
-            _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: lf),
-                withItemAt: URL(fileURLWithPath: tmp))
+            if let lf = levelFile { writeLevel(lf, sysPeak) }
+            if let mlf = micLevelFile { writeLevel(mlf, micPeak) }
         }
         timer.resume()
         meterTimer = timer
@@ -353,6 +501,8 @@ case "tap-rate":
 case "tap-start":
     var duration: Double? = nil
     var levelFile: String? = nil
+    var micLevelFile: String? = nil
+    var withMic = false
     var i = 1
     while i < args.count {
         if args[i] == "--duration", i + 1 < args.count, let d = Double(args[i + 1]), d > 0 {
@@ -361,12 +511,18 @@ case "tap-start":
         } else if args[i] == "--level-file", i + 1 < args.count {
             levelFile = args[i + 1]
             i += 2
+        } else if args[i] == "--mic-level-file", i + 1 < args.count {
+            micLevelFile = args[i + 1]
+            i += 2
+        } else if args[i] == "--with-mic" {
+            withMic = true
+            i += 1
         } else {
-            fputs("Usage: tap-start [--duration N] [--level-file PATH]\n", stderr)
+            fputs("Usage: tap-start [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH]\n", stderr)
             exit(1)
         }
     }
-    runTapStart(duration: duration, levelFile: levelFile)
+    runTapStart(duration: duration, levelFile: levelFile, micLevelFile: micLevelFile, withMic: withMic)
 default:
     fputs("Unknown command: \(cmd)\n", stderr)
     exit(1)

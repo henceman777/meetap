@@ -238,9 +238,8 @@ start_visualizer() {
         if [[ -f "$TAP_PID_FILE" ]]; then
             local sys_vol mic_vol
             sys_vol=$(cat "$LEVEL_FILE" 2>/dev/null)
-            # mic-level 是 ametadata 追加格式，取最后一行 Peak_level 值
-            mic_vol=$(tail -2 "$MIC_LEVEL_FILE" 2>/dev/null \
-                | sed -n 's/.*Peak_level=\(-\{0,1\}[0-9.]*\).*/\1/p' | tail -1)
+            # 两个电平文件均由 audio-tap 写（单行 dBFS，0.4s 原子替换）
+            mic_vol=$(cat "$MIC_LEVEL_FILE" 2>/dev/null)
             sleep 0.4
             max_vol="${sys_vol:--91}"
             if [[ -n "$mic_vol" && "$mic_vol" != "-inf" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
@@ -317,10 +316,9 @@ is_audio_silent() {
         done
         mean_vol="$max"
 
-        # 麦克风电平读 mic-level 文件（录制 ffmpeg astats 写，勿开新 ffmpeg 抢设备）
+        # 麦克风电平读 mic-level 文件（audio-tap 写，单行 dBFS）
         local mic_vol
-        mic_vol=$(tail -2 "$STATE_DIR/mic-level" 2>/dev/null \
-            | sed -n 's/.*Peak_level=\(-\{0,1\}[0-9.]*\).*/\1/p' | tail -1)
+        mic_vol=$(cat "$STATE_DIR/mic-level" 2>/dev/null)
         if [[ -n "$mic_vol" && "$mic_vol" != "-inf" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
             return 1   # 麦克风检测到人声级别的声音 → 不静音
         fi
@@ -1119,32 +1117,26 @@ start_recording() {
         # stop 时显式杀 tap，不再依赖「ffmpeg 退出 → EPIPE → tap 自杀」链条
         # （该链条在 ffmpeg 卡死时断裂，留下孤儿 tap 占住音频链路，
         # 导致下一次录制 ffmpeg 打不开输入 → 恶性循环）。
+        # meetily 架构：audio-tap 进程内采系统音(tap) + 麦克风(CoreAudio 输入
+        # IO proc)，ring buffer 混音后输出单路 PCM；ffmpeg 只做编码、零设备
+        # 访问——彻底消灭 avfoundation 与 tap 的设备竞态（用户环境必现卡死）。
+        # 电平双文件由 audio-tap 内部输出（tap-level 系统音 / mic-level 麦克风）。
         local TAP_FIFO="$STATE_DIR/tap.fifo"
         rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO"
         mkfifo "$TAP_FIFO"
 
-        "$TAP_TOOL" tap-start --level-file "$STATE_DIR/tap-level" \
+        "$TAP_TOOL" tap-start --with-mic \
+            --level-file "$STATE_DIR/tap-level" \
+            --mic-level-file "$STATE_DIR/mic-level" \
             > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
         TAP_PID=$!
         echo $TAP_PID > "$TAP_PID_FILE"
         disown $TAP_PID
 
-        # 等 tap 完成 aggregate device 创建（以 stderr 输出 SAMPLE_RATE 为标志，
-        # 最多 3s）。ffmpeg 的 avfoundation 若在 CoreAudio 设备表变动期间枚举
-        # 设备，会挂死在打开麦克风输入上——必须等设备表稳定后再启动。
-        for _ in $(seq 1 30); do
-            grep -q "SAMPLE_RATE" "$STATE_DIR/tap.log" 2>/dev/null && break
-            sleep 0.1
-        done
-        sleep 0.5
-
         ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
-            -f avfoundation -i ":default" \
-            -filter_complex "[1:a]asplit=2[micrec][micmeter];[0:a]asetpts=PTS-STARTPTS[a0];[micrec]asetpts=PTS-STARTPTS[a1];[a0][a1]amix=inputs=2:duration=longest[out];[micmeter]asetnsamples=n=19200,astats=metadata=1:reset=1,ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:file=${STATE_DIR}/mic-level:direct=1[meter]" \
-            -map "[out]" -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
+            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
             -movflags frag_keyframe+empty_moov \
             "$OUTPUT_FILE" \
-            -map "[meter]" -f null /dev/null \
             < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
         FFMPEG_PID=$!
@@ -1153,24 +1145,13 @@ start_recording() {
 
         sleep 1
         if kill -0 $FFMPEG_PID 2>/dev/null; then
-            autostop_daemon &
-            AUTOSTOP_PID=$!
-            echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
-            disown $AUTOSTOP_PID
-
+            # tap 模式不启用静音自停：混音后单路 PCM 无法区分系统音/麦克风，
+            # 麦克风持续收到环境音会让"静音"永不成立（用户决策：显式 stop）
             echo ""
             _t RECORDING_STARTED
             $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
             _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
-            local _grace_display
-            if (( CFG_SILENCE_GRACE >= 3600 )); then
-                _grace_display="$((CFG_SILENCE_GRACE / 3600)) 小时"
-            elif (( CFG_SILENCE_GRACE >= 60 )); then
-                _grace_display="$((CFG_SILENCE_GRACE / 60)) 分钟"
-            else
-                _grace_display="${CFG_SILENCE_GRACE} 秒"
-            fi
-            _t FIELD_AUTOSTOP "$_grace_display"
+            _t FIELD_STOP_MANUAL
             _t FIELD_STOP_CMD "$0"
             echo ""
 
