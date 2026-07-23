@@ -82,7 +82,7 @@ MSG_FIELD_PLAYBACK="   Playback: %s"
 MSG_FIELD_AUTOSTOP="   Auto-stop: after %s of silence"
 MSG_FIELD_STOP_MANUAL="   Auto-stop: disabled (Process Tap mode; stop explicitly)"
 MSG_FIELD_STOP_CMD="   Stop recording: %s stop"
-MSG_FIELD_SILENCE_AUTOSTOP="   Recording auto-stops after %s of silence (config: silence_grace)"
+MSG_FIELD_SILENCE_AUTOSTOP="   Recording auto-stops after %s of silence"
 MSG_ERR_FFMPEG_FAIL="❌ Failed to start ffmpeg:"
 
 # ── Recording stop ──

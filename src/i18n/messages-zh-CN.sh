@@ -83,7 +83,7 @@ MSG_FIELD_PLAYBACK="   播放: %s"
 MSG_FIELD_AUTOSTOP="   自动停止: 持续静音 %s 后"
 MSG_FIELD_STOP_MANUAL="   自动停止: 已关闭（Process Tap 模式，请显式停止）"
 MSG_FIELD_STOP_CMD="   停止录制: %s stop"
-MSG_FIELD_SILENCE_AUTOSTOP="   静默超 %s 则会议录制自动结束（config: silence_grace）"
+MSG_FIELD_SILENCE_AUTOSTOP="   静默超 %s 则会议录制自动结束"
 MSG_ERR_FFMPEG_FAIL="❌ ffmpeg 启动失败:"
 
 # ── 录制停止 ──
