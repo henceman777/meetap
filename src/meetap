@@ -19,6 +19,7 @@ CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
 CFG_VISUALIZER="dot"
 CFG_AUDIO_PERSIST=true
+CFG_AUDIO_CAPTURE="auto"
 CFG_EMAIL=""
 CFG_EMAIL_SENDER=""
 
@@ -80,6 +81,7 @@ load_config() {
             ai_backend)            CFG_AI_BACKEND="$val" ;;
             visualizer)            CFG_VISUALIZER="$val" ;;
             audio_persist)         CFG_AUDIO_PERSIST="$val" ;;
+            audio_capture)         CFG_AUDIO_CAPTURE="$val" ;;
             email)                 CFG_EMAIL="$val" ;;
             email_sender)          CFG_EMAIL_SENDER="$val" ;;
         esac
@@ -1019,6 +1021,69 @@ start_recording() {
         exit 1
     fi
 
+    # --- 音频捕获方式选择 ---
+    local TAP_TOOL="$SCRIPT_DIR/audio-tap"
+    local use_tap=false
+    if [[ "$CFG_AUDIO_CAPTURE" == "tap" ]] || [[ "$CFG_AUDIO_CAPTURE" == "auto" ]]; then
+        if [[ -x "$TAP_TOOL" ]] && "$TAP_TOOL" tap-supported &>/dev/null; then
+            use_tap=true
+        fi
+    fi
+
+    if [[ "$use_tap" == "true" ]]; then
+        # --- Process Tap 分支 ---
+        # 不切设备、不需要 BlackHole/audio-monitor,用户听到原声
+        local TAP_RATE
+        TAP_RATE=$("$TAP_TOOL" tap-rate 2>/dev/null || echo 48000)
+
+        ORIG_NAME=$("$TOOL" default-output-name 2>/dev/null || echo "Unknown")
+        MIC_NAME=$("$TOOL" default-input-name 2>/dev/null || echo "default")
+
+        # audio-tap tap-start 输出 Float32 LE mono PCM 到 stdout
+        # ffmpeg 从 stdin 读系统音 + avfoundation 读麦克风,混录输出
+        "$TAP_TOOL" tap-start 2>"$STATE_DIR/tap.log" | \
+        ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i pipe:0 \
+            -f avfoundation -i ":default" \
+            -filter_complex amix=inputs=2:duration=longest \
+            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
+            -movflags frag_keyframe+empty_moov \
+            "$OUTPUT_FILE" \
+            < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
+
+        FFMPEG_PID=$!
+        echo $FFMPEG_PID > "$PID_FILE"
+        disown $FFMPEG_PID
+
+        sleep 1
+        if kill -0 $FFMPEG_PID 2>/dev/null; then
+            autostop_daemon &
+            AUTOSTOP_PID=$!
+            echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
+            disown $AUTOSTOP_PID
+
+            echo ""
+            _t RECORDING_STARTED
+            $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
+            _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
+            local _grace_display
+            if (( CFG_SILENCE_GRACE >= 3600 )); then
+                _grace_display="$((CFG_SILENCE_GRACE / 3600)) 小时"
+            elif (( CFG_SILENCE_GRACE >= 60 )); then
+                _grace_display="$((CFG_SILENCE_GRACE / 60)) 分钟"
+            else
+                _grace_display="${CFG_SILENCE_GRACE} 秒"
+            fi
+            _t FIELD_AUTOSTOP "$_grace_display"
+            _t FIELD_STOP_CMD "$0"
+            echo ""
+        else
+            _t ERR_FFMPEG_FAIL
+            cat "$STATE_DIR/ffmpeg.log"
+            exit 1
+        fi
+    else
+
+    # --- BlackHole 分支(原有逻辑,一字不动) ---
     # 检查 BlackHole
     BH_UID=$("$TOOL" blackhole-uid 2>/dev/null)
     if [[ -z "$BH_UID" ]]; then
@@ -1147,6 +1212,8 @@ start_recording() {
         rm -f "$PID_FILE" "$MONITOR_PID_FILE" "$OUTPUT_FILE_MARKER"
         exit 1
     fi
+
+    fi  # 闭合 if use_tap / else (BlackHole 分支结束)
 }
 
 stop_recording() {

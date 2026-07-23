@@ -26,6 +26,9 @@ recording_dir = ~/Record
 audio_bitrate = 128k
 # Keep local audio file after S3 upload (true=keep, false=delete after upload)
 audio_persist = true
+# Audio capture method: auto | tap | blackhole
+# auto = use Process Tap if supported (macOS 14.4+), else BlackHole
+audio_capture = auto
 
 # ── Auto-stop ────────────────────────────────────────────────
 # Silence detection threshold (dB)
