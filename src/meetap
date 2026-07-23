@@ -164,6 +164,7 @@ mkdir -p "$RECORDING_DIR" "$STATE_DIR"
 # 状态文件
 PID_FILE="$STATE_DIR/ffmpeg.pid"
 MONITOR_PID_FILE="$STATE_DIR/monitor.pid"
+TAP_PID_FILE="$STATE_DIR/tap.pid"
 ORIGINAL_UID_FILE="$STATE_DIR/original-output.uid"
 ORIGINAL_NAME_FILE="$STATE_DIR/original-output.name"
 OUTPUT_FILE_MARKER="$STATE_DIR/output-file"
@@ -1051,8 +1052,11 @@ start_recording() {
         _t HINT_STOP_FIRST "$0"
         exit 1
     fi
-    # 清理残留状态
-    rm -f "$PID_FILE" "$MONITOR_PID_FILE"
+    # 清理残留状态。关键：上次异常停止可能留下孤儿 audio-tap（stop 只杀
+    # ffmpeg；tap 依赖 EPIPE 自杀，但 IO 回调停摆时永不触发）。孤儿会占住
+    # 音频链路，让新 ffmpeg 打不开麦克风输入 → 卡死 → 录音全丢，必须先清扫。
+    pkill -f "audio-tap tap-start" 2>/dev/null && sleep 0.5
+    rm -f "$PID_FILE" "$MONITOR_PID_FILE" "$TAP_PID_FILE"
 
     # 检查依赖
     if [[ ! -x "$TOOL" ]]; then
@@ -1108,16 +1112,28 @@ start_recording() {
         # 注意3：麦克风电平由本 ffmpeg 的 astats 滤镜写 mic-level 文件——
         # 绝不能开第二个 ffmpeg 并发采样 :default（输入设备被抢占会导致
         # 录制输入卡死、SIGINT 失效、录音全丢）。波形/静音检测只读该文件。
-        rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level"
-        "$TAP_TOOL" tap-start --level-file "$STATE_DIR/tap-level" 2>"$STATE_DIR/tap.log" | \
-        ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i pipe:0 \
+        # 用 FIFO 替代匿名管道：tap 与 ffmpeg 分开启动，两个 PID 都记录在案。
+        # stop 时显式杀 tap，不再依赖「ffmpeg 退出 → EPIPE → tap 自杀」链条
+        # （该链条在 ffmpeg 卡死时断裂，留下孤儿 tap 占住音频链路，
+        # 导致下一次录制 ffmpeg 打不开输入 → 恶性循环）。
+        local TAP_FIFO="$STATE_DIR/tap.fifo"
+        rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO"
+        mkfifo "$TAP_FIFO"
+
+        "$TAP_TOOL" tap-start --level-file "$STATE_DIR/tap-level" \
+            > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
+        TAP_PID=$!
+        echo $TAP_PID > "$TAP_PID_FILE"
+        disown $TAP_PID
+
+        ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
             -f avfoundation -i ":default" \
             -filter_complex "[1:a]asplit=2[micrec][micmeter];[0:a]asetpts=PTS-STARTPTS[a0];[micrec]asetpts=PTS-STARTPTS[a1];[a0][a1]amix=inputs=2:duration=longest[out];[micmeter]asetnsamples=n=19200,astats=metadata=1:reset=1,ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:file=${STATE_DIR}/mic-level:direct=1[meter]" \
             -map "[out]" -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
             -movflags frag_keyframe+empty_moov \
             "$OUTPUT_FILE" \
             -map "[meter]" -f null /dev/null \
-            > "$STATE_DIR/ffmpeg.log" 2>&1 &
+            < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
         FFMPEG_PID=$!
         echo $FFMPEG_PID > "$PID_FILE"
@@ -1324,8 +1340,19 @@ stop_recording() {
         rm -f "$MONITOR_PID_FILE"
     fi
 
-    # 清理 tap/mic 电平文件（tap 进程随 ffmpeg 退出收 EPIPE 自行退出，无需 kill）
-    rm -f "$STATE_DIR/tap-level" "$STATE_DIR/tap-level.tmp" "$STATE_DIR/mic-level"
+    # 显式停止 audio-tap（不再依赖 EPIPE 自杀——ffmpeg 卡死时该链条会断）
+    if [[ -f "$TAP_PID_FILE" ]]; then
+        TAP_PID=$(cat "$TAP_PID_FILE")
+        kill "$TAP_PID" 2>/dev/null
+        sleep 0.5
+        kill -9 "$TAP_PID" 2>/dev/null
+        rm -f "$TAP_PID_FILE"
+    fi
+    # 兜底清扫任何孤儿 tap（异常路径可能没写 PID 文件）
+    pkill -f "audio-tap tap-start" 2>/dev/null
+
+    # 清理 tap/mic 电平文件与 FIFO
+    rm -f "$STATE_DIR/tap-level" "$STATE_DIR/tap-level.tmp" "$STATE_DIR/mic-level" "$STATE_DIR/tap.fifo"
 
     # 恢复原始输出设备
     if [[ -f "$ORIGINAL_NAME_FILE" ]]; then
