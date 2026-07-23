@@ -13,9 +13,15 @@ $(BUILD)/audio-monitor: src/audio-monitor.swift
 	mkdir -p $(BUILD)
 	swiftc -O -framework CoreAudio -framework AudioToolbox $< -o $@
 
-$(BUILD)/audio-tap: src/audio-tap.swift
+# audio-tap 必须嵌入 Info.plist（NSAudioCaptureUsageDescription），
+# 否则 TCC 不弹授权框、静默拒绝，Process Tap 输出全零静音。
+$(BUILD)/audio-tap: src/audio-tap.swift src/audio-tap-Info.plist
 	mkdir -p $(BUILD)
-	swiftc -O -framework CoreAudio -framework AudioToolbox $< -o $@
+	swiftc -O -framework CoreAudio -framework AudioToolbox \
+		-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+		-Xlinker src/audio-tap-Info.plist \
+		$< -o $@
+	codesign --force --sign - $@
 
 install: all
 	mkdir -p $(PREFIX)
