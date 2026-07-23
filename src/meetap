@@ -1129,6 +1129,15 @@ start_recording() {
         echo $TAP_PID > "$TAP_PID_FILE"
         disown $TAP_PID
 
+        # 等 tap 完成 aggregate device 创建（以 stderr 输出 SAMPLE_RATE 为标志，
+        # 最多 3s）。ffmpeg 的 avfoundation 若在 CoreAudio 设备表变动期间枚举
+        # 设备，会挂死在打开麦克风输入上——必须等设备表稳定后再启动。
+        for _ in $(seq 1 30); do
+            grep -q "SAMPLE_RATE" "$STATE_DIR/tap.log" 2>/dev/null && break
+            sleep 0.1
+        done
+        sleep 0.5
+
         ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
             -f avfoundation -i ":default" \
             -filter_complex "[1:a]asplit=2[micrec][micmeter];[0:a]asetpts=PTS-STARTPTS[a0];[micrec]asetpts=PTS-STARTPTS[a1];[a0][a1]amix=inputs=2:duration=longest[out];[micmeter]asetnsamples=n=19200,astats=metadata=1:reset=1,ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:file=${STATE_DIR}/mic-level:direct=1[meter]" \
