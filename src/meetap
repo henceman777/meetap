@@ -603,6 +603,40 @@ build_prompt() {
     local speaker_stats=""
     [[ -f "$SPEAKER_STATS" ]] && speaker_stats=$(cat "$SPEAKER_STATS")
 
+    # 额外要求（可选）：meetap redo 时用户给出的补充指示（extra-requirements.md）
+    local extra_requirements=""
+    [[ -f "$SESSION_DIR/extra-requirements.md" ]] && \
+        extra_requirements=$(cat "$SESSION_DIR/extra-requirements.md")
+
+    # 外部会议资料（可选）：<session>/materials/ 下的文档转为纯文本注入
+    # prompt，辅助 LLM 修正人名/术语、补全背景。支持 md/txt/pdf/docx/html；
+    # 单文件截断 30k、总量截断 60k（transcript 120k 之外的预算）。
+    local materials_context=""
+    local materials_dir="$SESSION_DIR/materials"
+    if [[ -d "$materials_dir" ]]; then
+        local mfile mtext mname total=0
+        while IFS= read -r mfile; do
+            mtext=""
+            mname=$(basename "$mfile")
+            case "${mfile##*.}" in
+                md|txt|markdown) mtext=$(cat "$mfile" 2>/dev/null) ;;
+                pdf)  command -v pdftotext &>/dev/null && mtext=$(pdftotext "$mfile" - 2>/dev/null) ;;
+                docx|doc|rtf|html|htm) mtext=$(textutil -convert txt -stdout "$mfile" 2>/dev/null) ;;
+            esac
+            [[ -z "$mtext" ]] && continue
+            [[ ${#mtext} -gt 30000 ]] && mtext="${mtext:0:30000}
+[... 该资料过长，已截断 ...]"
+            materials_context="${materials_context}
+### 资料: ${mname}
+
+${mtext}
+"
+            total=${#materials_context}
+            (( total > 60000 )) && { materials_context="${materials_context}
+[... 资料总量过大，其余文件未纳入 ...]"; break; }
+        done < <(find "$materials_dir" -maxdepth 1 -type f ! -name ".*" | sort)
+    fi
+
     # 三级模板查找：会话级 > 用户级 > 默认级（复用 SCRIPT_DIR 的多路径查找）
     # 前两条是 override（用户可编辑的覆盖模板），其余是 default（随工具分发）。
     # 校验失败时按来源决定「警告回退」还是「硬错误」。
@@ -652,13 +686,15 @@ build_prompt() {
         return 1
     fi
 
-    # 变量注入：只替换白名单三个占位符，值来自环境变量，作为纯字面量替换。
+    # 变量注入：只替换白名单占位符，值来自环境变量，作为纯字面量替换。
     # 用 perl 而非 eval/envsubst——perl 把值当普通字符串写回，
     # transcript 里的 $(...)、反引号、${foo} 等 shell 元字符不会被执行或二次替换。
-    # 单次遍历同时替换三者，注入值不会被后续 pass 再次匹配（保持与旧 heredoc 一致的语义）。
+    # 单次遍历同时替换，注入值不会被后续 pass 再次匹配（保持与旧 heredoc 一致的语义）。
+    # materials_context 是可选占位符：模板里有就替换（可能为空），没有也不报错。
     SESSION_DATE="$SESSION_DATE" speaker_stats="$speaker_stats" transcript="$transcript" \
+    materials_context="$materials_context" extra_requirements="$extra_requirements" \
     perl -pe '
-        s/\$\{(SESSION_DATE|speaker_stats|transcript)\}/$ENV{$1}/g;
+        s/\$\{(SESSION_DATE|speaker_stats|transcript|materials_context|extra_requirements)\}/$ENV{$1}/g;
     ' "$template"
 }
 
@@ -1040,6 +1076,69 @@ summarize_transcript() {
     fi
 }
 
+# meetap again [会议目录名] —— 对已有会议重新执行生成任务。
+# 应对三类场景：1) materials/ 新增了资料要重新生成纪要；2) 上次转录或
+# 纪要生成失败要重跑；3) 有新要求（编辑 <session>/extra-requirements.md
+# 或 prompt.md 后重跑）。
+# 断点续跑：有 transcript → 只重新生成纪要；无 transcript 但有音频 →
+# 从转录开始重跑全链路。旧纪要归档到 archive/ 加时间戳，不覆盖丢失。
+again_session() {
+    local target="${1:-}"
+    local SESSION_DIR
+
+    if [[ -n "$target" ]]; then
+        # 支持绝对路径或目录名
+        if [[ -d "$target" ]]; then
+            SESSION_DIR="$(cd "$target" && pwd)"
+        elif [[ -d "$RECORDING_DIR/$target" ]]; then
+            SESSION_DIR="$RECORDING_DIR/$target"
+        else
+            _t ERR_AGAIN_SESSION_NOT_FOUND "$target" "$RECORDING_DIR"
+            exit 1
+        fi
+    else
+        # 默认：最近一次会议（按目录名排序，命名以时间戳开头天然有序）
+        SESSION_DIR=$(find "$RECORDING_DIR" -maxdepth 1 -type d -name "20*" | sort | tail -1)
+        if [[ -z "$SESSION_DIR" ]]; then
+            _t ERR_AGAIN_NO_SESSIONS "$RECORDING_DIR"
+            exit 1
+        fi
+    fi
+
+    local LOG_DIR="$SESSION_DIR/log"
+    local TRANSCRIPT="$LOG_DIR/transcript.txt"
+    _t AGAIN_TARGET "$(basename "$SESSION_DIR")"
+
+    # 归档旧纪要（md/html），避免重跑覆盖丢失历史版本
+    local old note archive_dir="$SESSION_DIR/archive"
+    for old in "$SESSION_DIR"/*.md "$SESSION_DIR"/*.html; do
+        [[ -f "$old" ]] || continue
+        case "$(basename "$old")" in
+            prompt.md|extra-requirements.md) continue ;;
+        esac
+        mkdir -p "$archive_dir"
+        note="$archive_dir/$(date +%H%M%S)_$(basename "$old")"
+        mv "$old" "$note"
+        _t AGAIN_ARCHIVED "$(basename "$old")"
+    done
+
+    if [[ -f "$TRANSCRIPT" ]]; then
+        # 已有转录：只重新生成纪要（吸收新 materials / extra-requirements）
+        _t AGAIN_FROM_NOTES
+        summarize_transcript "$SESSION_DIR"
+    else
+        # 无转录：从音频重跑全链路
+        local AUDIO_FILE
+        AUDIO_FILE=$(find "$SESSION_DIR" -maxdepth 1 -name "*.m4a" | sort | tail -1)
+        if [[ -z "$AUDIO_FILE" ]]; then
+            _t ERR_AGAIN_NO_AUDIO "$SESSION_DIR"
+            exit 1
+        fi
+        _t AGAIN_FROM_TRANSCRIBE "$(basename "$AUDIO_FILE")"
+        transcribe_recording "$AUDIO_FILE" "$SESSION_DIR"
+    fi
+}
+
 start_recording() {
     local VERBOSE=false
     if [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]]; then
@@ -1094,7 +1193,9 @@ start_recording() {
         session_base="${session_base}_$(sanitize_title "$MEETING_NAME")"
     fi
     SESSION_DIR="$RECORDING_DIR/$session_base"
-    mkdir -p "$SESSION_DIR"
+    # materials/: 存放外部会议资料（议程/PPT导出/背景文档等，支持
+    # md/txt/pdf/docx/html），生成纪要时喂给 LLM 辅助 transcript
+    mkdir -p "$SESSION_DIR/materials"
     echo "$SESSION_DIR" > "$STATE_DIR/session-dir"
     TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
     OUTPUT_FILE="$SESSION_DIR/meeting_${TIMESTAMP}.m4a"
@@ -1663,6 +1764,9 @@ case "${1:-}" in
     status)
         show_status
         ;;
+    again)
+        again_session "${2:-}"
+        ;;
     setup)
         setup_apps
         ;;
@@ -1737,6 +1841,7 @@ case "${1:-}" in
         _t USAGE_START
         _t USAGE_STOP
         _t USAGE_STATUS
+        _t USAGE_AGAIN
         _t USAGE_SETUP
         _t USAGE_CONFIG
         _t USAGE_CONFIG_SHOW

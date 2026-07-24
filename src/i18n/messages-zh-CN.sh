@@ -169,11 +169,21 @@ MSG_CONFIG_OPENING_EDITOR="✏️  正在打开编辑器: %s"
 MSG_CONFIG_NO_TEMPLATE="❌ 未找到默认配置模板，无法初始化"
 
 # ── 用法 ──
+# ── meetap again ──
+MSG_AGAIN_TARGET="🔁 重新执行会议任务: %s"
+MSG_AGAIN_ARCHIVED="   已归档旧文件: %s → archive/"
+MSG_AGAIN_FROM_NOTES="   检测到转录文本，从「纪要生成」阶段重跑（吸收 materials/ 新资料与 extra-requirements.md）"
+MSG_AGAIN_FROM_TRANSCRIBE="   未找到转录文本，从「转录」阶段重跑音频: %s（日志: log/meetap.log）"
+MSG_ERR_AGAIN_SESSION_NOT_FOUND="❌ 找不到会议目录: %s（已在 %s 下查找）"
+MSG_ERR_AGAIN_NO_SESSIONS="❌ %s 下没有任何会议目录"
+MSG_ERR_AGAIN_NO_AUDIO="❌ 会议目录中没有音频文件(.m4a): %s"
+
 MSG_USAGE_HEADER="MeeTap v%s - macOS 会议录制 + 自动转录"
-MSG_USAGE_LINE="用法: meetap {start|stop|status|setup|config|version}"
+MSG_USAGE_LINE="用法: meetap {start|stop|status|again|setup|config|version}"
 MSG_USAGE_START="  start [-t]   开始录制（-t 显示详细设备信息）"
 MSG_USAGE_STOP="  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
 MSG_USAGE_STATUS="  status       查看当前录制状态"
+MSG_USAGE_AGAIN="  again [目录名] 重新生成会议纪要（默认最近一次；先放资料到 materials/ 或写 extra-requirements.md）"
 MSG_USAGE_SETUP="  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
 MSG_USAGE_CONFIG="  config       打开编辑器修改配置（\$EDITOR）"
 MSG_USAGE_CONFIG_SHOW="  config show  显示当前配置"
