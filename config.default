@@ -40,7 +40,7 @@ silence_grace = 120
 # (for in-person meetings where system audio stays silent).
 # Typical speech: -25~-35 (CoreAudio tap meter); room noise: below -48. Raise if noisy environment
 # keeps recording alive; lower if soft speech gets ignored.
-mic_threshold = -42
+mic_threshold = -47
 
 # ── Display ──────────────────────────────────────────────────
 # CLI display language (en-US | zh-CN)
