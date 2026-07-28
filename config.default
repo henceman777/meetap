@@ -1,16 +1,16 @@
 # MeeTap Configuration
 
-# ── AWS ──────────────────────────────────────────────────────
+# ── AWS ───────────────────────────────────────────────────────
 # Region (affects S3, Transcribe, Bedrock)
 region = us-east-1
 
-# ── AI / Meeting Notes ───────────────────────────────────────
+# ── AI / Meeting Notes ────────────────────────────────────────
 # Backend for meeting notes generation (bedrock | claude-code)
 ai_backend = bedrock
 # Bedrock model (only used when ai_backend = bedrock)
 model = global.anthropic.claude-sonnet-5
 
-# ── Transcription ────────────────────────────────────────────
+# ── Transcription ─────────────────────────────────────────────
 # Languages (space-separated, priority order, AWS Transcribe codes)
 # Full list: https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html
 transcribe_languages = en-US zh-CN ja-JP
@@ -19,7 +19,7 @@ max_speakers = 10
 # Enable multi-language detection within a single session (true/false)
 multi_language = false
 
-# ── Recording ────────────────────────────────────────────────
+# ── Recording ─────────────────────────────────────────────────
 # Output directory
 recording_dir = ~/Record
 # Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
@@ -30,7 +30,7 @@ audio_persist = true
 # auto = use Process Tap if supported (macOS 14.4+), else BlackHole
 audio_capture = auto
 
-# ── Auto-stop ────────────────────────────────────────────────
+# ── Auto-stop ─────────────────────────────────────────────────
 # Silence detection threshold (dB)
 silence_threshold = -50
 # Stop after N seconds of continuous silence
@@ -42,7 +42,7 @@ silence_grace = 120
 # keeps recording alive; lower if soft speech gets ignored.
 mic_threshold = -47
 
-# ── Display ──────────────────────────────────────────────────
+# ── Display ───────────────────────────────────────────────────
 # CLI display language (en-US | zh-CN)
 # Only affects terminal output, notifications, and help text.
 # Meeting notes are always generated in Chinese regardless of this setting;
@@ -51,8 +51,10 @@ language = zh-CN
 # Audio visualizer style: dot | bar | spectrum (color bars) | block
 visualizer = dot
 
-# ── Email (optional) ────────────────────────────────────────
+# ── Email (optional) ──────────────────────────────────────────
 # Recipients for meeting notes (comma-separated, leave empty to disable)
 # email = alice@example.com, bob@example.com
 # SES verified sender address (required if email is set)
 # email_sender = meetap@example.com
+
+# ── End of MeeTap configuration ───────────────────────────────
