@@ -236,13 +236,21 @@ start_visualizer() {
         # tap-level 文件存在性——启动后 0.4s 内文件未生成会误走 ffmpeg 回退，
         # 该 ffmpeg 与录制 ffmpeg 的 avfoundation 初始化撞车 → 录制卡死。
         if [[ -f "$TAP_PID_FILE" ]]; then
-            local sys_vol mic_vol
-            sys_vol=$(cat "$LEVEL_FILE" 2>/dev/null)
-            # 两个电平文件均由 audio-tap 写（单行 dBFS，0.4s 原子替换）
-            mic_vol=$(cat "$MIC_LEVEL_FILE" 2>/dev/null)
+            # 电平文件两列 "峰值 RMS"（audio-tap 写，0.4s 原子替换）。
+            # 波形显示用 RMS（第2列）——峰值连续讲话时恒定顶格无起伏，
+            # RMS 跟随音节/停顿自然波动；门限判定仍用峰值（第1列，标定基于峰值）。
+            local sys_line mic_line sys_vol mic_peak mic_vol
+            sys_line=$(cat "$LEVEL_FILE" 2>/dev/null)
+            mic_line=$(cat "$MIC_LEVEL_FILE" 2>/dev/null)
+            sys_vol="${sys_line##* }"          # 系统音 RMS
+            mic_peak="${mic_line%% *}"         # 麦克风峰值（过门限用）
+            mic_vol="${mic_line##* }"          # 麦克风 RMS（显示用）
             sleep 0.4
             max_vol="${sys_vol:--91}"
-            if [[ -n "$mic_vol" && "$mic_vol" != "-inf" ]] && (( ${mic_vol%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
+            # 波形的麦克风门限比静音检测的 mic_threshold 更严（-40 vs -47）：
+            # 只有 speaker 正常讲话音量（实测峰值 -30~-36）才纳入波形，
+            # 轻微环境声（-40~-47）仍参与静音检测但不搅动波形。
+            if [[ -n "$mic_peak" && "$mic_peak" != "-inf" ]] && (( ${mic_peak%%.*} > -40 )); then
                 local s=${max_vol%%.*}
                 [[ ${mic_vol%%.*} -gt ${s:--91} ]] && max_vol="$mic_vol"
             fi
@@ -253,13 +261,14 @@ start_visualizer() {
         fi
         [[ -z "$max_vol" ]] && max_vol="-91"
 
-        # dBFS → 档位映射：窗口收窄到人声实际动态范围（门限 ~ -12dB），
-        # 全 0~-80 平铺会把人声(-30~-50)压在低档区，波形一排平点没有起伏。
-        # 下界跟随 mic_threshold（低于门限=0 档），上界 -12（响亮人声顶格）。
+        # dBFS → 档位映射（RMS 刻度）：RMS 比峰值低约 10dB，窗口 -50~-20——
+        # 轻声 RMS -46 ≈ 1 档、正常说话 -35~-40 ≈ 2-3 档、大声 -25 ≈ 5 档、
+        # 贴麦/响亮系统音 ≥-20 顶格。峰值刻度的旧窗口(-47~-12)会让正常
+        # 说话只剩 0-1 档。
         local vi=${max_vol%%.*}
         vi=${vi#-}
-        local lo=${CFG_MIC_THRESHOLD#-}   # 如 47（绝对值）
-        local hi=12
+        local lo=50
+        local hi=20
         local level
         if [[ $vi -ge $lo ]]; then level=0
         elif [[ $vi -le $hi ]]; then level=$MAX_IDX
@@ -313,12 +322,13 @@ is_audio_silent() {
     # 门限拦掉环境底噪，避免嘈杂环境永不自停。
     # BlackHole 模式：沿用 ffmpeg 采样混录信号（本身已含麦克风）。
     if [[ -f "$TAP_PID_FILE" ]]; then
-        # 系统音与麦克风在同一 5s 窗口内各采 5 次取峰值（电平文件 0.4s 更新）
+        # 系统音与麦克风在同一 5s 窗口内各采 5 次取峰值（电平文件 0.4s 更新，
+        # 两列 "峰值 RMS"——静音判定取第 1 列峰值，阈值标定基于峰值）
         local max="-91" mic_max="-91" v m
         for _ in 1 2 3 4 5; do
-            v=$(cat "$STATE_DIR/tap-level" 2>/dev/null)
+            v=$(cat "$STATE_DIR/tap-level" 2>/dev/null); v="${v%% *}"
             [[ -n "$v" ]] && (( $(printf '%.0f' "$v") > $(printf '%.0f' "$max") )) && max="$v"
-            m=$(cat "$STATE_DIR/mic-level" 2>/dev/null)
+            m=$(cat "$STATE_DIR/mic-level" 2>/dev/null); m="${m%% *}"
             [[ -n "$m" && "$m" != "-inf" ]] && (( $(printf '%.0f' "$m") > $(printf '%.0f' "$mic_max") )) && mic_max="$m"
             sleep 1
         done

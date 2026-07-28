@@ -60,11 +60,17 @@ func nominalSampleRate(_ id: AudioDeviceID) -> Float64? {
 // 写失败（如 ffmpeg 退出导致 EPIPE）时置位，由主线程负责清理退出
 let writeFailedFlag = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
 
-// 电平表（--level-file / --mic-level-file）：IO 回调更新峰值，
-// 主队列定时器每 0.4s 写 dBFS 到文件，供 meetap 点阵波形/静音检测读取
+// 电平表（--level-file / --mic-level-file）：IO 回调累计峰值+平方和，
+// 主队列定时器每 0.4s 写 "峰值dBFS RMSdBFS" 两列到文件。
+// 峰值供静音检测（阈值标定基于峰值）；RMS 供波形显示——峰值在连续
+// 讲话时恒定顶格（每窗都摸到最大音节），RMS 跟随音节/停顿自然起伏。
 let meterLock = NSLock()
 var meterPeak: Float = 0        // 系统音峰值
+var meterSumSq: Double = 0      // 系统音平方和（算 RMS）
+var meterCount: Int = 0
 var micMeterPeak: Float = 0     // 麦克风峰值
+var micMeterSumSq: Double = 0
+var micMeterCount: Int = 0
 var meterTimer: DispatchSourceTimer? = nil
 
 // MARK: - 麦克风采集与混音（--with-mic，借鉴 meetily ring-buffer 混音架构）
@@ -152,10 +158,18 @@ final class MicCapture {
             let stride = max(1, Int(buf.mNumberChannels > 0 ? buf.mNumberChannels : UInt32(channels)))
             ring.write(fp, n, stride: stride)
             var peak: Float = 0
+            var sumsq: Double = 0
+            var cnt = 0
             var i = 0
-            while i < n { let a = abs(fp[i]); if a > peak { peak = a }; i += stride }
+            while i < n {
+                let v = fp[i]; let a = abs(v)
+                if a > peak { peak = a }
+                sumsq += Double(v) * Double(v); cnt += 1
+                i += stride
+            }
             meterLock.lock()
             if peak > micMeterPeak { micMeterPeak = peak }
+            micMeterSumSq += sumsq; micMeterCount += cnt
             meterLock.unlock()
         }
         guard st == noErr, let createdPid = pid else {
@@ -286,11 +300,17 @@ final class TapCapture {
             guard let data = buf.mData, buf.mDataByteSize > 0 else { return }
             let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
             let fp = data.assumingMemoryBound(to: Float.self)
-            // 电平表：记录本窗口系统音峰值
+            // 电平表：记录本窗口系统音峰值 + 平方和（RMS 用）
             var peak: Float = 0
-            for i in 0..<n { let a = abs(fp[i]); if a > peak { peak = a } }
+            var sumsq: Double = 0
+            for i in 0..<n {
+                let v = fp[i]; let a = abs(v)
+                if a > peak { peak = a }
+                sumsq += Double(v) * Double(v)
+            }
             meterLock.lock()
             if peak > meterPeak { meterPeak = peak }
+            meterSumSq += sumsq; meterCount += n
             meterLock.unlock()
 
             // --with-mic：tap 作主时钟，从 ring 取等量麦克风样本叠加（进程内混音，
@@ -447,11 +467,13 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
         DispatchQueue.main.asyncAfter(deadline: .now() + d) { cleanupAndExit(0) }
     }
 
-    // 电平表：每 0.4s 把窗口峰值转 dBFS 写入文件（原子替换，读方不会读到半行）
+    // 电平表：每 0.4s 写 "峰值dBFS RMSdBFS" 到文件（原子替换，读方不会读到半行）
     if levelFile != nil || micLevelFile != nil {
-        func writeLevel(_ path: String, _ peak: Float) {
-            let db = peak > 0 ? max(-91.0, 20.0 * log10(Double(peak))) : -91.0
-            let line = String(format: "%.1f\n", db)
+        func writeLevel(_ path: String, _ peak: Float, _ sumsq: Double, _ count: Int) {
+            let peakDb = peak > 0 ? max(-91.0, 20.0 * log10(Double(peak))) : -91.0
+            let rms = count > 0 ? (sumsq / Double(count)).squareRoot() : 0
+            let rmsDb = rms > 0 ? max(-91.0, 20.0 * log10(rms)) : -91.0
+            let line = String(format: "%.1f %.1f\n", peakDb, rmsDb)
             let tmp = path + ".tmp"
             try? line.write(toFile: tmp, atomically: false, encoding: .utf8)
             _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: path),
@@ -462,10 +484,14 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
         timer.setEventHandler {
             meterLock.lock()
             let sysPeak = meterPeak; meterPeak = 0
+            let sysSumSq = meterSumSq; meterSumSq = 0
+            let sysCount = meterCount; meterCount = 0
             let micPeak = micMeterPeak; micMeterPeak = 0
+            let micSumSq = micMeterSumSq; micMeterSumSq = 0
+            let micCount = micMeterCount; micMeterCount = 0
             meterLock.unlock()
-            if let lf = levelFile { writeLevel(lf, sysPeak) }
-            if let mlf = micLevelFile { writeLevel(mlf, micPeak) }
+            if let lf = levelFile { writeLevel(lf, sysPeak, sysSumSq, sysCount) }
+            if let mlf = micLevelFile { writeLevel(mlf, micPeak, micSumSq, micCount) }
         }
         timer.resume()
         meterTimer = timer
