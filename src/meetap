@@ -895,7 +895,7 @@ if html is None:
 
     body_html_local = [body_html]
     _inject_style('table', 'border-collapse:collapse;width:100%;margin:12px 0;font-size:13px')
-    _inject_style('th', 'border:1px solid #d0d7de;padding:6px 10px;background:#f6f8fa;text-align:left')
+    _inject_style('th', 'border:1px solid #d0d7de;padding:6px 10px;background:#f6f8fa')
     _inject_style('td', 'border:1px solid #d0d7de;padding:6px 10px')
     body_html = body_html_local[0]
 
