@@ -17,8 +17,7 @@
 #
 # 每条消息定义为 MSG_<KEY>，由 _t() / _tn() 通过 printf 格式化，可带 %s / %d 占位符
 
-# ── 自动停止 ──
-MSG_AUTOSTOP_NOTIFY="持续静音 %s 秒，自动停止录制"
+# ── 自动停止（时长上限，可选，由 meetap start -d N 触发）──
 MSG_MAXDUR_NOTIFY="已达设定的会议时长上限，自动结束录制"
 
 # ── 转录流程 ──
@@ -81,10 +80,8 @@ MSG_MIC_DEVICE="🎤 麦克风: %s"
 MSG_RECORDING_STARTED="🎙️  录制已开始"
 MSG_FIELD_FILE="   文件: %s"
 MSG_FIELD_PLAYBACK="   播放: %s"
-MSG_FIELD_AUTOSTOP="   自动停止: 持续静音 %s 后"
-MSG_FIELD_STOP_MANUAL="   自动停止: 已关闭（Process Tap 模式，请显式停止）"
+MSG_FIELD_STOP_MANUAL="   自动停止: 未设置（会议持续录制，请手动 stop 或用 -d 指定时长）"
 MSG_FIELD_STOP_CMD="   停止录制: %s stop"
-MSG_FIELD_SILENCE_AUTOSTOP="   静默超 %s 则会议录制自动结束"
 MSG_FIELD_MAX_DURATION="   时长上限: %s 分钟后自动结束"
 MSG_ERR_FFMPEG_FAIL="❌ ffmpeg 启动失败:"
 MSG_ERR_BAD_DURATION="❌ 会议时长上限必须是正整数分钟: %s"
@@ -108,7 +105,7 @@ MSG_TRANSCRIBE_BACKGROUND="📝 后台转录已启动（完成后会收到通知
 MSG_STATUS_RECORDING="🎙️  录制中%s"
 MSG_STATUS_FILE="   文件: %s"
 MSG_STATUS_PLAYBACK="   播放设备: %s"
-MSG_STATUS_AUTOSTOP_ON="   自动停止: 已启用"
+MSG_STATUS_AUTOSTOP_ON="   自动停止: 已设时长上限"
 MSG_STATUS_MONITOR_RUN="   音频转发: 运行中"
 MSG_STATUS_VISUALIZER_RUN="   波形显示: 运行中（终端底部）"
 MSG_STATUS_IDLE="⏹️  未在录制"

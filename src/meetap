@@ -12,9 +12,6 @@ CFG_MODEL="global.anthropic.claude-sonnet-5"
 CFG_TRANSCRIBE_LANGUAGES="en-US zh-CN ja-JP"
 CFG_RECORDING_DIR="$HOME/Record"
 CFG_MAX_SPEAKERS=10
-CFG_SILENCE_THRESHOLD=-50
-CFG_SILENCE_GRACE=120
-CFG_MIC_THRESHOLD=-47
 CFG_AUDIO_BITRATE="128k"
 CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
@@ -75,9 +72,6 @@ load_config() {
             transcribe_languages)  CFG_TRANSCRIBE_LANGUAGES="$val" ;;
             recording_dir)         CFG_RECORDING_DIR="${val/#\~/$HOME}" ;;
             max_speakers)          CFG_MAX_SPEAKERS="$val" ;;
-            silence_threshold)     CFG_SILENCE_THRESHOLD="$val" ;;
-            silence_grace)         CFG_SILENCE_GRACE="$val" ;;
-            mic_threshold)         CFG_MIC_THRESHOLD="$val" ;;
             audio_bitrate)         CFG_AUDIO_BITRATE="$val" ;;
             multi_language)        CFG_MULTI_LANGUAGE="$val" ;;
             ai_backend)            CFG_AI_BACKEND="$val" ;;
@@ -227,7 +221,7 @@ start_visualizer() {
     # - tap 模式：系统音读 tap-level（audio-tap 写）；麦克风读 mic-level
     #   （录制 ffmpeg 的 astats 滤镜写，0.4s 窗口追加）。两个都是文件读取，
     #   零额外设备占用（严禁并发开第二个 ffmpeg 采 :default，会抢占输入设备）。
-    #   麦克风超过人声门限(mic_threshold)才参与合成，取两路较大者。
+    #   麦克风超过人声门限(-40dB)才参与合成，取两路较大者。
     # - BlackHole 模式：ffmpeg 采样混录信号（本身已含系统音+麦克风）。
     local LEVEL_FILE="$STATE_DIR/tap-level"
     local MIC_LEVEL_FILE="$STATE_DIR/mic-level"
@@ -248,9 +242,8 @@ start_visualizer() {
             mic_vol="${mic_line##* }"          # 麦克风 RMS（显示用）
             sleep 0.4
             max_vol="${sys_vol:--91}"
-            # 波形的麦克风门限比静音检测的 mic_threshold 更严（-40 vs -47）：
-            # 只有 speaker 正常讲话音量（实测峰值 -30~-36）才纳入波形，
-            # 轻微环境声（-40~-47）仍参与静音检测但不搅动波形。
+            # 波形的麦克风门限 -40dB：只有 speaker 正常讲话音量（实测峰值
+            # -30~-36）才纳入波形，轻微环境声（-40 以下）不搅动波形。
             if [[ -n "$mic_peak" && "$mic_peak" != "-inf" ]] && (( ${mic_peak%%.*} > -40 )); then
                 local s=${max_vol%%.*}
                 [[ ${mic_vol%%.*} -gt ${s:--91} ]] && max_vol="$mic_vol"
@@ -315,50 +308,15 @@ stop_visualizer() {
     fi
 }
 
-is_audio_silent() {
-    local mean_vol
-    # tap 模式：系统音读电平文件（5 次取峰值，近似 5s 窗口）；
-    # 另采样麦克风一次，超过 mic_threshold（人声门限）即视为「有人在讲话」——
-    # 覆盖现场会议/演讲场景：系统音全程静音，人声只进麦克风，不该自停。
-    # 门限拦掉环境底噪，避免嘈杂环境永不自停。
-    # BlackHole 模式：沿用 ffmpeg 采样混录信号（本身已含麦克风）。
-    if [[ -f "$TAP_PID_FILE" ]]; then
-        # 系统音与麦克风在同一 5s 窗口内各采 5 次取峰值（电平文件 0.4s 更新，
-        # 两列 "峰值 RMS"——静音判定取第 1 列峰值，阈值标定基于峰值）
-        local max="-91" mic_max="-91" v m
-        for _ in 1 2 3 4 5; do
-            v=$(cat "$STATE_DIR/tap-level" 2>/dev/null); v="${v%% *}"
-            [[ -n "$v" ]] && (( $(printf '%.0f' "$v") > $(printf '%.0f' "$max") )) && max="$v"
-            m=$(cat "$STATE_DIR/mic-level" 2>/dev/null); m="${m%% *}"
-            [[ -n "$m" && "$m" != "-inf" ]] && (( $(printf '%.0f' "$m") > $(printf '%.0f' "$mic_max") )) && mic_max="$m"
-            sleep 1
-        done
-        mean_vol="$max"
-        # 麦克风超过人声门限 → 有人在讲话 → 不静音（门限拦环境底噪）
-        if (( ${mic_max%%.*} > ${CFG_MIC_THRESHOLD%%.*} )); then
-            return 1
-        fi
-    else
-        mean_vol=$(ffmpeg -f avfoundation -i ":BlackHole 2ch" -t 5 \
-            -af volumedetect -f null /dev/null 2>&1 \
-            | sed -n 's/.*mean_volume: \([-0-9.]*\).*/\1/p')
-    fi
-    if [[ -z "$mean_vol" ]]; then
-        return 1
-    fi
-    local vol_int=${mean_vol%%.*}
-    [[ $vol_int -le $CFG_SILENCE_THRESHOLD ]]
-}
-
+# 会议时长上限守护：到达预设 deadline（epoch 秒）即自动结束录制。
+# 仅在 meetap start -d N 指定了时长上限时启动（无 -d 则不自动结束，需手动 stop）。
+# （静默自停特性已废止：会议中的自然停顿不应触发结束。）
 autostop_daemon() {
-    local silence_start=""
-
     while true; do
         if [[ ! -f "$PID_FILE" ]] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
             break
         fi
 
-        # 会议时长上限：到达预设 deadline（epoch 秒）即自动结束，与静默检测并行
         if [[ -f "$MAX_DURATION_FILE" ]]; then
             local deadline
             deadline=$(cat "$MAX_DURATION_FILE" 2>/dev/null)
@@ -369,21 +327,7 @@ autostop_daemon() {
             fi
         fi
 
-        if is_audio_silent; then
-            if [[ -z "$silence_start" ]]; then
-                silence_start=$(date +%s)
-            fi
-            local elapsed=$(( $(date +%s) - silence_start ))
-            if [[ $elapsed -ge $CFG_SILENCE_GRACE ]]; then
-                osascript -e "display notification \"$(_tn AUTOSTOP_NOTIFY "$CFG_SILENCE_GRACE")\" with title \"MeeTap\"" 2>/dev/null
-                "$0" stop
-                break
-            fi
-        else
-            silence_start=""
-        fi
-
-        sleep 30
+        sleep 10
     done
 }
 
@@ -1313,29 +1257,25 @@ start_recording() {
 
         sleep 1
         if kill -0 $FFMPEG_PID 2>/dev/null; then
-            # 静默自停：聚合语音（系统音 tap-level + 麦克风 mic-level，麦克风
-            # 过 mic_threshold 门限拦底噪）持续静默超过 silence_grace 秒自动停止。
-            # 另可用 meetap start -d N 设置会议时长上限（分钟），到点自动结束。
-            autostop_daemon &
-            AUTOSTOP_PID=$!
-            echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
-            disown $AUTOSTOP_PID
+            # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护，到点自动结束。
+            # 无 -d 则不自动结束，需手动 stop（静默自停特性已废止）。
+            if [[ -n "$MAX_DURATION_MIN" ]]; then
+                autostop_daemon &
+                AUTOSTOP_PID=$!
+                echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
+                disown $AUTOSTOP_PID
+            fi
 
             echo ""
             _t RECORDING_STARTED
             $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
             _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
             _t FIELD_STOP_CMD "$0"
-            local _grace_display
-            if (( CFG_SILENCE_GRACE >= 3600 )); then
-                _grace_display="$((CFG_SILENCE_GRACE / 3600)) 小时"
-            elif (( CFG_SILENCE_GRACE >= 60 )); then
-                _grace_display="$((CFG_SILENCE_GRACE / 60)) 分钟"
+            if [[ -n "$MAX_DURATION_MIN" ]]; then
+                _t FIELD_MAX_DURATION "$MAX_DURATION_MIN"
             else
-                _grace_display="${CFG_SILENCE_GRACE} 秒"
+                _t FIELD_STOP_MANUAL
             fi
-            _t FIELD_SILENCE_AUTOSTOP "$_grace_display"
-            [[ -n "$MAX_DURATION_MIN" ]] && _t FIELD_MAX_DURATION "$MAX_DURATION_MIN"
             echo ""
 
             # 点阵波形 + 状态栏（与 BlackHole 分支一致；电平来自 tap-level 文件）
@@ -1429,27 +1369,23 @@ start_recording() {
 
     sleep 1
     if kill -0 $FFMPEG_PID 2>/dev/null; then
-        # 启动自动停止守护进程（基于音频静音检测）
-        autostop_daemon &
-        AUTOSTOP_PID=$!
-        echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
-        disown $AUTOSTOP_PID
+        # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护（静默自停已废止）
+        if [[ -n "$MAX_DURATION_MIN" ]]; then
+            autostop_daemon &
+            AUTOSTOP_PID=$!
+            echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
+            disown $AUTOSTOP_PID
+        fi
 
         echo ""
         _t RECORDING_STARTED
         $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
         _t FIELD_PLAYBACK "$ORIG_NAME"
-        # 格式化 silence_grace 秒数为人类可读(秒/分钟/小时)
-        local _grace_display
-        if (( CFG_SILENCE_GRACE >= 3600 )); then
-            _grace_display="$((CFG_SILENCE_GRACE / 3600)) 小时"
-        elif (( CFG_SILENCE_GRACE >= 60 )); then
-            _grace_display="$((CFG_SILENCE_GRACE / 60)) 分钟"
+        if [[ -n "$MAX_DURATION_MIN" ]]; then
+            _t FIELD_MAX_DURATION "$MAX_DURATION_MIN"
         else
-            _grace_display="${CFG_SILENCE_GRACE} 秒"
+            _t FIELD_STOP_MANUAL
         fi
-        _t FIELD_AUTOSTOP "$_grace_display"
-        [[ -n "$MAX_DURATION_MIN" ]] && _t FIELD_MAX_DURATION "$MAX_DURATION_MIN"
         _t FIELD_STOP_CMD "$0"
         echo ""
 
@@ -1864,8 +1800,6 @@ case "${1:-}" in
                     "  transcribe_languages  = $CFG_TRANSCRIBE_LANGUAGES" \
                     "  recording_dir         = $CFG_RECORDING_DIR" \
                     "  max_speakers          = $CFG_MAX_SPEAKERS" \
-                    "  silence_threshold     = $CFG_SILENCE_THRESHOLD" \
-                    "  silence_grace         = $CFG_SILENCE_GRACE" \
                     "  audio_bitrate         = $CFG_AUDIO_BITRATE" \
                     "  audio_persist         = $CFG_AUDIO_PERSIST" \
                     "  multi_language        = $CFG_MULTI_LANGUAGE" \

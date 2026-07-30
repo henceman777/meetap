@@ -17,7 +17,6 @@
 #                 AWS SDK errors (passed through verbatim)
 
 # ── Auto-stop ──
-MSG_AUTOSTOP_NOTIFY="Silent for %s seconds, stopping recording automatically"
 MSG_MAXDUR_NOTIFY="Reached the configured meeting time limit, stopping recording automatically"
 
 # ── Transcription pipeline ──
@@ -80,10 +79,8 @@ MSG_MIC_DEVICE="🎤 Microphone: %s"
 MSG_RECORDING_STARTED="🎙️  Recording started"
 MSG_FIELD_FILE="   File: %s"
 MSG_FIELD_PLAYBACK="   Playback: %s"
-MSG_FIELD_AUTOSTOP="   Auto-stop: after %s of silence"
-MSG_FIELD_STOP_MANUAL="   Auto-stop: disabled (Process Tap mode; stop explicitly)"
+MSG_FIELD_STOP_MANUAL="   Auto-stop: not set (records until you stop; use -d to set a time limit)"
 MSG_FIELD_STOP_CMD="   Stop recording: %s stop"
-MSG_FIELD_SILENCE_AUTOSTOP="   Recording auto-stops after %s of silence"
 MSG_FIELD_MAX_DURATION="   Time limit: auto-stops after %s min"
 MSG_ERR_FFMPEG_FAIL="❌ Failed to start ffmpeg:"
 MSG_ERR_BAD_DURATION="❌ Meeting time limit must be a positive integer (minutes): %s"
@@ -107,7 +104,7 @@ MSG_TRANSCRIBE_BACKGROUND="📝 Background transcription started (you'll be noti
 MSG_STATUS_RECORDING="🎙️  Recording%s"
 MSG_STATUS_FILE="   File: %s"
 MSG_STATUS_PLAYBACK="   Playback device: %s"
-MSG_STATUS_AUTOSTOP_ON="   Auto-stop: enabled"
+MSG_STATUS_AUTOSTOP_ON="   Auto-stop: time limit set"
 MSG_STATUS_MONITOR_RUN="   Audio forward: running"
 MSG_STATUS_VISUALIZER_RUN="   Waveform: running (bottom of terminal)"
 MSG_STATUS_IDLE="⏹️  Not recording"
