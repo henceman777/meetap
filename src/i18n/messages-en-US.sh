@@ -18,6 +18,7 @@
 
 # ── Auto-stop ──
 MSG_AUTOSTOP_NOTIFY="Silent for %s seconds, stopping recording automatically"
+MSG_MAXDUR_NOTIFY="Reached the configured meeting time limit, stopping recording automatically"
 
 # ── Transcription pipeline ──
 MSG_TRANSCRIBE_STARTED="Transcription started"
@@ -83,7 +84,10 @@ MSG_FIELD_AUTOSTOP="   Auto-stop: after %s of silence"
 MSG_FIELD_STOP_MANUAL="   Auto-stop: disabled (Process Tap mode; stop explicitly)"
 MSG_FIELD_STOP_CMD="   Stop recording: %s stop"
 MSG_FIELD_SILENCE_AUTOSTOP="   Recording auto-stops after %s of silence"
+MSG_FIELD_MAX_DURATION="   Time limit: auto-stops after %s min"
 MSG_ERR_FFMPEG_FAIL="❌ Failed to start ffmpeg:"
+MSG_ERR_BAD_DURATION="❌ Meeting time limit must be a positive integer (minutes): %s"
+MSG_ERR_UNKNOWN_OPTION="❌ Unknown option: %s"
 
 # ── Recording stop ──
 MSG_WAITING_RECORDING="⏳ Waiting for recording to finish..."
@@ -179,7 +183,7 @@ MSG_ERR_AGAIN_NO_AUDIO="ERROR: no audio file (.m4a) in session: %s"
 
 MSG_USAGE_HEADER="MeeTap v%s - macOS meeting recorder + auto-transcription"
 MSG_USAGE_LINE="Usage: meetap {start|stop|status|again|setup|config|version}"
-MSG_USAGE_START="  start [-t]   Start recording (-t shows verbose device info)"
+MSG_USAGE_START="  start [-t] [-d MIN] [name] Start recording (-t verbose; -d sets a time limit, auto-stops when reached)"
 MSG_USAGE_STOP="  stop [-t]    Stop recording, restore audio device, auto-transcribe (-t shows verbose file info)"
 MSG_USAGE_STATUS="  status       Show current recording status"
 MSG_USAGE_AGAIN="  again [dir]  Re-generate meeting notes (default: latest; put files in materials/ or edit extra-requirements.md first)"

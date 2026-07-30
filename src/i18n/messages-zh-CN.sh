@@ -19,6 +19,7 @@
 
 # ── 自动停止 ──
 MSG_AUTOSTOP_NOTIFY="持续静音 %s 秒，自动停止录制"
+MSG_MAXDUR_NOTIFY="已达设定的会议时长上限，自动结束录制"
 
 # ── 转录流程 ──
 MSG_TRANSCRIBE_STARTED="Transcription started"
@@ -84,7 +85,10 @@ MSG_FIELD_AUTOSTOP="   自动停止: 持续静音 %s 后"
 MSG_FIELD_STOP_MANUAL="   自动停止: 已关闭（Process Tap 模式，请显式停止）"
 MSG_FIELD_STOP_CMD="   停止录制: %s stop"
 MSG_FIELD_SILENCE_AUTOSTOP="   静默超 %s 则会议录制自动结束"
+MSG_FIELD_MAX_DURATION="   时长上限: %s 分钟后自动结束"
 MSG_ERR_FFMPEG_FAIL="❌ ffmpeg 启动失败:"
+MSG_ERR_BAD_DURATION="❌ 会议时长上限必须是正整数分钟: %s"
+MSG_ERR_UNKNOWN_OPTION="❌ 未知选项: %s"
 
 # ── 录制停止 ──
 MSG_WAITING_RECORDING="⏳ 等待录制完成..."
@@ -180,7 +184,7 @@ MSG_ERR_AGAIN_NO_AUDIO="❌ 会议目录中没有音频文件(.m4a): %s"
 
 MSG_USAGE_HEADER="MeeTap v%s - macOS 会议录制 + 自动转录"
 MSG_USAGE_LINE="用法: meetap {start|stop|status|again|setup|config|version}"
-MSG_USAGE_START="  start [-t]   开始录制（-t 显示详细设备信息）"
+MSG_USAGE_START="  start [-t] [-d 分钟] [会议名] 开始录制（-t 详细信息；-d 指定时长上限，到点自动结束）"
 MSG_USAGE_STOP="  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
 MSG_USAGE_STATUS="  status       查看当前录制状态"
 MSG_USAGE_AGAIN="  again [目录名] 重新生成会议纪要（默认最近一次；先放资料到 materials/ 或写 extra-requirements.md）"

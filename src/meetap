@@ -169,6 +169,7 @@ ORIGINAL_UID_FILE="$STATE_DIR/original-output.uid"
 ORIGINAL_NAME_FILE="$STATE_DIR/original-output.name"
 OUTPUT_FILE_MARKER="$STATE_DIR/output-file"
 AUTOSTOP_PID_FILE="$STATE_DIR/autostop.pid"
+MAX_DURATION_FILE="$STATE_DIR/max-duration-deadline"   # 达到该 epoch 秒即自动结束（可选）
 MEETING_APPS_FILE="$STATE_DIR/meeting-apps"
 VISUALIZER_PID_FILE="$STATE_DIR/visualizer.pid"
 
@@ -355,6 +356,17 @@ autostop_daemon() {
     while true; do
         if [[ ! -f "$PID_FILE" ]] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
             break
+        fi
+
+        # 会议时长上限：到达预设 deadline（epoch 秒）即自动结束，与静默检测并行
+        if [[ -f "$MAX_DURATION_FILE" ]]; then
+            local deadline
+            deadline=$(cat "$MAX_DURATION_FILE" 2>/dev/null)
+            if [[ -n "$deadline" ]] && (( $(date +%s) >= deadline )); then
+                osascript -e "display notification \"$(_tn MAXDUR_NOTIFY)\" with title \"MeeTap\"" 2>/dev/null
+                "$0" stop
+                break
+            fi
         fi
 
         if is_audio_silent; then
@@ -1168,13 +1180,31 @@ again_session() {
 
 start_recording() {
     local VERBOSE=false
-    if [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]]; then
-        VERBOSE=true
-        echo "true" > "$STATE_DIR/test-mode"
-        shift
-    else
-        rm -f "$STATE_DIR/test-mode"
-    fi
+    local MAX_DURATION_MIN=""   # 会议时长上限（分钟，可选）
+    # 解析选项：-t/--test 显示详情；-d/--duration N 指定会议时长上限（分钟）
+    # 选项可任意顺序，之后的位置参数为会议名称
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            -t|--test)
+                VERBOSE=true
+                echo "true" > "$STATE_DIR/test-mode"
+                shift
+                ;;
+            -d|--duration)
+                MAX_DURATION_MIN="${2:-}"
+                if ! [[ "$MAX_DURATION_MIN" =~ ^[1-9][0-9]*$ ]]; then
+                    _t ERR_BAD_DURATION "$MAX_DURATION_MIN"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            *)
+                _t ERR_UNKNOWN_OPTION "$1"
+                exit 1
+                ;;
+        esac
+    done
+    [[ "$VERBOSE" == "false" ]] && rm -f "$STATE_DIR/test-mode"
     # 可选位置参数：会议名称（meetap start 季度架构评审）
     local MEETING_NAME="${1:-}"
 
@@ -1188,7 +1218,7 @@ start_recording() {
     # ffmpeg；tap 依赖 EPIPE 自杀，但 IO 回调停摆时永不触发）。孤儿会占住
     # 音频链路，让新 ffmpeg 打不开麦克风输入 → 卡死 → 录音全丢，必须先清扫。
     pkill -f "audio-tap tap-start" 2>/dev/null && sleep 0.5
-    rm -f "$PID_FILE" "$MONITOR_PID_FILE" "$TAP_PID_FILE"
+    rm -f "$PID_FILE" "$MONITOR_PID_FILE" "$TAP_PID_FILE" "$MAX_DURATION_FILE"
 
     # 检查依赖
     if [[ ! -x "$TOOL" ]]; then
@@ -1227,6 +1257,11 @@ start_recording() {
     TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
     OUTPUT_FILE="$SESSION_DIR/meeting_${TIMESTAMP}.m4a"
     echo "$OUTPUT_FILE" > "$OUTPUT_FILE_MARKER"
+
+    # 会议时长上限（可选）：换算成 deadline 的 epoch 秒，交由 autostop_daemon 监控
+    if [[ -n "$MAX_DURATION_MIN" ]]; then
+        echo $(( $(date +%s) + MAX_DURATION_MIN * 60 )) > "$MAX_DURATION_FILE"
+    fi
 
     if [[ "$use_tap" == "true" ]]; then
         # --- Process Tap 分支 ---
@@ -1280,7 +1315,7 @@ start_recording() {
         if kill -0 $FFMPEG_PID 2>/dev/null; then
             # 静默自停：聚合语音（系统音 tap-level + 麦克风 mic-level，麦克风
             # 过 mic_threshold 门限拦底噪）持续静默超过 silence_grace 秒自动停止。
-            # 时长可用 meetap start -g N 覆盖，默认读 config silence_grace。
+            # 另可用 meetap start -d N 设置会议时长上限（分钟），到点自动结束。
             autostop_daemon &
             AUTOSTOP_PID=$!
             echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
@@ -1300,6 +1335,7 @@ start_recording() {
                 _grace_display="${CFG_SILENCE_GRACE} 秒"
             fi
             _t FIELD_SILENCE_AUTOSTOP "$_grace_display"
+            [[ -n "$MAX_DURATION_MIN" ]] && _t FIELD_MAX_DURATION "$MAX_DURATION_MIN"
             echo ""
 
             # 点阵波形 + 状态栏（与 BlackHole 分支一致；电平来自 tap-level 文件）
@@ -1413,6 +1449,7 @@ start_recording() {
             _grace_display="${CFG_SILENCE_GRACE} 秒"
         fi
         _t FIELD_AUTOSTOP "$_grace_display"
+        [[ -n "$MAX_DURATION_MIN" ]] && _t FIELD_MAX_DURATION "$MAX_DURATION_MIN"
         _t FIELD_STOP_CMD "$0"
         echo ""
 
@@ -1448,6 +1485,7 @@ stop_recording() {
         kill "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null
         rm -f "$AUTOSTOP_PID_FILE" "$MEETING_APPS_FILE"
     fi
+    rm -f "$MAX_DURATION_FILE"
 
     if [[ ! -f "$PID_FILE" ]]; then
         _t ERR_NO_ACTIVE_RECORDING
