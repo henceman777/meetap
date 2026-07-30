@@ -882,6 +882,23 @@ if html is None:
                 out.append(block)
         body_html = '\n'.join(out)
 
+    # --- 给表格注入内联样式 ---
+    # markdown 库产出的是裸 <table>/<th>/<td>，邮件客户端会剥掉 <head> 里的
+    # <style>，只有内联样式才可靠。为每个表格元素补上边框与内边距。
+    def _inject_style(tag, style):
+        # 已有 style 的（如列对齐 style="text-align:right"）合并，否则新建
+        pat_has = re.compile(r'<' + tag + r'(?![a-z])([^>]*?)\bstyle="([^"]*)"', re.IGNORECASE)
+        s = pat_has.sub(lambda m: f'<{tag}{m.group(1)}style="{style};{m.group(2)}"', body_html_local[0])
+        pat_no = re.compile(r'<' + tag + r'(?![a-z])(?![^>]*\bstyle=)([^>]*)>', re.IGNORECASE)
+        s = pat_no.sub(lambda m: f'<{tag}{m.group(1)} style="{style}">', s)
+        body_html_local[0] = s
+
+    body_html_local = [body_html]
+    _inject_style('table', 'border-collapse:collapse;width:100%;margin:12px 0;font-size:13px')
+    _inject_style('th', 'border:1px solid #d0d7de;padding:6px 10px;background:#f6f8fa;text-align:left')
+    _inject_style('td', 'border:1px solid #d0d7de;padding:6px 10px')
+    body_html = body_html_local[0]
+
     # 正文里 Claude 按模板要求写了 LARRY 页脚；模板外框会再注入 footer，
     # 先剥掉正文里的那份，避免邮件出现双页脚；连同落款上方的分割线 <hr> 一起剥
     # （模板 footer 自带浅灰细线，md 的 --- 转成的黑色 <hr> 会重复且突兀）
