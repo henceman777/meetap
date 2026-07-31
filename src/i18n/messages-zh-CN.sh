@@ -138,7 +138,7 @@ MSG_SETUP_TAP_GUIDE_2="   2. 在「仅系统录音」中点 + 添加你的终端
 MSG_SETUP_TAP_GUIDE_3="   3. 若系统提示需要重新打开终端 App，请照做后重新运行 meetap setup"
 MSG_SETUP_TAP_PRESS_AFTER_GRANT="   完成授权后按 Enter 复测..."
 MSG_SETUP_TAP_STILL_SILENT="⚠️  复测仍为静音。若刚在系统设置中改过授权，请完全退出并重启终端 App 后再运行 meetap setup"
-MSG_SETUP_TAP_FALLBACK_NOTE="   在授权生效前，录制会自动回退到 BlackHole 方式，功能不受影响"
+MSG_SETUP_TAP_FALLBACK_NOTE="   注意：auto 模式在 14.4+ 上直接走 Process Tap，授权未生效不会自动回退、会录到静音；授权前如需应急录制，请把配置 audio_capture 改为 blackhole（需已装 BlackHole）"
 MSG_SETUP_TEAMS_DONE="✅ Teams 设置完成"
 
 # ── Setup: 腾讯会议 ──

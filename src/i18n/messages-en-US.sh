@@ -137,7 +137,7 @@ MSG_SETUP_TAP_GUIDE_2="   2. Under 'System Audio Recording Only', click + and ad
 MSG_SETUP_TAP_GUIDE_3="   3. If macOS asks to relaunch the terminal app, do so and re-run meetap setup"
 MSG_SETUP_TAP_PRESS_AFTER_GRANT="   Press Enter after granting to re-test..."
 MSG_SETUP_TAP_STILL_SILENT="WARNING: still silent. If you just changed the permission, fully quit and relaunch your terminal app, then re-run meetap setup"
-MSG_SETUP_TAP_FALLBACK_NOTE="   Until permission takes effect, recording falls back to BlackHole automatically"
+MSG_SETUP_TAP_FALLBACK_NOTE="   Note: in auto mode on 14.4+ recording uses Process Tap directly; without permission it will NOT fall back and will capture silence. To record before granting, set config audio_capture=blackhole (requires BlackHole installed)"
 MSG_SETUP_TEAMS_DONE="✅ Teams setup complete"
 
 # ── Setup: Tencent Meeting ──
