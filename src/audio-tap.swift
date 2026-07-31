@@ -7,7 +7,8 @@ import Foundation
 //
 // 子命令:
 //   tap-supported             检测系统是否支持 Process Tap（≥14.4 输出 "yes" exit 0）
-//   tap-rate                  打印默认输出设备标称采样率（整数 Hz，tap 采样率跟随此设备）
+//   tap-rate                  打印默认输出设备标称采样率（整数 Hz，仅参考）
+//   tap-format                打印 Process Tap 实际采样率（整数 Hz，采集/编码以此为准）
 //   tap-start [--duration N]  捕获系统音频，Float32 LE mono PCM 写 stdout
 //                             ffmpeg 读法: ffmpeg -f f32le -ar <rate> -ac 1 -i pipe:0 ...
 //
@@ -411,6 +412,47 @@ func runTapRate() -> Never {
     exit(0)
 }
 
+// tap-format：打印 Process Tap 的【实际】采样率（Hz）。
+// 与 tap-rate 的区别至关重要：tap-rate 读默认输出设备的“标称采样率”
+// (kAudioDevicePropertyNominalSampleRate)，而 tap-start 采集时用的是 tap 自身
+// 协商出的流格式 (kAudioTapPropertyFormat)。两者在某些设备上不相等（如蓝牙
+// 通话模式），若拿标称率喂 ffmpeg -ar 解码 tap 裸流，会导致时长错拉、音调失真。
+// 本命令创建临时 tap、读真实格式、随即销毁，让调用方拿到与采集一致的采样率。
+func runTapFormat() -> Never {
+    guard #available(macOS 14.4, *) else {
+        fputs("Error: Process Tap requires macOS 14.4+\n", stderr)
+        exit(1)
+    }
+    guard defaultOutputDevice() != nil else {
+        fputs("Error: cannot get default output device\n", stderr)
+        exit(1)
+    }
+    let desc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
+    desc.name = "meetap-tap-probe"
+    desc.isPrivate = true
+    var tid = AudioObjectID(kAudioObjectUnknown)
+    let st = AudioHardwareCreateProcessTap(desc, &tid)
+    guard st == noErr, tid != kAudioObjectUnknown else {
+        fputs("Error: AudioHardwareCreateProcessTap failed (status \(st))\n", stderr)
+        exit(1)
+    }
+    defer { AudioHardwareDestroyProcessTap(tid) }
+
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioTapPropertyFormat,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var asbd = AudioStreamBasicDescription()
+    var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    guard AudioObjectGetPropertyData(tid, &addr, 0, nil, &size, &asbd) == noErr,
+          asbd.mSampleRate > 0 else {
+        fputs("Error: cannot read tap format\n", stderr)
+        exit(1)
+    }
+    print(Int(asbd.mSampleRate))
+    exit(0)
+}
+
 var activeMic: MicCapture? = nil
 
 func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, withMic: Bool) -> Never {
@@ -509,7 +551,8 @@ guard let cmd = args.first else {
 
     Commands:
       tap-supported             检测 Process Tap 是否可用（yes / 原因）
-      tap-rate                  打印默认输出设备采样率（Hz）
+      tap-rate                  打印默认输出设备标称采样率（Hz）
+      tap-format                打印 Process Tap 实际采样率（Hz，采集/编码应以此为准）
       tap-start [--duration N] [--level-file PATH]
                                 捕获系统音频，Float32 LE mono PCM 写 stdout
                                 --level-file: 每 0.4s 写当前电平(dBFS)到文件，
@@ -524,6 +567,8 @@ case "tap-supported":
     runTapSupported()
 case "tap-rate":
     runTapRate()
+case "tap-format":
+    runTapFormat()
 case "tap-start":
     var duration: Double? = nil
     var levelFile: String? = nil

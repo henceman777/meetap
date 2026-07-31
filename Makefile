@@ -29,6 +29,10 @@ install: all
 	cp $(BUILD)/audio-multi-output $(PREFIX)/audio-multi-output
 	cp $(BUILD)/audio-monitor $(PREFIX)/audio-monitor
 	cp $(BUILD)/audio-tap $(PREFIX)/audio-tap
+	# cp 会破坏 ad-hoc 签名（带 __info_plist 段尤甚），TCC 判定签名无效后
+	# 内核会在创建 Process Tap 时 SIGKILL 进程（tap-format/tap-start 表现为
+	# exit 137）。install 后必须重新签名，否则安装版录音全静音/被杀。
+	codesign --force --sign - $(PREFIX)/audio-tap
 	chmod +x $(PREFIX)/meetap
 	mkdir -p $(PREFIX)/i18n
 	cp src/i18n/*.sh $(PREFIX)/i18n/
