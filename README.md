@@ -343,7 +343,7 @@ flowchart TB
 
 **架构组成**（谁在哪、谁管什么）：
 
-![image-20260731205319177](README.assets/image-20260731205319177.png)
+![image-20260731205319177](image/architecture_diagram.png)
 
 没有 VPC、没有集群、没有"我家的服务器"——4 个托管服务通过 SDK/CLI 直接调用。
 
