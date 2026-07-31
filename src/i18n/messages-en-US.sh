@@ -171,6 +171,7 @@ MSG_CONFIG_NO_TEMPLATE="❌ Default config template not found, cannot initialize
 # ── Usage ──
 # -- meetap again --
 MSG_AGAIN_TARGET="Re-running meeting task: %s"
+MSG_AGAIN_EXTRA_PROMPT="   Extra request this run: %s"
 MSG_AGAIN_ARCHIVED="   Archived old file: %s -> archive/"
 MSG_AGAIN_FROM_NOTES="   Transcript found; re-running from notes generation (picks up new materials/ and extra-requirements.md)"
 MSG_AGAIN_FROM_TRANSCRIBE="   No transcript; re-running from transcription: %s (log: log/meetap.log)"
@@ -183,7 +184,7 @@ MSG_USAGE_LINE="Usage: meetap {start|stop|status|again|setup|config|version}"
 MSG_USAGE_START="  start [-t] [-d MIN] [name] Start recording (-t verbose; -d sets a time limit, auto-stops when reached)"
 MSG_USAGE_STOP="  stop [-t]    Stop recording, restore audio device, auto-transcribe (-t shows verbose file info)"
 MSG_USAGE_STATUS="  status       Show current recording status"
-MSG_USAGE_AGAIN="  again [dir]  Re-generate meeting notes (default: latest; put files in materials/ or edit extra-requirements.md first)"
+MSG_USAGE_AGAIN="  again [dir] [extra prompt]  Re-generate meeting notes (default: latest; extra prompt is passed to the LLM as an added instruction; or put files in materials/)"
 MSG_USAGE_SETUP="  setup        One-click setup for Zoom + Teams + Tencent Meeting (only once)"
 MSG_USAGE_CONFIG="  config       Open config in \$EDITOR"
 MSG_USAGE_CONFIG_SHOW="  config show  Show current configuration"

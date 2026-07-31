@@ -1067,6 +1067,7 @@ summarize_transcript() {
 # 从转录开始重跑全链路。旧纪要归档到 archive/ 加时间戳，不覆盖丢失。
 again_session() {
     local target="${1:-}"
+    local extra_prompt="${2:-}"   # 可选：本次补充给 LLM 的重新生成要求
     local SESSION_DIR
 
     if [[ -n "$target" ]]; then
@@ -1091,6 +1092,14 @@ again_session() {
     local LOG_DIR="$SESSION_DIR/log"
     local TRANSCRIPT="$LOG_DIR/transcript.txt"
     _t AGAIN_TARGET "$(basename "$SESSION_DIR")"
+
+    # 命令行补充要求：写入 extra-requirements.md，复用 build_prompt 的
+    # ${extra_requirements} 注入通道（不改 prompt 模板）。未给参数则保留
+    # 该文件原有内容（手工编辑的工作流不受影响）。
+    if [[ -n "$extra_prompt" ]]; then
+        printf '%s\n' "$extra_prompt" > "$SESSION_DIR/extra-requirements.md"
+        _t AGAIN_EXTRA_PROMPT "$extra_prompt"
+    fi
 
     # 归档旧纪要（md/html），避免重跑覆盖丢失历史版本
     local old note archive_dir="$SESSION_DIR/archive"
@@ -1772,7 +1781,7 @@ case "${1:-}" in
         show_status
         ;;
     again)
-        again_session "${2:-}"
+        again_session "${2:-}" "${3:-}"
         ;;
     setup)
         setup_apps
