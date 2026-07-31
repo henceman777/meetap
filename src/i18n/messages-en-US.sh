@@ -155,6 +155,7 @@ MSG_SETUP_STEP_ZOOM="[2/4] Configure Zoom"
 MSG_SETUP_STEP_TEAMS="[3/4] Configure Teams"
 MSG_SETUP_STEP_WEMEET="[4/4] Configure Tencent Meeting"
 MSG_SETUP_DIVIDER="---"
+MSG_SETUP_APPS_TAP_SKIP="i  Process Tap captures the whole system mix, independent of each meeting app's speaker setting; skipped Zoom / Teams / Tencent Meeting configuration"
 MSG_SETUP_ALL_DONE="✅ Setup complete! You can now run %s start to record a meeting"
 MSG_SETUP_ALL_DONE_HINT="   You only need to do this once, unless you change it back in an app."
 

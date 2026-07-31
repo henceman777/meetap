@@ -167,6 +167,11 @@ MAX_DURATION_FILE="$STATE_DIR/max-duration-deadline"   # 达到该 epoch 秒即�
 MEETING_APPS_FILE="$STATE_DIR/meeting-apps"
 VISUALIZER_PID_FILE="$STATE_DIR/visualizer.pid"
 
+# Process Tap 授权标记（持久化于配置目录，非 /tmp）：一旦通过授权自检即写入，
+# 之后 start 直接信任、跳过探测，避免每次录制都做 2 秒实测并播提示音。
+# 授权真失败时清除，触发下次重新引导。
+TAP_AUTH_MARKER="$(dirname "$CONFIG_FILE")/tap-authorized"
+
 KNOWN_MEETING_APPS="zoom.us|Microsoft Teams|TencentMeeting|Webex|Lark|Feishu|DingTalk|Slack"
 
 detect_meeting_apps() {
@@ -1193,6 +1198,23 @@ start_recording() {
     if [[ "$CFG_AUDIO_CAPTURE" == "tap" ]] || [[ "$CFG_AUDIO_CAPTURE" == "auto" ]]; then
         if [[ -x "$TAP_TOOL" ]] && "$TAP_TOOL" tap-supported &>/dev/null; then
             use_tap=true
+            # 首次授权自检（惰性）：系统支持 Tap，但宿主终端可能缺「系统录音」授权，
+            # 授权未生效会静默录到全零。已通过授权的持久标记存在则直接信任、零开销；
+            # 否则做一次 2 秒实测——静音则就地引导授权，避免用户开完会才发现录了个寂寞。
+            if [[ ! -f "$TAP_AUTH_MARKER" ]]; then
+                _t SETUP_TAP_PROBING
+                if tap_probe "$TAP_TOOL"; then
+                    _t SETUP_TAP_OK
+                    mark_tap_authorized
+                elif tap_authorize_guide "$TAP_TOOL"; then
+                    mark_tap_authorized
+                else
+                    # 引导后仍静音：本次不硬走 Tap（否则录全静音），如实提示回退方式后中止。
+                    # 用户可按提示授权后重跑，或把 audio_capture 改为 blackhole 应急。
+                    _t SETUP_TAP_FALLBACK_NOTE
+                    exit 1
+                fi
+            fi
         fi
     fi
 
@@ -1685,37 +1707,34 @@ setup_wemeet() {
     _t SETUP_WEMEET_DONE
 }
 
-# Process Tap 授权检测与引导。
+# 写入授权已通过的持久标记（顺带保证配置目录存在，覆盖模板缺失等边缘情况）。
+mark_tap_authorized() {
+    mkdir -p "$(dirname "$TAP_AUTH_MARKER")" 2>/dev/null
+    touch "$TAP_AUTH_MARKER" 2>/dev/null
+}
+
+# Process Tap 静音自测：后台播提示音，tap 录 2 秒，检查捕获是否全零。
+# 返回 0=有信号（授权正常），1=全静音（宿主终端缺系统录音授权）。
+# 顶层函数，供 setup（授权引导）与 start（首次惰性自检）共用。
+# 参数：$1 = audio-tap 工具路径。
+tap_probe() {
+    local tap_tool="$1"
+    mkdir -p "$STATE_DIR"
+    local pcm="$STATE_DIR/tap-probe.pcm"
+    ( sleep 0.6 && afplay /System/Library/Sounds/Glass.aiff ) &>/dev/null &
+    "$tap_tool" tap-start --duration 2 > "$pcm" 2>/dev/null
+    # 全零检测：删除所有 0x00 后剩余字节数 >0 即有信号。
+    # 不能用 head -c1|grep .（首个非零字节若是 0x0A 换行会被 grep 误判为空）
+    [[ "$(LC_ALL=C tr -d '\0' < "$pcm" | wc -c)" -gt 0 ]] && return 0
+    return 1
+}
+
+# 全零 → 引导用户在系统设置里为终端 App 添加系统录音授权，并复测一次。
 # macOS 的 TCC 对系统音频捕获有个陷阱：宿主终端 App（如 Ghostty）若未声明
-# NSAudioCaptureUsageDescription，授权框永远不弹、tap 静默输出全零——
-# 用户毫无感知。所以 setup 必须主动做「录 2 秒 + 播提示音 + 验非零」的实测，
-# 全零则引导用户去系统设置手动添加终端 App，再复测确认。
-setup_tap() {
-    local TAP_TOOL="$SCRIPT_DIR/audio-tap"
-
-    if [[ ! -x "$TAP_TOOL" ]] || ! "$TAP_TOOL" tap-supported &>/dev/null; then
-        _t SETUP_TAP_UNSUPPORTED
-        return 0   # 不支持则走 BlackHole，不算 setup 失败
-    fi
-
-    # 静音自测：后台播提示音，tap 录 2 秒，检查是否全零
-    _tap_probe() {
-        local pcm="$STATE_DIR/tap-probe.pcm"
-        ( sleep 0.6 && afplay /System/Library/Sounds/Glass.aiff ) &>/dev/null &
-        "$TAP_TOOL" tap-start --duration 2 > "$pcm" 2>/dev/null
-        # 全零检测：删除所有 0x00 后剩余字节数 >0 即有信号。
-        # 不能用 head -c1|grep .（首个非零字节若是 0x0A 换行会被 grep 误判为空）
-        [[ "$(LC_ALL=C tr -d '\0' < "$pcm" | wc -c)" -gt 0 ]] && return 0
-        return 1
-    }
-
-    _t SETUP_TAP_PROBING
-    if _tap_probe; then
-        _t SETUP_TAP_OK
-        return 0
-    fi
-
-    # 全零 → 引导授权
+# NSAudioCaptureUsageDescription，授权框永远不弹、tap 静默输出全零——用户毫无感知。
+# 返回 0=复测通过，1=仍静音。参数：$1 = audio-tap 工具路径。
+tap_authorize_guide() {
+    local tap_tool="$1"
     echo ""
     _t SETUP_TAP_SILENT_HEADER
     _t SETUP_TAP_SILENT_WHY
@@ -1729,13 +1748,42 @@ setup_tap() {
 
     # 复测（授权改动可能要求重启终端才生效，复测失败时如实告知）
     _t SETUP_TAP_PROBING
-    if _tap_probe; then
+    if tap_probe "$tap_tool"; then
         _t SETUP_TAP_OK
-    else
-        _t SETUP_TAP_STILL_SILENT
-        _t SETUP_TAP_FALLBACK_NOTE
+        return 0
     fi
-    return 0
+    _t SETUP_TAP_STILL_SILENT
+    return 1
+}
+
+# setup 中的 Process Tap 授权检测与引导。
+# 返回 0=Tap 可用（授权已通过），1=不可用（不支持或授权失败，需走 BlackHole）。
+# 通过时写持久标记 TAP_AUTH_MARKER，让后续 meetap start 直接信任、跳过自测。
+setup_tap() {
+    local TAP_TOOL="$SCRIPT_DIR/audio-tap"
+
+    if [[ ! -x "$TAP_TOOL" ]] || ! "$TAP_TOOL" tap-supported &>/dev/null; then
+        _t SETUP_TAP_UNSUPPORTED
+        rm -f "$TAP_AUTH_MARKER"
+        return 1   # 不支持 → 走 BlackHole
+    fi
+
+    _t SETUP_TAP_PROBING
+    if tap_probe "$TAP_TOOL"; then
+        _t SETUP_TAP_OK
+        mark_tap_authorized
+        return 0
+    fi
+
+    if tap_authorize_guide "$TAP_TOOL"; then
+        mark_tap_authorized
+        return 0
+    fi
+
+    # 授权真失败：清除标记，触发下次重新引导
+    rm -f "$TAP_AUTH_MARKER"
+    _t SETUP_TAP_FALLBACK_NOTE
+    return 1
 }
 
 setup_apps() {
@@ -1744,25 +1792,43 @@ setup_apps() {
     _t SETUP_HEADER
     echo ""
 
-    _t SETUP_STEP_TAP
-    _t SETUP_DIVIDER
-    setup_tap
-    echo ""
+    # 判定实际采集路径决定是否需要配置会议 App 扬声器：
+    #   - 配置强制 blackhole，或 Tap 不支持/未授权 → 走 BlackHole，需逐个配置会议 App；
+    #   - 否则走 Process Tap，采集整个系统混音，与会议 App 扬声器无关，跳过这些步骤。
+    local use_blackhole=false
+    if [[ "$CFG_AUDIO_CAPTURE" == "blackhole" ]]; then
+        use_blackhole=true
+    else
+        _t SETUP_STEP_TAP
+        _t SETUP_DIVIDER
+        if setup_tap; then
+            use_blackhole=false
+        else
+            use_blackhole=true
+        fi
+        echo ""
+    fi
 
-    _t SETUP_STEP_ZOOM
-    _t SETUP_DIVIDER
-    setup_zoom
-    echo ""
+    if [[ "$use_blackhole" == "true" ]]; then
+        _t SETUP_STEP_ZOOM
+        _t SETUP_DIVIDER
+        setup_zoom
+        echo ""
 
-    _t SETUP_STEP_TEAMS
-    _t SETUP_DIVIDER
-    setup_teams
-    echo ""
+        _t SETUP_STEP_TEAMS
+        _t SETUP_DIVIDER
+        setup_teams
+        echo ""
 
-    _t SETUP_STEP_WEMEET
-    _t SETUP_DIVIDER
-    setup_wemeet
-    echo ""
+        _t SETUP_STEP_WEMEET
+        _t SETUP_DIVIDER
+        setup_wemeet
+        echo ""
+    else
+        # Tap 模式：会议 App 扬声器无关，跳过 Zoom / Teams / 腾讯会议配置
+        _t SETUP_APPS_TAP_SKIP
+        echo ""
+    fi
 
     _t SETUP_HEADER
     _t SETUP_ALL_DONE "$0"

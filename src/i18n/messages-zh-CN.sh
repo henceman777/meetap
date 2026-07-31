@@ -156,6 +156,7 @@ MSG_SETUP_STEP_ZOOM="【2/4】配置 Zoom"
 MSG_SETUP_STEP_TEAMS="【3/4】配置 Teams"
 MSG_SETUP_STEP_WEMEET="【4/4】配置腾讯会议"
 MSG_SETUP_DIVIDER="---"
+MSG_SETUP_APPS_TAP_SKIP="ℹ️  Process Tap 采集整个系统混音，与各会议 App 的扬声器设置无关，已跳过 Zoom / Teams / 腾讯会议配置"
 MSG_SETUP_ALL_DONE="✅ 配置完成！现在可以使用 %s start 录制会议了"
 MSG_SETUP_ALL_DONE_HINT="   此配置只需执行一次，除非你在 App 中手动改回。"
 
