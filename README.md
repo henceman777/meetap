@@ -343,28 +343,7 @@ flowchart TB
 
 **架构组成**（谁在哪、谁管什么）：
 
-```mermaid
-%%{init: {'flowchart': {'curve': 'basis'}}}%%
-flowchart LR
-    CLI["meetap CLI<br/>（本地 macOS，唯一控制面）"]
-
-    subgraph AWS["你的 AWS 账号"]
-        direction TB
-        S3["Amazon S3<br/><i>音频 + 转录结果的临时交换区</i>"]
-        TX["Amazon Transcribe<br/><i>语音转文字 + 说话人分离</i>"]
-        BR["Amazon Bedrock<br/><i>Claude / Nova / Llama…生成纪要</i>"]
-        SES["Amazon SES<br/><i>（可选）投递纪要邮件</i>"]
-    end
-
-    REC["收件人邮箱"]
-
-    CLI -->|put/get/delete| S3
-    CLI -->|start/get/delete job| TX
-    TX <-->|读音频、写结果| S3
-    CLI -->|ConverseStream| BR
-    CLI -.->|SendRawEmail| SES
-    SES -.-> REC
-```
+![image-20260731205319177](README.assets/image-20260731205319177.png)
 
 没有 VPC、没有集群、没有"我家的服务器"——4 个托管服务通过 SDK/CLI 直接调用。
 
