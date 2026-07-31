@@ -380,7 +380,6 @@ sequenceDiagram
 | 症状 | 原因 / 解决 |
 |---|---|
 | 首次 `start` 提示无系统音频权限 / 录音全静音 | 运行 `meetap setup` 完成 Process Tap 授权；或在系统设置 → 隐私与安全性 → 系统音频录制 中允许 |
-| `start` 后听不到会议声音（BlackHole 模式） | 先运行 `meetap stop`，再 `sudo killall coreaudiod`，等几秒后重试 |
 | 转录失败：`AWS credentials not configured` | 跑 `aws configure` 或检查 `AWS_PROFILE` |
 | 转录失败：`AccessDenied` / `ValidationException` | 确认账号已开通 Bedrock Model access，且 IAM 有 `bedrock:InvokeModelWithResponseStream` 权限 |
 | 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../log/meetap.log` 查看具体 AWS 报错 |
