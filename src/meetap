@@ -1198,23 +1198,10 @@ start_recording() {
     if [[ "$CFG_AUDIO_CAPTURE" == "tap" ]] || [[ "$CFG_AUDIO_CAPTURE" == "auto" ]]; then
         if [[ -x "$TAP_TOOL" ]] && "$TAP_TOOL" tap-supported &>/dev/null; then
             use_tap=true
-            # 首次授权自检（惰性）：系统支持 Tap，但宿主终端可能缺「系统录音」授权，
-            # 授权未生效会静默录到全零。已通过授权的持久标记存在则直接信任、零开销；
-            # 否则做一次 2 秒实测——静音则就地引导授权，避免用户开完会才发现录了个寂寞。
-            if [[ ! -f "$TAP_AUTH_MARKER" ]]; then
-                _t SETUP_TAP_PROBING
-                if tap_probe "$TAP_TOOL"; then
-                    _t SETUP_TAP_OK
-                    mark_tap_authorized
-                elif tap_authorize_guide "$TAP_TOOL"; then
-                    mark_tap_authorized
-                else
-                    # 引导后仍静音：本次不硬走 Tap（否则录全静音），如实提示回退方式后中止。
-                    # 用户可按提示授权后重跑，或把 audio_capture 改为 blackhole 应急。
-                    _t SETUP_TAP_FALLBACK_NOTE
-                    exit 1
-                fi
-            fi
+            # 授权自检由 meetap setup 负责（探测 + 引导 + 盖章）。start 只尊重结果：
+            # 若尚未确认过授权（无持久标记），录制前提醒跑一次 setup，但不探测、不播音、
+            # 不阻断——避免每次开录都做 2 秒实测 / 播提示音，保持 start 的轻量与静默。
+            [[ -f "$TAP_AUTH_MARKER" ]] || _t START_TAP_UNVERIFIED "$0"
         fi
     fi
 

@@ -84,6 +84,7 @@ MSG_FIELD_STOP_MANUAL="   自动停止: 关闭（手动 stop 结束）"
 MSG_FIELD_STOP_CMD="   停止录制: %s stop"
 MSG_FIELD_MAX_DURATION="   自动停止: %s 分钟后（约 %s）"
 MSG_ERR_FFMPEG_FAIL="❌ ffmpeg 启动失败:"
+MSG_START_TAP_UNVERIFIED="ℹ️  尚未确认系统音频录制授权，建议先跑一次 %s setup 完成授权自检，以免录到静音"
 MSG_ERR_BAD_DURATION="❌ 会议时长上限必须是正整数分钟: %s"
 MSG_ERR_UNKNOWN_OPTION="❌ 未知选项: %s"
 

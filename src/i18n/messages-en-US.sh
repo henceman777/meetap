@@ -83,6 +83,7 @@ MSG_FIELD_STOP_MANUAL="   Auto-stop: off (stop manually)"
 MSG_FIELD_STOP_CMD="   Stop recording: %s stop"
 MSG_FIELD_MAX_DURATION="   Auto-stop: in %s min (around %s)"
 MSG_ERR_FFMPEG_FAIL="❌ Failed to start ffmpeg:"
+MSG_START_TAP_UNVERIFIED="i  System audio recording permission not yet verified; run %s setup once to complete the permission check, otherwise you may record silence"
 MSG_ERR_BAD_DURATION="❌ Meeting time limit must be a positive integer (minutes): %s"
 MSG_ERR_UNKNOWN_OPTION="❌ Unknown option: %s"
 
