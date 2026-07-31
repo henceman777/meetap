@@ -95,7 +95,9 @@ final class MicRing {
             i += stride
         }
     }
-    func read(into out: inout [Float], _ n: Int) -> Int {
+    // 读入调用方预分配的裸指针缓冲（不接收 inout [Float]：实时 tap 回调里
+    // 用 Swift 数组会因 COW 检查/潜在分配而破坏实时安全，改用预分配 scratch）。
+    func read(into out: UnsafeMutablePointer<Float>, _ n: Int) -> Int {
         lock.lock(); defer { lock.unlock() }
         let take = min(n, count)
         for i in 0..<take {
@@ -218,6 +220,11 @@ final class TapCapture {
     private let ioQueue = DispatchQueue(label: "meetap.audio-tap.io")
     var micRing: MicRing? = nil  // --with-mic 时由 main 注入；tap 回调里混音
 
+    // 混音用 scratch buffer：在 start() 一次性预分配，实时回调里复用，
+    // 绝不在 IO 回调（实时线程）里 malloc/新建数组——那会引发音频 glitch。
+    private var micScratch: UnsafeMutablePointer<Float>?
+    private var micScratchCap = 0
+
     private(set) var sampleRate: Float64 = 0
     private(set) var channels: UInt32 = 1
 
@@ -288,6 +295,17 @@ final class TapCapture {
         }
         aggregateID = aggID
 
+        // 混音 scratch buffer 预分配：容量取 1 秒样本（sampleRate 帧），远大于
+        // 任一 IO buffer（通常几十毫秒）。回调里若 n 超容量则跳过混音（不分配）。
+        // 闭包外捕获为局部量，避免回调隐式捕获 self、也保证实时线程零分配。
+        if micRing != nil {
+            let cap = max(48000, Int(sampleRate))
+            micScratch = UnsafeMutablePointer<Float>.allocate(capacity: cap)
+            micScratchCap = cap
+        }
+        let scratch = micScratch
+        let scratchCap = micScratchCap
+
         // 4. IO proc：从回调拿 PCM，直接写 stdout。
         //    mono tap → 单 buffer Float32；管道写通常远快于实时音频速率，不会阻塞回调。
         var pid: AudioDeviceIOProcID?
@@ -315,13 +333,15 @@ final class TapCapture {
             meterLock.unlock()
 
             // --with-mic：tap 作主时钟，从 ring 取等量麦克风样本叠加（进程内混音，
-            // 借鉴 meetily pipeline；简单相加 + 削顶防爆音）
-            if let ring = ring {
-                var mic = [Float](repeating: 0, count: n)
-                let got = ring.read(into: &mic, n)
+            // 借鉴 meetily pipeline；简单相加 + 削顶防爆音）。
+            // 用预分配 scratch buffer（start() 里按 tap 首帧 n 分配），不在实时
+            // 回调里 malloc。若某帧 n 超出容量（极罕见），跳过混音只保系统音，
+            // 绝不触发实时线程分配。
+            if let ring = ring, let scratch = scratch, n <= scratchCap {
+                let got = ring.read(into: scratch, n)
                 if got > 0 {
                     for i in 0..<got {
-                        let mixed = fp[i] + mic[i]
+                        let mixed = fp[i] + scratch[i]
                         fp[i] = max(-1.0, min(1.0, mixed))
                     }
                 }
@@ -365,6 +385,11 @@ final class TapCapture {
         if tapID != kAudioObjectUnknown {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if let s = micScratch {
+            s.deallocate()
+            micScratch = nil
+            micScratchCap = 0
         }
     }
 }
@@ -488,6 +513,15 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     } catch {
         fputs("Error: \(error)\n", stderr)
         cleanupAndExit(1)
+    }
+
+    // 混音正确性前提：麦克风采样率必须与 tap 一致（ring buffer 按样本 1:1
+    // 叠加，不做重采样）。二者不等时混音会变速变调、ring 欠载/溢出断续。
+    // 目前 macOS 绝大多数输入/输出设备同为 48kHz，故不等极罕见；这里先告警
+    // 使其可观测，真出现再引入重采样（届时升采样场景线性插值即够）。
+    if let mic = activeMic, mic.sampleRate > 0, mic.sampleRate != capture.sampleRate {
+        fputs("WARNING: mic rate \(Int(mic.sampleRate)) != tap rate \(Int(capture.sampleRate)); "
+            + "mixing without resample will distort mic audio\n", stderr)
     }
 
     // 元信息走 stderr（stdout 只有 PCM 数据），供调用方构造 ffmpeg 参数
