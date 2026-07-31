@@ -461,23 +461,7 @@ sequenceDiagram
 > - **Bedrock**：ARN 锁在 `us-east-1`，换 region 或模型（Nova / Llama / DeepSeek 等）需同步调整。
 > - **SES**：把两处 `noreply@example.com` 换成你**已在 SES 验证**的发件地址，且 ARN 的 region 要与验证 region 一致（SES 按 region 独立验证）；验证整个域时改用域 identity ARN（`identity/example.com`）。**新账户默认 sandbox**，只能发给已验证地址，群发需先申请生产访问。
 
-**建议**：同时在 [AWS Budgets](https://console.aws.amazon.com/cost-management/home#/budgets) 设一个 $10/月 的告警，防止异常用量。
 
-
-
-## 附录 B：成本参考（us-east-1）
-
-| 服务 | 单价 | 30min 会议典型开销 |
-|---|---|---|
-| Transcribe (standard, async) | $0.024/min | ≈ $0.72 |
-| Bedrock Claude Sonnet | 按输入 / 输出 token 计价 | ≈ $0.01–0.05 |
-| S3 | 秒级存在 + 即删 | ≈ $0 |
-| SES | 前 62,000 封/月免费 | ≈ $0 |
-| **合计** | | **≈ $0.73–0.77** |
-
-换用 Nova / DeepSeek 等模型可进一步降低纪要生成成本，具体以 [Bedrock 当前定价](https://aws.amazon.com/bedrock/pricing/) 为准。
-
----
 
 
 
