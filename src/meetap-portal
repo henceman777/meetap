@@ -68,6 +68,17 @@ MEETING_WATCH_CONFIRM_TICKS = 2
 # 会议 App 的音频活动连续消失 N 个 tick（≈1 分钟）视为「上一场结束」，
 # 立即解除冷却——这样「忽略」的语义是「忽略这一场」，而不是「闭嘴半小时」。
 MEETING_WATCH_IDLE_CLEAR_TICKS = 4
+# any-audio 档确认「到底有没有在响」的阈值。不能借用 silence_threshold(-50)：
+# 采样测到的是过了系统音量之后的混音，实测本机音量 31 + 静音开启时，正在播放
+# 的声音只有 -66.8 dB，会被 -50 判成静音。地板实测 -91.0 dB，取 -75——距地板
+# 16 dB（挡住「流开着但不响」），距最弱实测真实信号 8 dB（不漏判）。
+MEETING_WATCH_ANY_AUDIO_THRESHOLD = -75
+# 排除自己：确认阶段每次都开一个 tap，audio-tap 自身会以 in=1 出现在进程枚举
+# 里（实测 `1 0 <pid> dev.meetap.audio-tap`）。不排除就会自我触发。
+MEETAP_OWN_BUNDLE = "dev.meetap.audio-tap"
+# 系统守护进程不算「App 出声」：mediaremoted / avconferenced / audiomxd 这些
+# 常驻进程挂在音频链路上，路径一律以这些前缀开头（实测 40 个进程里 22 个属此类）。
+SYSTEM_PATH_RE = re.compile(r"^/(usr|System|Library)/")
 
 # 纪要里若混入裸 HTML，CSP 负责挡住「执行」这一步（清洗负责挡结构破坏）。
 # img 允许 data: —— markdown 内嵌图片常用；connect-src 'self' 让页面内脚本
@@ -101,7 +112,8 @@ ENUM_KEYS = {
     "ai_backend": ("bedrock", "claude-code"),
     "visualizer": ("dot", "bar", "spectrum", "block"),
     "audio_capture": ("auto", "tap", "blackhole"),
-    "meeting_watch_trigger": ("app-audio", "app-mic", "system-audio", "app"),
+    "meeting_watch_trigger": ("app-audio", "app-mic", "any-audio",
+                               "system-audio", "app"),
     "meeting_watch_browser": ("", "Safari", "Google Chrome", "Microsoft Edge",
                                "Brave Browser", "Arc"),
 }
@@ -1225,7 +1237,51 @@ def _meeting_app_audio_io():
     return {"mic": frozenset(mic), "out": frozenset(out)}
 
 
-def _sample_system_audio_active():
+def _app_display_name(path):
+    """从可执行文件路径取用户认得的 App 名。取路径里第一个 .app 段，这样 helper
+    会归并到主 App：
+      /Applications/Slack.app/Contents/Frameworks/Slack Helper.app/… → Slack
+      /Applications/Microsoft Teams.app/Contents/Helpers/…ModuleHost → Microsoft Teams
+    没有 .app 段的（命令行程序，如 afplay）退回文件名。"""
+    m = re.match(r".*?/([^/]+)\.app/", path)
+    return m.group(1) if m else path.rsplit("/", 1)[-1]
+
+
+def _any_audio_output():
+    """哪些「非系统、非自己」的 App 正在做音频输出。返回 None 表示问不出来
+    （调用方须降级），否则返回 App 显示名集合；空集 = 已确认没有。
+
+    与 _meeting_app_audio_io() 的区别：那个用 MEETING_APPS_RE 白名单过滤 App
+    身份，这个完全不看身份，只滤掉「系统守护进程」和「MeeTap 自己」——这正是
+    any-audio 档的意义：覆盖不在白名单里的会议入口（WorkSpaces、浏览器里的
+    Google Meet、微信/QQ 语音）。"""
+    tap = audio_tap_bin()
+    if not tap:
+        return None
+    try:
+        p = subprocess.run([tap, "app-audio-state"], capture_output=True,
+                            text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None   # 含「装的是不认识这个子命令的旧二进制」，一样降级
+    names = set()
+    for line in p.stdout.splitlines():
+        f = line.split(None, 4)      # 路径含空格放最后；空值由 Swift 侧写 "-"
+        if len(f) != 5:
+            continue
+        _in_flag, out_flag, _pid, bundle, path = f
+        if out_flag != "1":
+            continue                 # 只看输出；麦克风归 app-audio/app-mic 管
+        if bundle == MEETAP_OWN_BUNDLE:
+            continue                 # 别把自己的确认采样当成别人在出声
+        if SYSTEM_PATH_RE.match(path):
+            continue                 # mediaremoted / avconferenced / …
+        names.add(_app_display_name(path))
+    return frozenset(names)
+
+
+def _sample_system_audio_active(threshold=None):
     """短时采样系统音频判断是否有输出（非静音）。返回 True/False/None——
     None 表示当前系统不支持 Process Tap，调用方应降级为仅按 App 判断。
     不切换系统输出设备（BlackHole 那条路需要切换，对静默后台检测是干扰，
@@ -1233,7 +1289,10 @@ def _sample_system_audio_active():
 
     注意：这已不再是主判据，而是 _meeting_app_audio_io() 拿不到结果时的
     fallback（以及 meeting_watch_trigger=system-audio 时的显式选择）。别把它
-    当成「快路径」优化掉——macOS 14 以下只剩这一级，删了就只能靠 App 在不在。"""
+    当成「快路径」优化掉——macOS 14 以下只剩这一级，删了就只能靠 App 在不在。
+
+    threshold 留空时用 silence_threshold（system-audio 档的原有口径，不要改）；
+    any-audio 档传 MEETING_WATCH_ANY_AUDIO_THRESHOLD，理由见该常量注释。"""
     tap = audio_tap_bin()
     if not tap:
         return None
@@ -1266,17 +1325,37 @@ def _sample_system_audio_active():
         peak = float(parts[0])
     except ValueError:
         return None
-    threshold = int(cfg_get("silence_threshold", "-50") or "-50")
+    if threshold is None:
+        threshold = int(cfg_get("silence_threshold", "-50") or "-50")
     return peak > threshold
 
 
-def _meeting_watch_trigger(running_apps):
+def _meeting_watch_trigger(running_apps, mode):
     """按 meeting_watch_trigger 配置逐级判断是否该提示，返回 (apps, reason)
     或 None（本 tick 不提示）。reason 只用来决定弹窗文案。
+    mode 由调用方读一次传进来，避免和 tick 里那次读取之间出现口径不一致。
 
     降级链（每一级判不出来就掉到下一级，最坏退回本次改动前的行为）：
-      会议 App 的进程音频 IO → 系统音采样 → 只看 App 在不在。"""
-    mode = cfg_get("meeting_watch_trigger", "app-audio") or "app-audio"
+      会议 App 的进程音频 IO → 系统音采样 → 只看 App 在不在。
+    any-audio 是独立的一档，不走这条链（它不看 App 身份）。"""
+    # any-audio：任何非系统 App 在出声就算。必须在这里直接 return，不能落进
+    # 下面那条以「已知会议 App」为前提的降级链。
+    if mode == "any-audio":
+        apps = _any_audio_output()
+        if apps is None:
+            _mw_debug("app-audio-state 不可用，any-audio 降级到系统音采样")
+            # 老系统上退回「系统输出非静音」，但仍不要求会议 App 在跑
+            if _sample_system_audio_active() is True:
+                return (running_apps or frozenset(["未知应用"])), "system"
+            return None
+        if not apps:
+            return None            # 已确认：没有任何 App 在出声
+        # 第二级：流开着不代表在响（实测 WorkSpaces out=1 而系统电平 -91 dB）。
+        # 采样返回 None（不支持 tap）时放行——问不出来不该把整档判死。
+        if _sample_system_audio_active(MEETING_WATCH_ANY_AUDIO_THRESHOLD) is False:
+            _mw_debug("有输出流但实测静音，跳过：%s" % sorted(apps))
+            return None
+        return apps, "any"
 
     if mode in ("app-audio", "app-mic"):
         st = _meeting_app_audio_io()
@@ -1309,6 +1388,7 @@ _MEETING_WATCH_REASON_TEXT = {
     "both":   "正在通话（麦克风与扬声器都在用）",
     "mic":    "已打开麦克风",            # 自己发起的会议：只有麦克风有活动
     "out":    "正在播放声音",
+    "any":    "正在播放声音",            # any-audio 档：不限 App 身份，措辞同 out
     "system": "正在播放系统声音",        # 降级口径：只知道系统有声，不知道是谁
     "app":    "正在运行",                # 最弱口径：只看到 App 起着
 }
@@ -1356,13 +1436,17 @@ def _meeting_watch_tick(portal_url):
     if pid_alive("ffmpeg.pid"):
         return   # 已经在录制，不需要再问
 
+    mode = cfg_get("meeting_watch_trigger", "app-audio") or "app-audio"
     running = detect_meeting_apps_py()      # 便宜的第一道闸：一个 ps
-    if not running:
+    # any-audio 必须绕开这道闸：它不看 App 身份，正是为了覆盖「没有已知会议 App
+    # 在跑」的场景（浏览器里的 Google Meet、WorkSpaces）。其余各档都以「有会议
+    # App」为前提，早退能省下后面的进程枚举和 2 秒采样。
+    if not running and mode != "any-audio":
         _meeting_watch_cooldown["until"] = 0.0   # 会议 App 全退出，冷却立即失效
         _meeting_watch_pending["ticks"] = 0
         return
 
-    trig = _meeting_watch_trigger(running)
+    trig = _meeting_watch_trigger(running, mode)
     if trig is None:
         _meeting_watch_pending["ticks"] = 0
         _meeting_watch_cooldown["idle"] += 1

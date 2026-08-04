@@ -64,8 +64,9 @@ portal_port = 8787
 # Meeting auto-detect (only runs while `meetap portal` is running): watches for
 # known meeting apps (Zoom/Teams/TencentMeeting/Webex/Lark/DingTalk/Slack) that
 # are actually using audio, then pops a native macOS dialog asking whether to
-# start recording. Off by default — this is an interruptive system dialog, opt in
-# deliberately. (true/false)
+# start recording. (The any-audio trigger below is the exception: it ignores app
+# identity entirely.) Off by default — this is an interruptive system dialog, opt
+# in deliberately. (true/false)
 meeting_watch = false
 # What counts as "a meeting is happening":
 #   app-audio    (default) the meeting app has the mic open OR is playing audio.
@@ -73,11 +74,22 @@ meeting_watch = false
 #                system output stays silent until someone else joins).
 #   app-mic      mic only — use this if some app holds an output stream open
 #                permanently and keeps triggering the prompt.
+#   any-audio    ANY app is playing audio — not limited to the meeting apps
+#                above. Catches meetings this tool doesn't know about (Amazon
+#                WorkSpaces/Chime, Google Meet in a browser, WeChat/QQ voice).
+#                Two-stage: checks which processes hold an output stream, then
+#                samples 2s to confirm sound is actually audible (a stream being
+#                open does not mean sound is coming out). System daemons and
+#                MeeTap itself are excluded.
+#                Loudest audio-based setting: watching YouTube or playing music
+#                WILL prompt. The 2-consecutive-tick debounce and 30-min
+#                cooldown keep that to a single dialog you dismiss.
 #   system-audio meeting app running AND non-silent system output. Misses
 #                meetings you host; samples 2s of system audio every 15s.
-#   app          meeting app merely running. Loudest setting.
-# app-audio/app-mic need macOS 14+; otherwise it falls back to system-audio and
-# then to app automatically.
+#   app          meeting app merely running — no audio check at all.
+# app-audio/app-mic/any-audio need macOS 14+; otherwise app-audio/app-mic fall
+# back to system-audio and then to app, and any-audio falls back to "system
+# output is not silent" (still without requiring a meeting app).
 # Expected prompts you may still see (all gated behind your confirmation, with a
 # 30-min cooldown after you ignore one): Slack huddles, a Zoom waiting room, and
 # "Test Speaker & Microphone" — in all of these the mic genuinely is open.
