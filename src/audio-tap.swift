@@ -1,5 +1,6 @@
 import AudioToolbox
 import CoreAudio
+import Darwin
 import Foundation
 
 // meetap audio-tap — 基于 macOS 14.4+ Core Audio Process Tap 的系统音频旁路捕获
@@ -10,6 +11,7 @@ import Foundation
 //   tap-rate                  打印默认输出设备标称采样率（整数 Hz，tap 采样率跟随此设备）
 //   tap-start [--duration N]  捕获系统音频，Float32 LE mono PCM 写 stdout
 //                             ffmpeg 读法: ffmpeg -f f32le -ar <rate> -ac 1 -i pipe:0 ...
+//   app-audio-state [--all]   列出正在做音频 IO 的进程（会议自动检测用，不建 tap 不弹权限框）
 //
 // tap-start 启动后 stderr 输出 "SAMPLE_RATE=<rate>" 等元信息（数据只走 stdout）。
 // SIGINT/SIGTERM 时显式销毁 aggregate device 与 tap（防止残留设备出现在音频 MIDI 设置）。
@@ -53,6 +55,80 @@ func nominalSampleRate(_ id: AudioDeviceID) -> Float64? {
     var size = UInt32(MemoryLayout<Float64>.size)
     guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &rate) == noErr else { return nil }
     return rate
+}
+
+// MARK: - 进程音频状态（CoreAudio Process 对象，macOS 14+）
+
+// 与 Process Tap 是两套东西：这里只「读属性」，不建 tap、不采样，
+// 因此不触发 TCC 系统音频授权框（tap 那条路会弹，见文件头权限说明），
+// 单次枚举实测约 0.2s，可以放心 15s 轮询一次。
+
+func processObjectList() -> [AudioObjectID]? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr,
+        size > 0 else { return nil }
+    var objs = [AudioObjectID](repeating: 0,
+        count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &objs) == noErr
+        else { return nil }
+    return objs
+}
+
+// 返回 nil 与返回 0 语义不同：nil = 这套属性在本系统上问不出来（老系统），
+// 调用方靠它判断整个判据是否可信；0 = 确认没有 IO。
+func processFlag(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector) -> UInt32? {
+    var addr = AudioObjectPropertyAddress(mSelector: sel,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectHasProperty(obj, &addr) else { return nil }
+    var v: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &v) == noErr else { return nil }
+    return v
+}
+
+func processPID(_ obj: AudioObjectID) -> pid_t? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyPID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var v: pid_t = 0
+    var size = UInt32(MemoryLayout<pid_t>.size)
+    guard AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &v) == noErr else { return nil }
+    return v
+}
+
+func processBundleID(_ obj: AudioObjectID) -> String {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyBundleID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    // 文档明确 caller 负责 release：用 Unmanaged 接，takeRetainedValue 平掉 +1。
+    // 直接用 CFString? 接会吃一个 Swift 内存管理警告。
+    var raw: Unmanaged<CFString>? = nil
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let st = withUnsafeMutablePointer(to: &raw) {
+        AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, $0)
+    }
+    guard st == noErr, let u = raw else { return "-" }
+    let s = u.takeRetainedValue() as String
+    return s.isEmpty ? "-" : s
+}
+
+func processExecPath(_ pid: pid_t) -> String {
+    // 会议 App 用 helper 进程做音频（Slack Helper / Teams WebView / Lark Helper），
+    // 光看 bundleID 认不出来（com.microsoft.teams2 里没有 "Microsoft Teams"），
+    // 所以必须给出可执行文件路径，让调用方用同一份 App 正则去匹配。
+    var buf = [CChar](repeating: 0, count: 4096)
+    let n = buf.withUnsafeMutableBytes { proc_pidpath(pid, $0.baseAddress, UInt32($0.count)) }
+    guard n > 0 else { return "-" }   // 别人家的进程可能 EPERM，不算错误
+    return String(cString: buf)
 }
 
 // MARK: - stdout 写入（IO 回调线程内直接 write；管道 64KB 缓冲足够容纳数秒音频）
@@ -216,6 +292,7 @@ final class TapCapture {
     private var running = false
     private let ioQueue = DispatchQueue(label: "meetap.audio-tap.io")
     var micRing: MicRing? = nil  // --with-mic 时由 main 注入；tap 回调里混音
+    var micSampleRate: Float64 = 0  // 麦克风标称采样率；与 tap 采样率不同时需重采样对齐
 
     private(set) var sampleRate: Float64 = 0
     private(set) var channels: UInt32 = 1
@@ -291,6 +368,13 @@ final class TapCapture {
         //    mono tap → 单 buffer Float32；管道写通常远快于实时音频速率，不会阻塞回调。
         var pid: AudioDeviceIOProcID?
         let ring = micRing
+        // 麦克风与 tap 标称采样率可能不一致（且会在不同会话间波动，例如
+        // 24000 vs 48000）：ring 只搬字节不感知采样率，若直接等量读取相加，
+        // 混入的麦克风人声会按错误时间轴对齐，听感糊/断续。这里预先算好
+        // 比例，混音时按比例线性插值把麦克风采样对齐到 tap 的时钟上。
+        let micRatio: Double = (ring != nil && micSampleRate > 0 && sampleRate > 0)
+            ? micSampleRate / sampleRate : 1.0
+        var micScratch: [Float] = []
         st = AudioDeviceCreateIOProcIDWithBlock(&pid, aggregateID, ioQueue) {
             _, inInputData, _, _, _ in
             let abl = UnsafeMutableAudioBufferListPointer(
@@ -313,15 +397,26 @@ final class TapCapture {
             meterSumSq += sumsq; meterCount += n
             meterLock.unlock()
 
-            // --with-mic：tap 作主时钟，从 ring 取等量麦克风样本叠加（进程内混音，
-            // 借鉴 meetily pipeline；简单相加 + 削顶防爆音）
+            // --with-mic：tap 作主时钟，从 ring 按 micRatio 线性插值取出与 tap
+            // 时钟对齐的麦克风样本叠加（进程内混音；相加 + 削顶防爆音）。
+            // micRatio == 1 时插值退化为逐样本直取，等价于原直接相加逻辑。
             if let ring = ring {
-                var mic = [Float](repeating: 0, count: n)
-                let got = ring.read(into: &mic, n)
+                let need = Int((Double(n) * micRatio).rounded(.up)) + 1
+                if micScratch.count < need {
+                    micScratch = [Float](repeating: 0, count: need)
+                }
+                let got = ring.read(into: &micScratch, need)
                 if got > 0 {
-                    for i in 0..<got {
-                        let mixed = fp[i] + mic[i]
-                        fp[i] = max(-1.0, min(1.0, mixed))
+                    // usable：ring 欠载（got < need）时按实际能覆盖的插值范围
+                    // 裁剪输出样本数，避免对超出数据范围的尾部做错误外插。
+                    let usable = min(n, Int(Double(got - 1) / micRatio) + 1)
+                    for i in 0..<usable {
+                        let srcPos = Double(i) * micRatio
+                        let idx0 = min(Int(srcPos), got - 1)
+                        let idx1 = min(idx0 + 1, got - 1)
+                        let frac = Float(srcPos - Double(idx0))
+                        let sample = micScratch[idx0] * (1 - frac) + micScratch[idx1] * frac
+                        fp[i] = max(-1.0, min(1.0, fp[i] + sample))
                     }
                 }
             }
@@ -403,11 +498,80 @@ func runTapSupported() -> Never {
 }
 
 func runTapRate() -> Never {
-    guard let dev = defaultOutputDevice(), let rate = nominalSampleRate(dev) else {
+    guard let outDev = defaultOutputDevice() else {
+        fputs("Error: cannot get default output device\n", stderr)
+        exit(1)
+    }
+    // 输出设备「标称采样率」不总等于 Process Tap 实际协商到的采样率
+    // （二者曾在同一台机器上分别读到 24000 / 48000，导致 tap-start
+    // 真实吐出的 PCM 与这里报给 ffmpeg -ar 的值不一致，录音整体变速/变调）。
+    // 因此优先临时建一个 tap，直接读 kAudioTapPropertyFormat——与
+    // TapCapture.start() 的 readTapFormat() 同源，用完立即销毁。
+    if #available(macOS 14.4, *) {
+        let desc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
+        desc.isPrivate = true
+        var tid = AudioObjectID(kAudioObjectUnknown)
+        if AudioHardwareCreateProcessTap(desc, &tid) == noErr, tid != kAudioObjectUnknown {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioTapPropertyFormat,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var asbd = AudioStreamBasicDescription()
+            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            let ok = AudioObjectGetPropertyData(tid, &addr, 0, nil, &size, &asbd) == noErr
+                && asbd.mSampleRate > 0
+            let rate = ok ? asbd.mSampleRate : (nominalSampleRate(outDev) ?? 48000)
+            AudioHardwareDestroyProcessTap(tid)
+            print(Int(rate))
+            exit(0)
+        }
+    }
+    guard let rate = nominalSampleRate(outDev) else {
         fputs("Error: cannot get default output device sample rate\n", stderr)
         exit(1)
     }
     print(Int(rate))
+    exit(0)
+}
+
+// 每个正在做音频 IO 的进程输出一行「<in> <out> <pid> <bundleID> <可执行文件路径>」。
+// 路径含空格所以放最后；bundleID/路径取不到时写 "-"，否则字段会错位（调用方按
+// 固定 5 段解析）。
+//
+// 退出码是这个子命令的关键契约：
+//   0 = 结果可信（stdout 为空表示「已确认没有进程在做音频 IO」）
+//   1 = 无法判断，调用方必须降级到别的判据
+func runAppAudioState(all: Bool) -> Never {
+    // 守卫 ①：版本下限。Process 对象的 piri/piro 是 macOS 14 才有的。
+    let v = ProcessInfo.processInfo.operatingSystemVersion
+    guard v.majorVersion >= 14 else {
+        fputs("unsupported: macOS \(v.majorVersion) < 14\n", stderr)
+        exit(1)
+    }
+    // 守卫 ②：拿不到进程列表 → 无法判断
+    guard let objs = processObjectList(), !objs.isEmpty else {
+        fputs("unsupported: cannot read process object list\n", stderr)
+        exit(1)
+    }
+    var answered = 0
+    var lines: [String] = []
+    for o in objs {
+        let inFlag = processFlag(o, kAudioProcessPropertyIsRunningInput)
+        let outFlag = processFlag(o, kAudioProcessPropertyIsRunningOutput)
+        if inFlag != nil || outFlag != nil { answered += 1 }
+        let i = inFlag ?? 0, ou = outFlag ?? 0
+        guard all || i == 1 || ou == 1 else { continue }
+        guard let pid = processPID(o) else { continue }
+        lines.append("\(i) \(ou) \(pid) \(processBundleID(o)) \(processExecPath(pid))")
+    }
+    // 守卫 ③：一个进程都答不出 piri/piro，说明这套属性在本系统上不可用。
+    // 此时若照常 exit 0 输出空，调用方会把「查不到」误当成「确认没有音频活动」，
+    // 整个检测会静默失效——必须报 1 让它降级。
+    guard answered > 0 else {
+        fputs("unsupported: process IO-state properties unavailable\n", stderr)
+        exit(1)
+    }
+    for line in lines { print(line) }
     exit(0)
 }
 
@@ -432,6 +596,7 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
             try mic.start()
             activeMic = mic
             capture.micRing = mic.ring
+            capture.micSampleRate = mic.sampleRate
             fputs("MIC=on rate=\(Int(mic.sampleRate))\n", stderr)
         } catch {
             fputs("MIC=off (\(error))\n", stderr)
@@ -514,6 +679,11 @@ guard let cmd = args.first else {
                                 捕获系统音频，Float32 LE mono PCM 写 stdout
                                 --level-file: 每 0.4s 写当前电平(dBFS)到文件，
                                 供波形显示读取（SIGINT/SIGTERM 停止并清理）
+      app-audio-state [--all]   列出正在做音频 IO 的进程，每行
+                                "<in> <out> <pid> <bundleID> <可执行文件路径>"
+                                exit 0 = 结果可信（空输出=确认无活动）
+                                exit 1 = 无法判断，调用方须降级
+                                --all: 不过滤，列出全部进程（排查用）
 
     """, stderr)
     exit(1)
@@ -524,6 +694,16 @@ case "tap-supported":
     runTapSupported()
 case "tap-rate":
     runTapRate()
+case "app-audio-state":
+    var all = false
+    for a in args.dropFirst() {
+        guard a == "--all" else {
+            fputs("Usage: app-audio-state [--all]\n", stderr)
+            exit(1)
+        }
+        all = true
+    }
+    runAppAudioState(all: all)
 case "tap-start":
     var duration: Double? = nil
     var levelFile: String? = nil

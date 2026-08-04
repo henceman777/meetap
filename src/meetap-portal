@@ -1,0 +1,1460 @@
+#!/usr/bin/env python3
+# MeeTap Web Portal —— 本机 web 控制台
+#
+# 设计约束（改动前务必先读）:
+#   1. 只绑 127.0.0.1，不做鉴权。绑本机只挡住网络层，浏览器仍可能被外部页面
+#      利用，所以 Host 头校验 + Origin 拒绝 + 写操作自定义头三件套一个都不能省。
+#   2. 不改 src/meetap 的既有函数。状态全部直读 /tmp/meeting-record/ 与
+#      ~/Record/，portal 与 CLI 天然同源——终端敲 meetap stop，网页 1s 内自己
+#      转空闲，不需要任何同步机制。
+#   3. subprocess 一律 list 传参、shell=False。会议名等用户输入绝不拼命令行。
+#   4. meetap again 是前台阻塞的（src/meetap:1155,1165 调 summarize_transcript
+#      没有 &），会跑几十秒到几分钟——必须扔进后台线程，不能在请求处理里等。
+#   5. 只用标准库（markdown 库除外，venv 里已有）。不新增 pip 依赖。
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
+
+VERSION = "1.0.0"
+STATE_DIR = "/tmp/meeting-record"
+
+# 请求体上限：config 更新就是几百字节，1MB 已经宽松到离谱
+BODY_LIMIT = 1_000_000
+# 排空上限。排空的目的只是让 keep-alive 连接对齐，而合法请求体本来就很小；
+# 超过这个量直接断连，绝不为了「对齐」去读一个巨大的体 —— 否则客户端只要
+# 声明一个大 Content-Length 再不发数据，就能把工作线程钉死在 read 上。
+DRAIN_LIMIT = BODY_LIMIT
+
+# 转录原文读取上限：纯防御性兜底，build_prompt 自己喂给 LLM 时已在 120k
+# 字符处截断（预算考量），这里给浏览器读原文用，正常不指望触发。
+TRANSCRIPT_MAX_BYTES = 5_000_000
+
+# 会议资料上传：build_prompt (src/meetap:634-636) 只认识这几种扩展名，
+# 传别的它会静默忽略——上传时就拒绝，比让用户上传后石沉大海更诚实。
+ALLOWED_MATERIAL_EXTS = frozenset((
+    "md", "txt", "markdown", "pdf", "docx", "doc", "rtf", "html", "htm",
+))
+# 单文件上限：PPT 导出的 PDF/docx 通常几 MB，20MB 留足余量，同时把内存/
+# 磁盘占用的坏情况钉死在有限范围内。
+MATERIAL_MAX_BYTES = 20_000_000
+# 补充要求：build_prompt 对它不截断（不同于 materials 的 30k/60k 截断），
+# 所以在入口处自己设限，防止一次粘贴把 prompt 撑爆。
+EXTRA_REQ_MAX_CHARS = 20_000
+
+# 会议自动检测：与 src/meetap:177 的 KNOWN_MEETING_APPS 保持一致（bash 侧
+# 那份是死代码，从未被调用，本次不动；这里是 portal 独立复用同一份 App
+# 列表）。新增受支持的会议 App 时两处都要同步更新。
+MEETING_APPS_RE = re.compile(
+    r"zoom\.us|Microsoft Teams|TencentMeeting|Webex|Lark|Feishu|DingTalk|Slack")
+MEETING_WATCH_INTERVAL = 15    # 轮询间隔（秒）
+MEETING_WATCH_COOLDOWN = 1800  # 用户忽略/未响应后的冷却时长（秒）
+# 系统音频采样时长，与 setup_tap:1725 的探测时长一致。只有降级到
+# meeting_watch_trigger=system-audio 这一级才会用到（见 _meeting_watch_trigger）。
+MEETING_WATCH_SAMPLE_SECONDS = 2
+# 弹窗前要求连续 N 个 tick 都命中，才认为「真的在开会」。
+# 一声 Slack 通知音只有 1~2 秒，隔 15s 采两次几乎不可能都撞上；
+# 而真会议的音频 IO 会连续好几分钟。代价是提示最多晚 15s 出现。
+MEETING_WATCH_CONFIRM_TICKS = 2
+# 会议 App 的音频活动连续消失 N 个 tick（≈1 分钟）视为「上一场结束」，
+# 立即解除冷却——这样「忽略」的语义是「忽略这一场」，而不是「闭嘴半小时」。
+MEETING_WATCH_IDLE_CLEAR_TICKS = 4
+
+# 纪要里若混入裸 HTML，CSP 负责挡住「执行」这一步（清洗负责挡结构破坏）。
+# img 允许 data: —— markdown 内嵌图片常用；connect-src 'self' 让页面内脚本
+# 即便被注入也无法把纪要内容发到外部域。
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
+       "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+# 与 src/meetap:71-89 的 load_config case 一一对应。PUT /api/config 只接受这些键。
+# 新增配置项时这里和 src/meetap 必须同步。
+# 例外：meeting_watch/meeting_watch_trigger/meeting_watch_browser 只被 portal
+# 自己的会议检测后台线程读取，src/meetap 的 bash 侧 load_config 不认识这几个键
+# 也无妨——bash 那边的 case 语句没有默认分支，未知键静默忽略，不会报错。
+CONFIG_KEYS = (
+    "region", "language", "model", "transcribe_languages", "recording_dir",
+    "max_speakers", "silence_threshold", "silence_grace", "mic_threshold",
+    "audio_bitrate", "multi_language", "ai_backend", "visualizer",
+    "audio_persist", "audio_capture", "email", "email_sender", "portal_port",
+    "meeting_watch", "meeting_watch_trigger", "meeting_watch_browser",
+)
+
+# 数值型键：PUT 时校验必须是整数，挡住把 silence_grace 写成字符串导致
+# bash 侧 (( )) 算术比较炸掉的情况。
+NUMERIC_KEYS = frozenset((
+    "max_speakers", "silence_threshold", "silence_grace",
+    "mic_threshold", "portal_port",
+))
+BOOL_KEYS = frozenset(("multi_language", "audio_persist", "meeting_watch"))
+ENUM_KEYS = {
+    "language": ("en-US", "zh-CN"),
+    "ai_backend": ("bedrock", "claude-code"),
+    "visualizer": ("dot", "bar", "spectrum", "block"),
+    "audio_capture": ("auto", "tap", "blackhole"),
+    "meeting_watch_trigger": ("app-audio", "app-mic", "system-audio", "app"),
+    "meeting_watch_browser": ("", "Safari", "Google Chrome", "Microsoft Edge",
+                               "Brave Browser", "Arc"),
+}
+
+
+def script_dir():
+    """解析 symlink 后的安装目录，与 src/meetap:27 的 SCRIPT_DIR 语义一致。"""
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def find_static_dir():
+    """多安装布局查找静态资源，照抄 find_config_template:31 的候选数组写法。"""
+    sd = script_dir()
+    for p in (
+        os.path.join(sd, "..", "share", "meetap", "portal"),   # dev 源码树 / 标准 prefix
+        os.path.join(sd, "share", "meetap", "portal"),         # make install (PREFIX=~/bin)
+        "/opt/homebrew/share/meetap/portal",
+        "/usr/local/share/meetap/portal",
+    ):
+        if os.path.isdir(p):
+            return os.path.realpath(p)
+    return None
+
+
+def meetap_bin():
+    """定位 meetap 主脚本：优先同目录（install 后平铺），否则 dev 树。"""
+    sd = script_dir()
+    for p in (os.path.join(sd, "meetap"), os.path.join(sd, "..", "src", "meetap")):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return os.path.realpath(p)
+    return shutil.which("meetap")
+
+
+def audio_tap_bin():
+    """定位 audio-tap 二进制：与 meetap_bin() 同风格。install 后与 meetap
+    平铺同目录（Makefile:32）；dev 树里编译产物在 build/（Makefile:18）。"""
+    sd = script_dir()
+    for p in (os.path.join(sd, "audio-tap"), os.path.join(sd, "..", "build", "audio-tap")):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return os.path.realpath(p)
+    return None
+
+
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "meetap", "config")
+
+
+def parse_config():
+    """解析 config 为 dict。解析规则与 load_config:58 保持一致：
+    # 之后为注释、key/value 两侧去空白、~ 展开。"""
+    cfg = {}
+    p = config_path()
+    if not os.path.isfile(p):
+        return cfg
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key, val = key.strip(), val.strip()
+                if key in CONFIG_KEYS:
+                    cfg[key] = val
+    except OSError:
+        pass
+    return cfg
+
+
+def cfg_get(key, default=""):
+    return parse_config().get(key, default)
+
+
+def recording_dir():
+    d = cfg_get("recording_dir", "~/Record") or "~/Record"
+    if d.startswith("~"):
+        d = os.path.expanduser(d)
+    return os.path.realpath(d)
+
+
+def pid_alive(pid_file):
+    """读 PID 文件并检查进程存活，等价于 bash 的 kill -0。"""
+    try:
+        with open(os.path.join(STATE_DIR, pid_file)) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_state_file(name):
+    try:
+        with open(os.path.join(STATE_DIR, name), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def read_level(name):
+    """电平文件是两列 '峰值 RMS'（dBFS），每 0.4s 原子替换。
+    取第 2 列 RMS——与 start_visualizer:202 一致；第 1 列峰值在连续讲话时
+    顶格无起伏，画出来是一条直线。"""
+    raw = read_state_file(name)
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) < 2:
+        return None
+    try:
+        v = float(parts[1])
+    except ValueError:
+        return None
+    if v != v or v in (float("inf"), float("-inf")):  # NaN / -inf
+        return None
+    return v
+
+
+def get_status():
+    """录制状态。逻辑对齐 show_status:1557——起始时间用 ffmpeg.pid 的 mtime。"""
+    recording = pid_alive("ffmpeg.pid")
+    if not recording:
+        return {"recording": False}
+
+    elapsed = None
+    try:
+        elapsed = int(time.time() - os.stat(os.path.join(STATE_DIR, "ffmpeg.pid")).st_mtime)
+    except OSError:
+        pass
+
+    # 是否 tap 模式必须看 tap.pid 是否存在，不能看 tap-level 文件是否存在——
+    # 后者头 0.4s 还没生成，误判会让前端以为走的是 BlackHole 分支。
+    tap_mode = os.path.isfile(os.path.join(STATE_DIR, "tap.pid"))
+
+    out_file = read_state_file("output-file")
+    session_dir = read_state_file("session-dir")
+    return {
+        "recording": True,
+        "elapsed": elapsed,
+        "tap_mode": tap_mode,
+        "output_file": out_file,
+        "session": os.path.basename(session_dir) if session_dir else "",
+        "playback_device": read_state_file("original-output.name"),
+        "autostop": pid_alive("autostop.pid"),
+        "monitor": pid_alive("monitor.pid"),
+        "silence_grace": cfg_get("silence_grace", "120"),
+    }
+
+
+# 会话目录名白名单。后缀里显式排除 / 与 \ ——「.」会匹配斜杠，若写成 (_.+)?
+# 则 20260730_1430_../../etc 能通过正则（%2F 经 unquote 还原成真斜杠），
+# 穿越就只剩下面一层能拦。这里收紧后，第一层自己就足够。
+SESSION_RE = re.compile(r"^\d{8}_\d{4}(_[^/\\]+)?$")
+
+
+def list_sessions():
+    """枚举会话目录，按名倒序（命名以时间戳开头天然有序）。
+    附产物存在性标记，前端据此决定显示「查看纪要」还是「重新生成」。"""
+    root = recording_dir()
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for name in sorted(os.listdir(root), reverse=True):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d) or not SESSION_RE.match(name):
+            continue
+        log_dir = os.path.join(d, "log")
+        notes = find_notes(d)
+        meta = notes_meta(notes) if notes else {"title": "", "attendees": None}
+        try:
+            audio = [f for f in os.listdir(d) if f.endswith(".m4a")]
+        except OSError:
+            audio = []
+        out.append({
+            "id": name,
+            "title": meta["title"],
+            "attendees": meta["attendees"],
+            "duration_seconds": session_duration_seconds(d),
+            "has_notes": bool(notes),
+            "has_transcript": os.path.isfile(os.path.join(log_dir, "transcript.txt")),
+            "has_audio": bool(audio),
+            "materials": count_materials(d),
+            # 有音频/转录但还没纪要，且 log 在动 → 链路正在跑
+            "running": is_running(d, bool(notes)),
+        })
+    return out
+
+
+def find_notes(session_dir):
+    """找纪要 md。smart_name_notes:1010 已把 meeting-notes.md 重命名为
+    <日期>_<主题>.md，所以不能只找固定名；排除 prompt.md 与 extra-requirements.md
+    这两个输入文件（同 again_session:1144 的排除逻辑）。"""
+    try:
+        names = os.listdir(session_dir)
+    except OSError:
+        return None
+    skip = {"prompt.md", "extra-requirements.md"}
+    cands = [n for n in names if n.endswith(".md") and n not in skip]
+    if not cands:
+        return None
+
+    # 按 mtime 取最新，不能按名字排序：'m' > 任何数字，字典序会让固定名
+    # meeting-notes.md 永远压过日期前缀的智能命名（与本函数意图相反）。
+    # 同时给固定名降权 —— 它是重命名前的中间产物，smart_name_notes:1053 的
+    # mv 失败、或纪要写完但重命名前被中断，都会留下这份陈旧文件。
+    def rank(n):
+        try:
+            mtime = os.stat(os.path.join(session_dir, n)).st_mtime
+        except OSError:
+            mtime = 0
+        return (0 if n == "meeting-notes.md" else 1, mtime, n)
+
+    return os.path.join(session_dir, max(cands, key=rank))
+
+
+ATTENDEES_RE = re.compile(r"\*\*与会人员\*\*\s*(.+)")
+
+
+def notes_meta(notes_path):
+    """单次读取纪要头部：标题（首个 H1，同 send_meeting_notes:822 的做法）+
+    与会人员摘要（若纪要遵循默认模板的 `> **与会人员** ...` 一行）。后者是
+    best-effort 正则——自定义模板可能没有这行或格式不同，解析不到就置
+    None，不算错误。"""
+    title, attendees = None, None
+    try:
+        with open(notes_path, encoding="utf-8") as f:
+            for _ in range(60):
+                line = f.readline()
+                if not line:
+                    break
+                if title is None and line.startswith("# "):
+                    title = line[2:].strip()
+                if attendees is None:
+                    m = ATTENDEES_RE.search(line)
+                    if m:
+                        attendees = m.group(1).strip()
+                if title is not None and attendees is not None:
+                    break
+    except OSError:
+        pass
+    if title is None:
+        title = os.path.splitext(os.path.basename(notes_path))[0]
+    return {"title": title, "attendees": attendees}
+
+
+def count_materials(session_dir):
+    md = os.path.join(session_dir, "materials")
+    if not os.path.isdir(md):
+        return 0
+    try:
+        return len([f for f in os.listdir(md) if not f.startswith(".")])
+    except OSError:
+        return 0
+
+
+def safe_material_filename(raw_name):
+    """材料文件名净化：只取 basename（丢弃路径部分），扩展名必须在白名单内，
+    长度做基本约束。返回净化后文件名，或 None（拒绝）。上传与删除两个路径
+    复用同一个函数，避免两处校验逻辑走偏。"""
+    name = os.path.basename((raw_name or "").strip())
+    if not name or name in (".", "..") or "\x00" in name or len(name) > 150:
+        return None
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in ALLOWED_MATERIAL_EXTS:
+        return None
+    return name
+
+
+def list_materials(session_dir):
+    md = os.path.join(session_dir, "materials")
+    try:
+        names = sorted(f for f in os.listdir(md) if not f.startswith("."))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        try:
+            size = os.stat(os.path.join(md, n)).st_size
+        except OSError:
+            size = 0
+        out.append({"name": n, "size": size,
+                    "ext": n.rsplit(".", 1)[-1].lower() if "." in n else ""})
+    return out
+
+
+def read_extra_requirements(session_dir):
+    try:
+        with open(os.path.join(session_dir, "extra-requirements.md"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def write_extra_requirements(session_dir, text):
+    """整份覆盖：不同于 write_config 的『逐行替换』（config 要保留注释/其它
+    键），这是单一自由文本文件，直接原子写即可——不存在『读旧值再改』的并发
+    覆盖问题，不需要锁，最后写入者生效等同直接覆盖同一个文件。"""
+    p = os.path.join(session_dir, "extra-requirements.md")
+    try:
+        fd, tmp = tempfile.mkstemp(dir=session_dir, prefix=".extra-requirements.portal.")
+    except OSError as e:
+        return False, str(e)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, str(e)
+    return True, ""
+
+
+DURATION_RE = re.compile(r"^total:\s*(\d+)m(\d+)s", re.M)
+
+
+def session_duration_seconds(session_dir):
+    """从 log/speaker-stats.txt 的 total 行取总时长（秒）。该文件由
+    src/meetap:546-572 转录后机器生成，格式稳定；缺失/解析失败返回 None。
+    比从纪要正文解析『时长约 N 分钟』更可靠——那是 LLM 自由行文。"""
+    try:
+        with open(os.path.join(session_dir, "log", "speaker-stats.txt"), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = DURATION_RE.search(text)
+    return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
+
+def is_running(session_dir, has_notes):
+    """没纪要 + meetap.log 在 90s 内被写过 → 认为链路还在跑。
+    transcribe_recording:388 一进函数就 exec > meetap.log，所以 mtime 是可靠信号。"""
+    if has_notes:
+        return False
+    log_file = os.path.join(session_dir, "log", "meetap.log")
+    try:
+        return (time.time() - os.stat(log_file).st_mtime) < 90
+    except OSError:
+        return False
+
+
+def safe_session_dir(session_id):
+    """两层防穿越：
+      1. SESSION_RE 白名单 —— 名字里不允许出现 / 或 \\，所以拼出来的路径
+         必然是 recording_dir 的直接子项，这一层已经足够。
+      2. 拼接后用未解析路径复核它确实是 root 的直接子项。
+
+    注意第 2 层刻意用未解析路径（不是 realpath）：会话目录本身可能是软链接
+    （把旧录音挪到外置盘再链回来是常见操作），realpath 会解到盘外、dirname
+    不再等于 root。若据此拒绝，list_sessions 用 isdir 跟随软链接列得出来、
+    这里却一律 404，就会出现「列得出、点不开」。
+    """
+    if not SESSION_RE.match(session_id or ""):
+        return None
+    root = recording_dir()
+    d = os.path.join(root, session_id)
+    if os.path.dirname(os.path.abspath(d)) != root:
+        return None
+    if not os.path.isdir(d):
+        return None
+    return os.path.realpath(d)
+
+
+def render_notes(session_dir):
+    """纪要 md → HTML。复用 venv 已装的 markdown 库，扩展与
+    send_meeting_notes:845 一致；缺库时降级为 <pre> 纯文本，不报错。"""
+    notes = find_notes(session_dir)
+    if not notes:
+        return None
+    try:
+        with open(notes, encoding="utf-8") as f:
+            md_text = f.read()
+    except OSError:
+        return None
+    try:
+        import markdown
+        # 渲染结果必须过清洗：markdown 会原样透传纪要里的裸 HTML
+        body = sanitize_html(markdown.markdown(md_text, extensions=["tables", "fenced_code"]))
+    except ImportError:
+        body = "<pre>" + html_escape(md_text) + "</pre>"
+    return {"name": os.path.basename(notes), "html": body}
+
+
+def html_escape(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+# --- 纪要 HTML 清洗 ---
+# markdown 库原样透传裸 HTML（实测 <script> 与 onerror= 都会进入 DOM），
+# 而前端用 innerHTML 渲染，同源脚本对 X-Meetap 头毫无阻力 —— 页面内脚本能调
+# 任意本地接口。纪要由模型依据转录生成，没有远程攻击者，但「会上念一段 HTML
+# → 模型照抄进纪要 → 浏览器执行」这条链路是通的，修复成本远低于风险。
+#
+# 只保留 markdown 自身会产出的标签；其余标签连同属性一起丢弃（文本保留）。
+# 不引入 bleach —— 设计约束 5 要求不新增 pip 依赖，用标准库 html.parser 足够。
+ALLOWED_TAGS = frozenset((
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr",
+    "ul", "ol", "li", "dl", "dt", "dd",
+    "table", "thead", "tbody", "tr", "th", "td",
+    "code", "pre", "blockquote", "em", "strong", "del", "sup", "sub", "a", "img",
+))
+# 属性白名单：结构性属性可留，事件处理器（on*）与 style 一律不留
+ALLOWED_ATTRS = {
+    "a": ("href", "title"),
+    "img": ("src", "alt", "title"),
+    "th": ("align",),
+    "td": ("align",),
+    "code": ("class",),   # fenced_code 用 class 标语言，供高亮
+    "pre": ("class",),
+}
+SAFE_URL_RE = re.compile(r"^(https?:|mailto:|#|/|\./|\.\./|[^:]*$)", re.I)
+VOID_TAGS = frozenset(("br", "hr", "img"))
+
+
+class NotesSanitizer(HTMLParser):
+    """标签/属性白名单清洗。不在白名单的标签被剥离但保留其文本内容，
+    避免把纪要正文一起丢掉。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._open = []      # 已输出的开标签栈，用于收尾补齐
+        self._muted = 0      # >0 时连文本一起丢（script/style 的内容不能保留）
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "iframe", "object", "embed"):
+            self._muted += 1
+            return
+        if tag not in ALLOWED_TAGS:
+            return
+        allowed = ALLOWED_ATTRS.get(tag, ())
+        kept = []
+        for k, v in attrs:
+            k = (k or "").lower()
+            if k not in allowed:
+                continue          # on* / style 等一律在此被丢弃
+            v = v or ""
+            if k in ("href", "src") and not SAFE_URL_RE.match(v.strip()):
+                continue          # 挡 javascript: / data:text/html
+            kept.append('%s="%s"' % (k, html_escape(v)))
+        self.parts.append("<%s%s>" % (tag, (" " + " ".join(kept)) if kept else ""))
+        if tag not in VOID_TAGS:
+            self._open.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in ALLOWED_TAGS and tag in VOID_TAGS:
+            self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "iframe", "object", "embed"):
+            self._muted = max(0, self._muted - 1)
+            return
+        if tag not in ALLOWED_TAGS or tag in VOID_TAGS:
+            return
+        if tag in self._open:
+            # 弹到匹配项为止，顺带闭合中间未闭合的标签，防止结构外溢
+            while self._open:
+                t = self._open.pop()
+                self.parts.append("</%s>" % t)
+                if t == tag:
+                    break
+
+    def handle_data(self, data):
+        if self._muted:
+            return
+        self.parts.append(html_escape(data))
+
+    def result(self):
+        while self._open:
+            self.parts.append("</%s>" % self._open.pop())
+        return "".join(self.parts)
+
+
+def sanitize_html(raw):
+    s = NotesSanitizer()
+    s.feed(raw)
+    s.close()
+    return s.result()
+
+
+def tail_log(session_dir, lines=200):
+    """tail meetap.log。每行自带 [HH:MM:SS] 时间戳，直接给前端当进度用。"""
+    p = os.path.join(session_dir, "log", "meetap.log")
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()[-lines:]
+    except OSError:
+        return []
+
+
+def read_transcript(session_dir, limit=TRANSCRIPT_MAX_BYTES):
+    """读取 log/transcript.txt 全文，供前端只读展示。纯文本，前端必须用
+    textContent 渲染，不走 markdown/HTML 清洗（不需要，也不能当 HTML 用）。"""
+    p = os.path.join(session_dir, "log", "transcript.txt")
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            text = f.read(limit + 1)
+    except OSError:
+        return None
+    if len(text) > limit:
+        text = text[:limit] + "\n\n[... 转录过长，已截断 ...]"
+    return text
+
+
+# --- again 的后台执行与进度追踪 ---
+# again 前台阻塞几十秒到几分钟，必须扔到线程里；这里只记「哪些会话正在跑」，
+# 真正的进度由前端轮询 /log 读 meetap.log（唯一进度源，不另造一套）。
+_again_lock = threading.Lock()
+_again_running = set()
+
+# 录制控制串行化。ThreadingHTTPServer 每请求一线程，两个标签页同时点「开始」
+# 会双双通过 pid_alive 检查（TOCTOU），跑两次 meetap start —— 第二次会 pkill
+# 掉第一次的 tap 并覆盖 session-dir 状态文件，第一场录制直接丢失。
+# 「检查 + 执行」必须在同一把锁内完成。录制本就是独占操作，串行化无副作用。
+_start_lock = threading.Lock()
+
+# config 的「读原文 → 改内存 → 写回」必须整段原子。并发 PUT 各自读到同一份
+# 原文再各自写回，后提交的会覆盖掉前一次的修改。
+_config_lock = threading.Lock()
+
+
+def run_again(session_id):
+    with _again_lock:
+        if session_id in _again_running:
+            return False
+        _again_running.add(session_id)
+
+    def worker():
+        try:
+            subprocess.run([meetap_bin(), "again", session_id],
+                           capture_output=True, text=True, timeout=3600)
+        except Exception:
+            pass
+        finally:
+            with _again_lock:
+                _again_running.discard(session_id)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
+def start_recording_now(name=""):
+    """启动录制的共享实现：HTTP /api/start 与会议自动检测后台线程都调用
+    这个函数，加锁逻辑只写一处。整段持锁：pid_alive 检查与 start 执行之间
+    不能有空隙，否则并发两次启动会双双通过检查，第二次毁掉第一场录制。
+    返回 (body, code)——已在录制时 409，其余情况一律 200（即便 run_cli
+    的 body 里 ok=False，语义与原 /api/start 路由完全一致，不新增判断）。"""
+    with _start_lock:
+        if pid_alive("ffmpeg.pid"):
+            return {"error": "already recording"}, 409
+        args = ["start"] + ([name] if name else [])
+        # 会议名原样作为 argv 传入；sanitize_title:990 会在 bash 侧清洗成目录名
+        # 超时回查 ffmpeg 是否起来了 —— 录制成功就不该报错（见 run_cli）
+        result = run_cli(args, timeout=60, alive_check=lambda: pid_alive("ffmpeg.pid"))
+        return result, 200
+
+
+def run_cli(args, timeout=30, alive_check=None):
+    """调 meetap 子命令。list 传参 + shell=False，用户输入绝不进 shell。
+    非零退出码与 stderr 一起回给前端（stop 无录制时 exit 1，不能静默）。
+
+    两个关键细节：
+
+    stdin=DEVNULL —— 不能让子进程继承 portal 的 stdin。portal 一般在真终端里
+    跑，继承后 start_recording 里的 `tty` 会返回真实设备名，于是终端波形
+    (start_visualizer) 被启动，往用户跑 portal 的那个终端写 ANSI 控制序列、
+    改滚动区。网页端有自己的 canvas 波形，不需要它。
+
+    超时不等于失败 —— start_recording 后台拉起的守护进程若忘记重定向，就会
+    继承下面这根 stdout 管道并把它撑住，导致读到 EOF 前一直等（src/meetap 侧
+    已补重定向，这里是纵深防御）。此时 bash 主进程其实早已退出、录制正常在跑，
+    所以超时后用 alive_check 回查真实状态，不能一律报错。
+    """
+    binp = meetap_bin()
+    if not binp:
+        return {"ok": False, "code": -1, "output": "meetap executable not found"}
+    try:
+        p = subprocess.Popen(
+            [binp] + args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError as e:
+        return {"ok": False, "code": -1, "output": str(e)}
+
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        return {"ok": p.returncode == 0, "code": p.returncode, "output": (out or "").strip()}
+    except subprocess.TimeoutExpired:
+        pass
+
+    # 超时：先看命令的实际效果是否已经达成，再决定要不要报错
+    if alive_check is not None and alive_check():
+        return {"ok": True, "code": 0, "output": "",
+                "note": "command still running in background; state verified"}
+
+    p.kill()
+    try:
+        p.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    return {"ok": False, "code": -1, "output": "command timed out"}
+
+
+def write_config(updates):
+    """原地改写 config：逐行扫描，只替换命中键的 value，注释与分区线原样保留。
+    绝不重写整个文件——config.default 的分区结构与注释是文档的一部分。
+    未在文件里出现过的键追加到末尾结束标注行之前。"""
+    with _config_lock:
+        return _write_config_locked(updates)
+
+
+def _write_config_locked(updates):
+    p = config_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines(keepends=True)
+    except OSError:
+        return False, "config file not readable"
+
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        stripped = line.split("#", 1)[0]
+        if "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in remaining:
+                nl = "\n" if line.endswith("\n") else ""
+                out.append("%s = %s%s" % (key, remaining.pop(key), nl))
+                continue
+        out.append(line)
+
+    if remaining:
+        # 末尾结束标注行（config.default 最后一行）之前插入，保持文件收尾整洁
+        insert_at = len(out)
+        for i in range(len(out) - 1, -1, -1):
+            if out[i].lstrip().startswith("#") and "End of" in out[i]:
+                insert_at = i
+                break
+        block = ["%s = %s\n" % (k, v) for k, v in remaining.items()]
+        out[insert_at:insert_at] = block
+
+    # 唯一临时名：固定名会让并发写互相覆盖同一个 inode，os.replace 的原子性
+    # 救不了共享 source 的情况。同目录建 tmp 保证 replace 不跨文件系统。
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".config.portal.")
+    except OSError as e:
+        return False, str(e)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("".join(out))
+        os.replace(tmp, p)   # 原子替换，避免写一半被 bash 侧读到
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, str(e)
+    return True, ""
+
+
+def validate_config(updates):
+    """键白名单 + 类型/枚举校验。写坏配置会让 bash 侧算术比较或分支炸掉，
+    所以宁可在这里拒绝。"""
+    clean = {}
+    for k, v in updates.items():
+        if k not in CONFIG_KEYS:
+            return None, "unknown key: %s" % k
+        v = ("" if v is None else str(v)).strip()
+        # 值里不能有换行或 #，否则会把后续内容顶成注释、破坏文件结构
+        if "\n" in v or "\r" in v or "#" in v:
+            return None, "invalid characters in value for %s" % k
+        if k in NUMERIC_KEYS:
+            try:
+                int(v)
+            except ValueError:
+                return None, "%s must be an integer" % k
+        elif k in BOOL_KEYS:
+            if v not in ("true", "false"):
+                return None, "%s must be true or false" % k
+        elif k in ENUM_KEYS and v not in ENUM_KEYS[k]:
+            return None, "%s must be one of: %s" % (k, ", ".join(ENUM_KEYS[k]))
+        clean[k] = v
+    return clean, ""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "MeeTapPortal/" + VERSION
+    protocol_version = "HTTP/1.1"
+    # 连接级超时：声明了 Content-Length 却不发数据的客户端不能把工作线程钉死。
+    # 本机使用，30s 对任何正常请求都绰绰有余。
+    timeout = 30
+
+    # --- 安全校验 ---
+    # 绑 127.0.0.1 只挡住网络层。浏览器里的恶意页面仍能打本地接口，所以：
+    #   Host 白名单  → 防 DNS rebinding（恶意域名解析到 127.0.0.1）
+    #   拒绝 Origin  → 防跨站页面发请求
+    #   写操作要求自定义头 → 防简单表单 POST（表单发不出自定义头）
+    def _host_ok(self):
+        host = (self.headers.get("Host") or "").strip()
+        allowed = {"127.0.0.1:%d" % self.server.server_port,
+                   "localhost:%d" % self.server.server_port,
+                   "[::1]:%d" % self.server.server_port}
+        return host in allowed
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True   # 同源 GET / curl 无 Origin
+        try:
+            p = urlparse(origin)
+        except ValueError:
+            return False
+        return (p.hostname in ("127.0.0.1", "localhost", "::1")
+                and str(p.port or "") == str(self.server.server_port))
+
+    def _guard(self, write=False):
+        # 拒绝前必须排空请求体：protocol_version 是 HTTP/1.1，连接会复用，
+        # 未读的 body 会被当成下一个请求的请求行解析（实测报 501 Unsupported
+        # method '{"config":...GET'），整条连接就此错位。
+        if not self._host_ok():
+            self._drain_body()
+            self._json({"error": "invalid Host header"}, 403)
+            return False
+        if not self._origin_ok():
+            self._drain_body()
+            self._json({"error": "cross-origin request refused"}, 403)
+            return False
+        if write and self.headers.get("X-Meetap") != "1":
+            self._drain_body()
+            self._json({"error": "missing X-Meetap header"}, 403)
+            return False
+        return True
+
+    def _drain_body(self):
+        """按 Content-Length 丢弃请求体，保持 keep-alive 连接对齐。
+        分块读，避免一个超大 Content-Length 把内存吃满。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if n <= 0:
+            return
+        if n > DRAIN_LIMIT:
+            # 体量太大就不排了：读它既慢又可被用来拖住线程。放弃连接复用，
+            # 响应照发（close_connection 只影响发完之后是否复用）。
+            self.close_connection = True
+            return
+        remaining = n
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            self.close_connection = True   # 读超时/断开：连接已不可信
+
+    # --- 响应辅助 ---
+    def _send(self, body, ctype, code=200):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # 第二层防线（第一层是 sanitize_html）：内联 <script> 与 onerror= 这类
+        # 内联事件处理器被浏览器直接拒绝执行；外部源也加载不了，顺带杜绝纪要
+        # 内容外泄到第三方域。前端是独立 .js/.css、无内联脚本，天然满足 'self'。
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass   # 前端轮询中途关页面很常见，不是错误
+
+    def _json(self, obj, code=200):
+        self._send(json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8", code)
+
+    def _body_json(self):
+        """返回 (obj, err)。err 为 None 表示成功；否则是 (code, message)，
+        调用方直接回给客户端。超限与格式错误要区分开：前者 413、后者 400。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None, (400, "invalid Content-Length")
+        if n <= 0:
+            return {}, None
+        if n > BODY_LIMIT:
+            self._drain_body()
+            return None, (413, "request body too large")
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8")), None
+        except (ValueError, UnicodeDecodeError):
+            return None, (400, "invalid JSON body")
+
+    def _handle_material_upload(self, sid):
+        """POST /api/sessions/{id}/materials：body 直接是文件原始字节（不是
+        multipart——单文件场景，自定义头传文件名足够，省掉手写 multipart
+        解析；沿用项目已有的 X-Meetap 自定义头风格）。"""
+        d = safe_session_dir(sid)
+        if not d:
+            self._drain_body()
+            return self._json({"error": "session not found"}, 404)
+        name = safe_material_filename(unquote(self.headers.get("X-Meetap-Filename", "")))
+        if not name:
+            self._drain_body()
+            return self._json({"error": "invalid or unsupported filename/extension"}, 400)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._drain_body()
+            return self._json({"error": "invalid Content-Length"}, 400)
+        if n <= 0:
+            return self._json({"error": "empty body"}, 400)
+        if n > MATERIAL_MAX_BYTES:
+            # MATERIAL_MAX_BYTES > DRAIN_LIMIT：_drain_body 会自然走「太大不
+            # 排空，直接关连接」分支，无需改动 _drain_body 本身。
+            self._drain_body()
+            return self._json({"error": "file too large (max %dMB)" %
+                                (MATERIAL_MAX_BYTES // 1_000_000)}, 413)
+        try:
+            data = self.rfile.read(n)
+        except OSError:
+            self.close_connection = True
+            return
+        materials_dir = os.path.join(d, "materials")
+        try:
+            os.makedirs(materials_dir, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=materials_dir, prefix=".upload.")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, os.path.join(materials_dir, name))  # 同名覆盖，原子替换
+        except OSError as e:
+            return self._json({"error": str(e)}, 500)
+        return self._json({"saved": name, "size": len(data)}, 201)
+
+    def _handle_material_delete(self, sid, raw_name):
+        d = safe_session_dir(sid)
+        if not d:
+            return self._json({"error": "session not found"}, 404)
+        name = safe_material_filename(raw_name)
+        if not name:
+            return self._json({"error": "invalid filename"}, 400)
+        p = os.path.join(d, "materials", name)
+        if not os.path.isfile(p):
+            return self._json({"error": "material not found"}, 404)
+        try:
+            os.remove(p)
+        except OSError as e:
+            return self._json({"error": str(e)}, 500)
+        return self._json({"deleted": name})
+
+    def log_message(self, fmt, *args):
+        pass   # 静音默认的 stderr 访问日志，终端只留启动提示
+
+    # --- 路由 ---
+    def do_GET(self):
+        if not self._guard():
+            return
+        path = urlparse(self.path).path
+
+        if path == "/api/status":
+            return self._json(get_status())
+        if path == "/api/levels":
+            return self._json({
+                "system": read_level("tap-level"),
+                "mic": read_level("mic-level"),
+                "recording": pid_alive("ffmpeg.pid"),
+            })
+        if path == "/api/sessions":
+            return self._json({"sessions": list_sessions(),
+                               "recording_dir": recording_dir()})
+        if path == "/api/config":
+            return self._json({"config": parse_config(),
+                               "path": config_path(),
+                               "keys": list(CONFIG_KEYS),
+                               "enums": ENUM_KEYS,
+                               "numeric": sorted(NUMERIC_KEYS),
+                               "bools": sorted(BOOL_KEYS)})
+
+        m = re.match(r"^/api/sessions/([^/]+)/transcript$", path)
+        if m:
+            d = safe_session_dir(unquote(m.group(1)))
+            if not d:
+                return self._json({"error": "session not found"}, 404)
+            text = read_transcript(d)
+            if text is None:
+                return self._json({"error": "no transcript"}, 404)
+            return self._json({"id": unquote(m.group(1)), "text": text})
+
+        m = re.match(r"^/api/sessions/([^/]+)/materials$", path)
+        if m:
+            d = safe_session_dir(unquote(m.group(1)))
+            if not d:
+                return self._json({"error": "session not found"}, 404)
+            return self._json({"materials": list_materials(d)})
+
+        m = re.match(r"^/api/sessions/([^/]+)/extra-requirements$", path)
+        if m:
+            d = safe_session_dir(unquote(m.group(1)))
+            if not d:
+                return self._json({"error": "session not found"}, 404)
+            return self._json({"text": read_extra_requirements(d)})
+
+        m = re.match(r"^/api/sessions/([^/]+)(/log)?$", path)
+        if m:
+            sid = unquote(m.group(1))
+            d = safe_session_dir(sid)
+            if not d:
+                return self._json({"error": "session not found"}, 404)
+            if m.group(2):
+                with _again_lock:
+                    busy = sid in _again_running
+                return self._json({"lines": tail_log(d), "again_running": busy,
+                                   "running": is_running(d, bool(find_notes(d)))})
+            notes = render_notes(d)
+            if not notes:
+                return self._json({"error": "no notes yet", "id": sid}, 404)
+            return self._json({"id": sid, **notes})
+
+        return self._static(path)
+
+    def do_POST(self):
+        if not self._guard(write=True):
+            return
+        path = urlparse(self.path).path
+
+        # 材料上传是二进制且可能超过 BODY_LIMIT，不能走下面统一的 JSON body
+        # 读取——必须在那之前分流，自己接管 body 读取。纯粹重排顺序，不改变
+        # start/stop/again 任何现有行为。
+        m = re.match(r"^/api/sessions/([^/]+)/materials$", path)
+        if m:
+            return self._handle_material_upload(unquote(m.group(1)))
+
+        body, err = self._body_json()
+        if err:
+            return self._json({"error": err[1]}, err[0])
+        if not isinstance(body, dict):
+            return self._json({"error": "invalid JSON body"}, 400)
+
+        if path == "/api/start":
+            name = (body.get("name") or "").strip()
+            result, code = start_recording_now(name)
+            return self._json(result, code)
+        if path == "/api/stop":
+            # stop 最长等 15s 杀 ffmpeg，留足余量；转录本身是后台跑的
+            # 与 start 共用一把锁，避免 start/stop 交错
+            with _start_lock:
+                return self._json(run_cli(
+                    ["stop"], timeout=90,
+                    alive_check=lambda: not pid_alive("ffmpeg.pid")))
+
+        m = re.match(r"^/api/sessions/([^/]+)/again$", path)
+        if m:
+            sid = unquote(m.group(1))
+            if not safe_session_dir(sid):
+                return self._json({"error": "session not found"}, 404)
+            # again 阻塞几十秒到几分钟 → 后台线程 + 立即 202，前端转去轮询 /log
+            if not run_again(sid):
+                return self._json({"error": "already running for this session"}, 409)
+            return self._json({"accepted": True, "id": sid}, 202)
+
+        return self._json({"error": "not found"}, 404)
+
+    def do_PUT(self):
+        if not self._guard(write=True):
+            return
+        path = urlparse(self.path).path
+
+        m = re.match(r"^/api/sessions/([^/]+)/extra-requirements$", path)
+        if m:
+            d = safe_session_dir(unquote(m.group(1)))
+            body, err = self._body_json()
+            if err:
+                return self._json({"error": err[1]}, err[0])
+            if not d:
+                return self._json({"error": "session not found"}, 404)
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(text, str):
+                return self._json({"error": "text field (string) required"}, 400)
+            if len(text) > EXTRA_REQ_MAX_CHARS:
+                return self._json({"error": "too long (max %d characters)" %
+                                    EXTRA_REQ_MAX_CHARS}, 400)
+            ok, err2 = write_extra_requirements(d, text)
+            if not ok:
+                return self._json({"error": err2}, 500)
+            return self._json({"saved": True})
+
+        if path != "/api/config":
+            return self._json({"error": "not found"}, 404)
+        body, err = self._body_json()
+        if err:
+            return self._json({"error": err[1]}, err[0])
+        if not isinstance(body, dict):
+            return self._json({"error": "invalid JSON body"}, 400)
+        updates = body.get("config")
+        if not isinstance(updates, dict) or not updates:
+            return self._json({"error": "config object required"}, 400)
+        clean, err = validate_config(updates)
+        if clean is None:
+            return self._json({"error": err}, 400)
+        ok, err = write_config(clean)
+        if not ok:
+            return self._json({"error": err}, 500)
+        return self._json({"saved": sorted(clean), "config": parse_config()})
+
+    def do_DELETE(self):
+        if not self._guard(write=True):
+            return
+        path = urlparse(self.path).path
+        m = re.match(r"^/api/sessions/([^/]+)/materials/([^/]+)$", path)
+        if m:
+            return self._handle_material_delete(unquote(m.group(1)), unquote(m.group(2)))
+        self._drain_body()   # DELETE 一般不带 body，但客户端仍可能带——防御性排空
+        return self._json({"error": "not found"}, 404)
+
+    # --- 静态资源 ---
+    def _static(self, path):
+        root = find_static_dir()
+        if not root:
+            return self._send("portal assets not found", "text/plain; charset=utf-8", 500)
+        rel = "index.html" if path in ("/", "") else path.lstrip("/")
+        target = os.path.realpath(os.path.join(root, rel))
+        # 静态资源同样要防穿越：realpath 后必须仍在 root 之下
+        if not (target == root or target.startswith(root + os.sep)) or not os.path.isfile(target):
+            return self._send("not found", "text/plain; charset=utf-8", 404)
+        ctype = {
+            ".html": "text/html; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".svg": "image/svg+xml",
+        }.get(os.path.splitext(target)[1], "application/octet-stream")
+        try:
+            with open(target, "rb") as f:
+                return self._send(f.read(), ctype)
+        except OSError:
+            return self._send("not found", "text/plain; charset=utf-8", 404)
+
+
+# --- 会议自动检测（只在 meetap portal 运行期间跑，不涉及登录项/LaunchAgent）---
+# 后台线程无条件启动，每 tick 先查 meeting_watch 配置，关闭时直接空转返回——
+# 不需要动态启停线程，配置弹窗切换开关后最多一个轮询间隔（15s）就生效。
+
+# 冷却状态：{"apps": frozenset, "until": epoch, "idle": 连续无音频活动的 tick 数}。
+# 用户忽略/未响应后针对当时「真正在出声的那批 App」进入冷却；音频活动连续消失
+# MEETING_WATCH_IDLE_CLEAR_TICKS 个 tick（视为上一场结束）或所有会议 App 都退出时，
+# 冷却立即失效，允许下一场新会议重新触发提醒。不持久化——portal 重启后重新
+# 计算，冷却状态丢失完全无害（最坏情况是重启后立刻可能再弹一次）。
+_meeting_watch_cooldown = {"apps": frozenset(), "until": 0.0, "idle": 0}
+# 弹窗前的确认状态：同一批 App 连续命中 MEETING_WATCH_CONFIRM_TICKS 次才弹。
+# 只按 apps 计数、不含 reason——真会议里 reason 会自然从 mic 变成 both
+# （别人开始说话），把 reason 算进 key 会让计数无谓归零、提示被推迟。
+_meeting_watch_pending = {"apps": frozenset(), "ticks": 0}
+
+
+def _mw_debug(msg):
+    """会议检测的排查开关：portal 跑在终端里且没有日志文件，没有这个的话
+    「为什么没弹提示」根本无法回答。设 MEETAP_MEETING_WATCH_DEBUG=1 打开。"""
+    if os.environ.get("MEETAP_MEETING_WATCH_DEBUG") == "1":
+        print("[meeting-watch] %s" % msg, file=sys.stderr, flush=True)
+
+
+def detect_meeting_apps_py():
+    """ps -eo comm= + 正则匹配，返回检测到的会议 App 名集合。"""
+    try:
+        out = subprocess.run(["ps", "-eo", "comm="], capture_output=True,
+                              text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    return frozenset(MEETING_APPS_RE.findall(out))
+
+
+def _meeting_app_audio_io():
+    """问 audio-tap：哪些会议 App 正在做音频 IO（麦克风 / 扬声器）。
+    返回 None 表示无法判断（二进制缺失/老系统/属性不可用），调用方须降级；
+    否则返回 {"mic": frozenset(App名), "out": frozenset(App名)}，两个都空
+    表示「已确认没有任何会议 App 在用音频」。
+
+    为什么不用旧的系统音采样：自己发起的会议里说话的是本人，麦克风有声但
+    系统输出是静音（没人接入/没人说话），旧口径必然判 False，提示永远不弹。
+    改看「会议 App 自己的音频 IO」同时解决三件事：自己开的会能弹、别人在
+    Chrome 放视频不会误弹（音频归属到 App）、不再每 15s 录 2 秒系统声音。"""
+    tap = audio_tap_bin()
+    if not tap:
+        return None
+    try:
+        p = subprocess.run([tap, "app-audio-state"], capture_output=True,
+                            text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None   # 含「装的是不认识这个子命令的旧二进制」，一样降级
+    mic, out = set(), set()
+    for line in p.stdout.splitlines():
+        f = line.split(None, 4)      # 路径含空格放最后；空值由 Swift 侧写 "-"
+        if len(f) != 5:
+            continue
+        in_flag, out_flag, _pid, _bundle, path = f
+        # 用与 ps 那条路完全同一份正则匹配可执行文件路径：会议 App 的音频是
+        # helper 进程在做（Slack Helper / Teams WebView / Lark Helper），
+        # 而这些 helper 的路径里带主 App 名，正好被子串匹配到。
+        names = MEETING_APPS_RE.findall(path)
+        if not names:
+            continue
+        if in_flag == "1":
+            mic.update(names)
+        if out_flag == "1":
+            out.update(names)
+    return {"mic": frozenset(mic), "out": frozenset(out)}
+
+
+def _sample_system_audio_active():
+    """短时采样系统音频判断是否有输出（非静音）。返回 True/False/None——
+    None 表示当前系统不支持 Process Tap，调用方应降级为仅按 App 判断。
+    不切换系统输出设备（BlackHole 那条路需要切换，对静默后台检测是干扰，
+    这里刻意只用 tap 分支，不支持就直接放弃这一判据）。
+
+    注意：这已不再是主判据，而是 _meeting_app_audio_io() 拿不到结果时的
+    fallback（以及 meeting_watch_trigger=system-audio 时的显式选择）。别把它
+    当成「快路径」优化掉——macOS 14 以下只剩这一级，删了就只能靠 App 在不在。"""
+    tap = audio_tap_bin()
+    if not tap:
+        return None
+    try:
+        if subprocess.run([tap, "tap-supported"], capture_output=True,
+                           timeout=5).returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    level_file = os.path.join(STATE_DIR, "meeting-watch-level")
+    try:
+        subprocess.run(
+            [tap, "tap-start", "--duration", str(MEETING_WATCH_SAMPLE_SECONDS),
+             "--level-file", level_file],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=MEETING_WATCH_SAMPLE_SECONDS + 5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    # 电平文件两列「峰值 RMS」。静音判定用峰值——与 src/meetap:319-352
+    # is_audio_silent() 的判据口径一致（该函数明确用第 1 列峰值配
+    # CFG_SILENCE_THRESHOLD 比较；read_level() 那个取 RMS 是给波形显示用的
+    # 另一种口径，这里不能借用）。
+    raw = read_state_file("meeting-watch-level")
+    parts = raw.split()
+    if len(parts) < 1:
+        return None
+    try:
+        peak = float(parts[0])
+    except ValueError:
+        return None
+    threshold = int(cfg_get("silence_threshold", "-50") or "-50")
+    return peak > threshold
+
+
+def _meeting_watch_trigger(running_apps):
+    """按 meeting_watch_trigger 配置逐级判断是否该提示，返回 (apps, reason)
+    或 None（本 tick 不提示）。reason 只用来决定弹窗文案。
+
+    降级链（每一级判不出来就掉到下一级，最坏退回本次改动前的行为）：
+      会议 App 的进程音频 IO → 系统音采样 → 只看 App 在不在。"""
+    mode = cfg_get("meeting_watch_trigger", "app-audio") or "app-audio"
+
+    if mode in ("app-audio", "app-mic"):
+        st = _meeting_app_audio_io()
+        if st is not None:
+            mic = st["mic"]
+            out = st["out"] if mode == "app-audio" else frozenset()
+            apps = mic | out
+            if not apps:
+                return None     # 已确认：没有会议 App 在用音频
+            reason = "both" if (mic and out) else ("mic" if mic else "out")
+            return apps, reason
+        _mw_debug("app-audio-state 不可用，降级")
+
+    if mode != "app":
+        active = _sample_system_audio_active()
+        if active is False:
+            return None
+        if active is True:
+            # 这一级拿不到「是哪个 App 在响」，只能报 ps 看到的全部会议 App
+            return running_apps, "system"
+        # active is None（不支持 tap）→ 降到只看 App
+
+    return running_apps, "app"
+
+
+# portal 至今没有 i18n（从不 source i18n/messages-*.sh，前端也是中文字面量），
+# 所以这里跟 portal 其余部分保持一致写死中文。将来 portal 接 i18n 时，
+# 这几条和下面的按钮文案是最自然的第一批客户。
+_MEETING_WATCH_REASON_TEXT = {
+    "both":   "正在通话（麦克风与扬声器都在用）",
+    "mic":    "已打开麦克风",            # 自己发起的会议：只有麦克风有活动
+    "out":    "正在播放声音",
+    "system": "正在播放系统声音",        # 降级口径：只知道系统有声，不知道是谁
+    "app":    "正在运行",                # 最弱口径：只看到 App 起着
+}
+
+
+def _ask_start_recording_dialog(apps, reason):
+    """弹 osascript display dialog 问是否开始录制，解析按钮/超时。
+    20 秒无响应算「否」——安全默认，绝不在用户没表态时静默开始录制。"""
+    app_list = "、".join(sorted(apps))
+    prompt = "检测到会议应用（%s）%s，是否开始录制？" % (
+        app_list, _MEETING_WATCH_REASON_TEXT.get(reason, "正在运行"))
+    script = (
+        'display dialog "%s" with title "MeeTap" '
+        'buttons {"忽略", "开始录制"} default button "开始录制" '
+        'giving up after 20' % prompt.replace('"', "'")
+    )
+    try:
+        out = subprocess.run(["osascript", "-e", script], capture_output=True,
+                              text=True, timeout=25).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "button returned:开始录制" in out
+
+
+def open_new_browser_window(url, browser_pref):
+    """按用户在配置里选的浏览器强制开新窗口；留空则退化为现有的
+    open <url>（与 main() 里 portal 自启动时打开浏览器同一模式，不保证
+    新窗口——具体行为由用户的默认浏览器决定）。"""
+    if not browser_pref:
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    if browser_pref == "Safari":
+        script = 'tell application "Safari" to make new document with properties {URL:"%s"}' % url
+        subprocess.Popen(["osascript", "-e", script],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    # Chromium 系（Chrome/Edge/Brave/Arc）：--new-window 可靠地开新窗口
+    subprocess.Popen(["open", "-na", browser_pref, "--args", "--new-window", url],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _meeting_watch_tick(portal_url):
+    if cfg_get("meeting_watch", "false") != "true":
+        return
+    if pid_alive("ffmpeg.pid"):
+        return   # 已经在录制，不需要再问
+
+    running = detect_meeting_apps_py()      # 便宜的第一道闸：一个 ps
+    if not running:
+        _meeting_watch_cooldown["until"] = 0.0   # 会议 App 全退出，冷却立即失效
+        _meeting_watch_pending["ticks"] = 0
+        return
+
+    trig = _meeting_watch_trigger(running)
+    if trig is None:
+        _meeting_watch_pending["ticks"] = 0
+        _meeting_watch_cooldown["idle"] += 1
+        if _meeting_watch_cooldown["idle"] >= MEETING_WATCH_IDLE_CLEAR_TICKS:
+            _meeting_watch_cooldown["until"] = 0.0   # 上一场结束了，下一场可以再问
+        _mw_debug("无音频活动 idle=%d" % _meeting_watch_cooldown["idle"])
+        return
+    apps, reason = trig
+    _meeting_watch_cooldown["idle"] = 0
+
+    now = time.time()
+    if apps == _meeting_watch_cooldown["apps"] and now < _meeting_watch_cooldown["until"]:
+        _mw_debug("冷却中，剩 %ds" % int(_meeting_watch_cooldown["until"] - now))
+        return
+
+    # 去抖：连续命中才弹，挡掉「一声通知音 / 一条语音消息」这类瞬时活动
+    if apps == _meeting_watch_pending["apps"]:
+        _meeting_watch_pending["ticks"] += 1
+    else:
+        _meeting_watch_pending["apps"] = apps
+        _meeting_watch_pending["ticks"] = 1
+    _mw_debug("命中 apps=%s reason=%s ticks=%d/%d" % (
+        sorted(apps), reason, _meeting_watch_pending["ticks"],
+        MEETING_WATCH_CONFIRM_TICKS))
+    if _meeting_watch_pending["ticks"] < MEETING_WATCH_CONFIRM_TICKS:
+        return
+    _meeting_watch_pending["ticks"] = 0
+
+    if _ask_start_recording_dialog(apps, reason):
+        start_recording_now()
+        browser_pref = cfg_get("meeting_watch_browser", "")
+        open_new_browser_window(portal_url, browser_pref)
+        _meeting_watch_cooldown["apps"] = frozenset()
+        _meeting_watch_cooldown["until"] = 0.0
+    else:
+        # 冷却 key 只记「真正在出声的那批 App」，不含 reason——reason 在一场
+        # 会里会变（mic → both），算进 key 就等于半小时内还会再弹一次。
+        _meeting_watch_cooldown["apps"] = apps
+        _meeting_watch_cooldown["until"] = now + MEETING_WATCH_COOLDOWN
+
+
+def meeting_watch_loop(portal_url):
+    while True:
+        try:
+            _meeting_watch_tick(portal_url)
+        except Exception:
+            pass   # 后台守护线程：任何单次 tick 异常都不能拖垮整个 portal 进程
+        time.sleep(MEETING_WATCH_INTERVAL)
+
+
+DEFAULT_PORT = 8787
+
+
+def main():
+    # MEETAP_PORTAL_PORT 覆盖 config，供测试与临时换端口用
+    raw = os.environ.get("MEETAP_PORTAL_PORT") or cfg_get("portal_port", str(DEFAULT_PORT))
+    try:
+        port = int(raw or DEFAULT_PORT)
+    except ValueError:
+        port = DEFAULT_PORT
+
+    if not meetap_bin():
+        print("❌ meetap executable not found next to meetap-portal", file=sys.stderr)
+        return 1
+    if not find_static_dir():
+        print("❌ portal assets (share/meetap/portal) not found", file=sys.stderr)
+        return 1
+
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        print("❌ cannot bind 127.0.0.1:%d — %s" % (port, e), file=sys.stderr)
+        print("   change portal_port in %s" % config_path(), file=sys.stderr)
+        return 1
+
+    httpd.daemon_threads = True
+    url = "http://127.0.0.1:%d/" % port
+    print("🌐 MeeTap portal: %s" % url)
+    print("   Ctrl-C to stop")
+    if os.environ.get("MEETAP_PORTAL_NO_OPEN") != "1":
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 会议自动检测：无条件起线程，tick 内部按配置判断是否真的要做事——
+    # 关闭时线程仍在跑但每 15s 只做一次 cfg_get 检查，开销可忽略。
+    threading.Thread(target=meeting_watch_loop, args=(url,), daemon=True).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n👋 portal stopped")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

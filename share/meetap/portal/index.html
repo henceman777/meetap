@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>MeeTap</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- 常驻控制条：录制状态与开始/停止始终可见，看纪要时也不会被切走 -->
+<header>
+  <div class="bar">
+    <h1>🎙️ MeeTap</h1>
+    <div id="statusDot" class="dot idle"></div>
+    <strong id="statusLabel">空闲</strong>
+    <span id="elapsed" class="elapsed">--:--</span>
+
+    <div class="wavewrap">
+      <canvas id="wave" height="34" class="hidden"></canvas>
+      <span id="waveHint" class="meta">录制开始后显示实时电平</span>
+    </div>
+
+    <input id="meetingName" type="text" placeholder="会议名称（可选）" maxlength="60" autocomplete="off">
+    <button id="btnStart" class="primary">开始录制</button>
+    <button id="btnStop" class="danger" disabled>停止并生成纪要</button>
+    <button id="btnConfig" class="ghost icon" title="配置" aria-label="配置">⚙</button>
+  </div>
+  <div class="bar sub">
+    <span id="statusMeta" class="meta"></span>
+    <span id="recordMsg" class="msg"></span>
+  </div>
+</header>
+
+<main>
+  <div class="split">
+    <aside>
+      <div class="aside-head">
+        <strong>会议列表</strong>
+        <button id="btnRefresh" class="ghost icon" title="刷新" aria-label="刷新">↻</button>
+      </div>
+      <ul id="sessionList"></ul>
+      <p id="sessionEmpty" class="meta center hidden">暂无会议记录</p>
+    </aside>
+    <article id="detail">
+      <p class="meta center">从左侧选择一场会议</p>
+    </article>
+  </div>
+
+  <p class="meta center foot">
+    需要首次授权或配置会议 App？请在终端运行 <code>meetap setup</code> —— 系统授权与 App 配置需本机交互，网页无法代劳。
+  </p>
+</main>
+
+<!-- 配置弹窗：用原生 dialog + showModal()，焦点陷阱 / Esc / 遮罩由浏览器提供 -->
+<dialog id="configDlg" aria-labelledby="configTitle">
+  <div class="dlg-head">
+    <strong id="configTitle">配置</strong>
+    <button id="btnCloseConfig" class="ghost icon" title="关闭" aria-label="关闭">✕</button>
+  </div>
+  <div class="dlg-body">
+    <div class="notice">
+      <strong>关于语言</strong>：<code>language</code> 只影响 CLI 与本界面的显示语言。
+      <b>会议纪要始终以中文生成，转录保持会议原始语言。</b>
+    </div>
+    <p class="meta" id="configPath"></p>
+    <div id="configForm"></div>
+  </div>
+  <div class="dlg-foot">
+    <span id="configMsg" class="msg"></span>
+    <div class="dlg-btns">
+      <button id="btnReloadConfig" class="ghost">放弃修改</button>
+      <button id="btnSaveConfig" class="primary">保存配置</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -23,6 +23,7 @@ CFG_AUDIO_PERSIST=true
 CFG_AUDIO_CAPTURE="auto"
 CFG_EMAIL=""
 CFG_EMAIL_SENDER=""
+CFG_PORTAL_PORT=8787
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && cd "$(dirname "$(readlink "$(basename "$0")" || echo "$(basename "$0")")")" && pwd)"
 
@@ -86,6 +87,7 @@ load_config() {
             audio_capture)         CFG_AUDIO_CAPTURE="$val" ;;
             email)                 CFG_EMAIL="$val" ;;
             email_sender)          CFG_EMAIL_SENDER="$val" ;;
+            portal_port)           CFG_PORTAL_PORT="$val" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -400,6 +402,27 @@ transcribe_recording() {
         return 1
     fi
 
+    # 静音闸门：Transcribe 对静音音频会「成功」但返回零个词（items: []、
+    # speaker_labels: null），下游解析必崩且报不出原因。与其花 40 秒和一次
+    # 调用换一个空结果，不如在这里就把原因说清楚。放在建桶之前，免得静音
+    # 会话留下一个空桶。
+    # 阈值 -45 dB 的来历：实测 7 份正常录音峰值均为 0.0 dB，一份静音录音为
+    # -55.3 dB，中间 50 dB 空档，取中偏保守。
+    local MAX_VOL
+    MAX_VOL=$(ffmpeg -hide_banner -nostdin -i "$AUDIO_FILE" -af volumedetect \
+        -f null /dev/null 2>&1 \
+        | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
+    # 浮点比较用 awk：bc 不是 macOS 默认必装，且 [[ -lt ]] 只吃整数，-55.3 会报错。
+    # 测不出来（ffmpeg 缺失/文件损坏）时放行——不能因为量不到就拒绝转录。
+    if [[ -n "$MAX_VOL" ]] && awk "BEGIN{exit !($MAX_VOL < -45)}"; then
+        local DUR
+        DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$AUDIO_FILE" 2>/dev/null)
+        _t ERR_AUDIO_SILENT "$MAX_VOL" "${DUR%%.*}"
+        _t HINT_AUDIO_SILENT
+        osascript -e "display notification \"$(_tn NOTIFY_AUDIO_SILENT)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
+    fi
+
     # 用 Account ID 短哈希代替明文，避免桶名泄露 AWS 账户 ID（桶名仍全局唯一且稳定）
     local ACCOUNT_HASH
     ACCOUNT_HASH=$(printf '%s' "$ACCOUNT_ID" | shasum -a 256 | cut -c1-12)
@@ -491,6 +514,9 @@ transcribe_recording() {
     aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$LOG_DIR/transcribe-raw.json" --region "$AWS_REGION"
 
     # Extract transcript with speaker labels
+    # 不能写 `if ! python3 …; then rc=$?`——`!` 会把 $? 反转成 0，拿不到真实
+    # 退出码（3 = 未识别到语音）。所以先跑、立刻存 $?，再判断。
+    local RC=0
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 
@@ -502,8 +528,17 @@ output_txt = os.path.join(log_dir, "transcript.txt")
 with open(raw_json) as f:
     data = json.load(f)
 
-items = data["results"]["items"]
-segments = data["results"]["speaker_labels"]["segments"]
+results = data.get("results") or {}
+items = results.get("items") or []
+# speaker_labels 在「Transcribe 成功但一个词都没识别到」时是 null 而非空 dict，
+# 老代码直接 ["segments"] 取下标 → TypeError，且报不出真实原因。
+labels = results.get("speaker_labels") or {}
+segments = labels.get("segments") or []
+
+if not items:
+    # 零个词：本地化文案交给 bash 打，Python 侧只用退出码报状态，
+    # 免得在这里再引一套 i18n。
+    sys.exit(3)
 
 time_speaker = {}
 for seg in segments:
@@ -516,7 +551,10 @@ current_words = []
 
 for item in items:
     if item["type"] == "pronunciation":
-        speaker = time_speaker.get(item["start_time"], current_speaker)
+        # 说话人分离没出结果时（segments 为空）退回占位名：否则 current_speaker
+        # 全程为 None，末尾的 `if current_speaker` 会把已识别的语音整段丢掉，
+        # 白白产出一份空转录。
+        speaker = time_speaker.get(item["start_time"], current_speaker) or "spk_0"
         word = item["alternatives"][0]["content"]
         if speaker != current_speaker:
             if current_speaker and current_words:
@@ -536,6 +574,21 @@ with open(output_txt, "w") as f:
 
 print(f"Transcript saved: {len(lines)} speaker turns")
 PYEOF
+    RC=$?   # 必须紧跟 heredoc 之后，否则会被别的命令覆盖
+    if [[ $RC -ne 0 ]]; then
+        if [[ $RC -eq 3 ]]; then
+            _t ERR_NO_SPEECH_DETECTED
+            _t HINT_AUDIO_SILENT       # 与静音闸门共用同一份排查建议
+            osascript -e "display notification \"$(_tn NOTIFY_NO_SPEECH)\" with title \"MeeTap\"" 2>/dev/null
+        else
+            _t ERR_TRANSCRIPT_PARSE_FAILED "$RC"
+        fi
+        # 原来的清理在解析之后，这里提前 return 会跳过它，所以显式清一遍，
+        # 免得失败会话在 S3 和 Transcribe 里留下垃圾
+        aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
+        aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
+        return 1
+    fi
 
     # Cleanup S3 bucket and Transcribe job
     aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
@@ -550,7 +603,12 @@ raw_json = os.path.join(log_dir, "transcribe-raw.json")
 stats_file = os.path.join(log_dir, "speaker-stats.txt")
 with open(raw_json) as f:
     data = json.load(f)
-segments = data["results"]["speaker_labels"]["segments"]
+# 同 transcript 提取：speaker_labels 可能是 null。这一步失败不该中断流程——
+# build_prompt 那边是 `[[ -f "$SPEAKER_STATS" ]] &&`，缺这个文件只是纪要里
+# 少一段发言占比，所以这里只求不崩。
+results = data.get("results") or {}
+labels = results.get("speaker_labels") or {}
+segments = labels.get("segments") or []
 speakers = {}
 for seg in segments:
     spk = seg["speaker_label"]
@@ -1281,7 +1339,9 @@ start_recording() {
             # 静默自停：聚合语音（系统音 tap-level + 麦克风 mic-level，麦克风
             # 过 mic_threshold 门限拦底噪）持续静默超过 silence_grace 秒自动停止。
             # 时长可用 meetap start -g N 覆盖，默认读 config silence_grace。
-            autostop_daemon &
+            # 必须重定向：本守护进程活满整场录制，若继承调用方的 stdout（如
+            # meetap-portal 用管道抓输出），管道永不 EOF，调用方会一直卡住。
+            autostop_daemon > /dev/null 2>&1 &
             AUTOSTOP_PID=$!
             echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
             disown $AUTOSTOP_PID
@@ -1308,7 +1368,9 @@ start_recording() {
             if [[ -n "$TTY_DEV" && "$TTY_DEV" != "not a tty" ]]; then
                 sleep 0.1
                 setup_statusbar "$TTY_DEV"
-                start_visualizer "$TTY_DEV" &
+                # 波形只写 $TTY_DEV，不需要继承的 stdout；重定向以免它把
+                # 调用方的输出管道撑住不放（理由同 autostop_daemon）。
+                start_visualizer "$TTY_DEV" > /dev/null 2>&1 &
                 echo $! > "$VISUALIZER_PID_FILE"
                 disown $!
             fi
@@ -1394,7 +1456,9 @@ start_recording() {
     sleep 1
     if kill -0 $FFMPEG_PID 2>/dev/null; then
         # 启动自动停止守护进程（基于音频静音检测）
-        autostop_daemon &
+        # 重定向理由同 tap 分支：守护进程活满整场录制，继承的 stdout 管道
+        # 不会 EOF，会让用管道抓输出的调用方（meetap-portal）一直阻塞。
+        autostop_daemon > /dev/null 2>&1 &
         AUTOSTOP_PID=$!
         echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
         disown $AUTOSTOP_PID
@@ -1421,7 +1485,8 @@ start_recording() {
         if [[ -n "$TTY_DEV" && "$TTY_DEV" != "not a tty" ]]; then
             sleep 0.1
             setup_statusbar "$TTY_DEV"
-            start_visualizer "$TTY_DEV" &
+            # 重定向理由同 tap 分支：波形只写 $TTY_DEV，不该占着继承的管道
+            start_visualizer "$TTY_DEV" > /dev/null 2>&1 &
             echo $! > "$VISUALIZER_PID_FILE"
             disown $!
         fi
@@ -1797,6 +1862,22 @@ case "${1:-}" in
     setup)
         setup_apps
         ;;
+    portal)
+        # Web portal：本机 web 控制台。用 venv python 运行（复用已装的 markdown
+        # 库渲染纪要）；venv 缺失时降级到系统 python3，纪要退化为纯文本显示。
+        PORTAL="$SCRIPT_DIR/meetap-portal"
+        if [[ ! -f "$PORTAL" ]]; then
+            _t ERR_PORTAL_MISSING "$PORTAL"
+            exit 1
+        fi
+        PORTAL_PYTHON="$VENV_PYTHON"
+        if [[ ! -x "$PORTAL_PYTHON" ]]; then
+            _t WARN_PORTAL_VENV_MISSING
+            PORTAL_PYTHON="$(command -v python3)"
+            [[ -z "$PORTAL_PYTHON" ]] && { _t ERR_PORTAL_NO_PYTHON; exit 1; }
+        fi
+        exec "$PORTAL_PYTHON" "$PORTAL"
+        ;;
     setup-zoom)
         setup_zoom
         ;;
@@ -1833,7 +1914,8 @@ case "${1:-}" in
                     "  multi_language        = $CFG_MULTI_LANGUAGE" \
                     "  visualizer            = $CFG_VISUALIZER" \
                     "  email                 = ${CFG_EMAIL:-<not set>}" \
-                    "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
+                    "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}" \
+                    "  portal_port           = $CFG_PORTAL_PORT"
                 echo ""
                 [[ -f "$CONFIG_FILE" ]] && _t CONFIG_RESET_HINT "$CONFIG_FILE"
                 ;;
@@ -1869,6 +1951,7 @@ case "${1:-}" in
         _t USAGE_STOP
         _t USAGE_STATUS
         _t USAGE_AGAIN
+        _t USAGE_PORTAL
         _t USAGE_SETUP
         _t USAGE_CONFIG
         _t USAGE_CONFIG_SHOW

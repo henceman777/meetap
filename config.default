@@ -57,4 +57,35 @@ visualizer = dot
 # SES verified sender address (required if email is set)
 # email_sender = meetap@example.com
 
+# ── Web Portal ────────────────────────────────────────────────
+# Local web console port (meetap portal). Binds 127.0.0.1 only —
+# never exposed to the network, so no authentication is involved.
+portal_port = 8787
+# Meeting auto-detect (only runs while `meetap portal` is running): watches for
+# known meeting apps (Zoom/Teams/TencentMeeting/Webex/Lark/DingTalk/Slack) that
+# are actually using audio, then pops a native macOS dialog asking whether to
+# start recording. Off by default — this is an interruptive system dialog, opt in
+# deliberately. (true/false)
+meeting_watch = false
+# What counts as "a meeting is happening":
+#   app-audio    (default) the meeting app has the mic open OR is playing audio.
+#                Detects meetings YOU start (you talk, so the mic is open while
+#                system output stays silent until someone else joins).
+#   app-mic      mic only — use this if some app holds an output stream open
+#                permanently and keeps triggering the prompt.
+#   system-audio meeting app running AND non-silent system output. Misses
+#                meetings you host; samples 2s of system audio every 15s.
+#   app          meeting app merely running. Loudest setting.
+# app-audio/app-mic need macOS 14+; otherwise it falls back to system-audio and
+# then to app automatically.
+# Expected prompts you may still see (all gated behind your confirmation, with a
+# 30-min cooldown after you ignore one): Slack huddles, a Zoom waiting room, and
+# "Test Speaker & Microphone" — in all of these the mic genuinely is open.
+meeting_watch_trigger = app-audio
+# Browser to force-open in a NEW WINDOW when you accept the recording prompt
+# (Safari | Google Chrome | Microsoft Edge | Brave Browser | Arc). Leave empty
+# to just use `open <url>` — simplest, but your default browser may reuse an
+# existing tab instead of opening a new window.
+meeting_watch_browser =
+
 # ── End of MeeTap configuration ───────────────────────────────

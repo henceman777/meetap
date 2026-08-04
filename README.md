@@ -188,11 +188,42 @@ $ meetap stop
 
 ```bash
 meetap status       # 查看当前是否在音频采集
+meetap portal       # 启动本机 web 控制台
 meetap config       # 编辑配置
 meetap config show  # 查看当前配置值
 meetap version      # 显示版本号
 meetap help         # 显示所有命令
 ```
+
+---
+
+## 四·五、Web 控制台（可选）
+
+不想记命令？`meetap portal` 会在本机起一个 web 控制台并自动打开浏览器：
+
+```bash
+meetap portal
+# 🌐 MeeTap portal: http://127.0.0.1:8787/
+```
+
+**单页布局**，日常闭环不用切页：
+
+| 区域 | 能做什么 |
+|---|---|
+| **顶部控制条**（常驻） | 开始 / 停止采集、填会议名、实时电平波形、录制状态与时长。滚动阅读纪要时它粘在顶部不动，所以录制状态随时可见 |
+| **左栏会议列表** | 浏览全部会议，徽记标出「已生成纪要 / 待转录 / 生成中」与附带资料数 |
+| **右栏纪要与进度** | 阅读渲染好的纪要；对失败或需补料的会议一键「重新生成」（等价 `meetap again`），并实时显示 `log/meetap.log` 进度 |
+| **配置弹窗**（齿轮） | 表单方式读写 `~/.config/meetap/config`，保存时**只改动对应那一行**，注释与分区结构完整保留 |
+
+页面只在需要时轮询：波形仅录制中拉取，进度日志仅在选中的会议还在跑时拉取，切到别的标签页则全部暂停 —— 挂着不管也不会持续打后端。
+
+命令行与 web 控制台**状态同源**：状态直接读 `/tmp/meeting-record/` 与 `~/Record/`，所以在终端敲 `meetap stop`，网页会在 1 秒内自己转为空闲，反之亦然。两边可以随意混用。
+
+关于安全与范围：
+
+- 服务**只绑定 `127.0.0.1`**，不监听网络、不需要账号密码。同时校验 `Host` 头、拒绝跨站 `Origin`、写操作要求自定义请求头，防止浏览器里的其他页面借道操作本地接口。
+- 端口可通过配置项 `portal_port` 修改（默认 `8787`）。
+- **`meetap setup` 不在 web 控制台内**：音频捕获授权要在「系统设置」里点击、会议 App 的配置改写依赖本机文件与重启 App，网页只能给指引、无法代劳。首次使用仍请在终端运行 `meetap setup`。
 
 ---
 
@@ -404,9 +435,17 @@ make clean      # 清理构建产物
 ```
 src/
 ├── meetap                    # bash 主控脚本
+├── meetap-portal             # web 控制台（Python 标准库，无新增依赖）
 ├── audio-multi-output.swift  # CoreAudio 设备管理（SwitchAudioSource 薄封装）
 ├── audio-monitor.swift       # AUHAL AudioUnit 实时音频转发
+├── audio-tap.swift           # Process Tap 采集 + 麦克风进程内混音
+├── lib/ui.sh                 # UI 抽象层（gum 可选，无 gum 降级纯文本）
 └── i18n/                     # CLI 双语消息表
+
+share/meetap/
+├── prompts/                  # 纪要提示词模板（三级覆盖）
+├── templates/                # 邮件 HTML 模板
+└── portal/                   # web 控制台静态资源（原生 JS，无构建步骤）
 ```
 
 ## License

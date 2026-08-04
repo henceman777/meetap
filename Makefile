@@ -26,10 +26,11 @@ $(BUILD)/audio-tap: src/audio-tap.swift src/audio-tap-Info.plist
 install: all
 	mkdir -p $(PREFIX)
 	cp src/meetap $(PREFIX)/meetap
+	cp src/meetap-portal $(PREFIX)/meetap-portal
 	cp $(BUILD)/audio-multi-output $(PREFIX)/audio-multi-output
 	cp $(BUILD)/audio-monitor $(PREFIX)/audio-monitor
 	cp $(BUILD)/audio-tap $(PREFIX)/audio-tap
-	chmod +x $(PREFIX)/meetap
+	chmod +x $(PREFIX)/meetap $(PREFIX)/meetap-portal
 	mkdir -p $(PREFIX)/i18n
 	cp src/i18n/*.sh $(PREFIX)/i18n/
 	mkdir -p $(PREFIX)/lib
@@ -40,6 +41,8 @@ install: all
 	cp share/meetap/prompts/*.md $(PREFIX)/share/meetap/prompts/
 	mkdir -p $(PREFIX)/share/meetap/templates
 	cp share/meetap/templates/*.html $(PREFIX)/share/meetap/templates/
+	mkdir -p $(PREFIX)/share/meetap/portal
+	cp share/meetap/portal/* $(PREFIX)/share/meetap/portal/
 	@if [ ! -d "$(PREFIX)/meetap-venv" ]; then \
 		echo "Creating Python venv for boto3..."; \
 		python3 -m venv $(PREFIX)/meetap-venv; \

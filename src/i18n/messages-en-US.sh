@@ -35,6 +35,12 @@ MSG_NOTIFY_TRANSCRIBE_FAILED="Transcription failed, check the log"
 MSG_DOWNLOADING="Downloading transcript..."
 MSG_TRANSCRIBE_DONE="✅ Transcription complete: %s"
 MSG_NOTIFY_TRANSCRIBE_DONE="Transcription done, generating meeting notes..."
+MSG_ERR_AUDIO_SILENT="❌ Recording is silent (peak %s dB, %s seconds), skipping transcription"
+MSG_ERR_NO_SPEECH_DETECTED="❌ Transcription completed but no speech was recognized — the audio contains nothing intelligible"
+MSG_HINT_AUDIO_SILENT="   Likely causes: wrong input device selected / system output not switched to BlackHole / everyone stayed muted. The audio file is kept in the session directory — play it back to confirm."
+MSG_ERR_TRANSCRIPT_PARSE_FAILED="❌ Failed to parse the transcription result (exit code %s); see log/transcribe-raw.json"
+MSG_NOTIFY_AUDIO_SILENT="Recording is silent, transcription skipped"
+MSG_NOTIFY_NO_SPEECH="No speech recognized, summarization skipped"
 
 # ── Notes generation (meta messages only; note body stays Chinese) ──
 MSG_ERR_TRANSCRIPT_MISSING="⚠️ transcript.txt not found in log/, skipping summarization"
@@ -183,11 +189,17 @@ MSG_USAGE_START="  start [-t]   Start recording (-t shows verbose device info)"
 MSG_USAGE_STOP="  stop [-t]    Stop recording, restore audio device, auto-transcribe (-t shows verbose file info)"
 MSG_USAGE_STATUS="  status       Show current recording status"
 MSG_USAGE_AGAIN="  again [dir]  Re-generate meeting notes (default: latest; put files in materials/ or edit extra-requirements.md first)"
+MSG_USAGE_PORTAL="  portal       Start the local web console (record, browse notes, edit config)"
 MSG_USAGE_SETUP="  setup        One-click setup for Zoom + Teams + Tencent Meeting (only once)"
 MSG_USAGE_CONFIG="  config       Open config in \$EDITOR"
 MSG_USAGE_CONFIG_SHOW="  config show  Show current configuration"
 MSG_USAGE_VERSION="  version      Show version"
 MSG_USAGE_HINT="First-time users please run: meetap setup"
+
+# ── Web Portal ──
+MSG_ERR_PORTAL_MISSING="❌ Portal program not found: %s"
+MSG_WARN_PORTAL_VENV_MISSING="⚠ venv not found, falling back to system python3 (notes shown as plain text)"
+MSG_ERR_PORTAL_NO_PYTHON="❌ python3 not found, cannot start portal"
 
 # ── Version ──
 MSG_VERSION_LINE="MeeTap v%s"

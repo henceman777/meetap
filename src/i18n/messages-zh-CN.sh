@@ -36,6 +36,12 @@ MSG_NOTIFY_TRANSCRIBE_FAILED="转录失败，请查看日志"
 MSG_DOWNLOADING="Downloading transcript..."
 MSG_TRANSCRIBE_DONE="✅ Transcription complete: %s"
 MSG_NOTIFY_TRANSCRIBE_DONE="转录完成，正在整理会议纪要..."
+MSG_ERR_AUDIO_SILENT="❌ 录音是静音的（峰值 %s dB，时长 %s 秒），已跳过转录"
+MSG_ERR_NO_SPEECH_DETECTED="❌ 转录完成但未识别到任何语音，音频中没有可识别的说话内容"
+MSG_HINT_AUDIO_SILENT="   可能原因：录制时选错了输入设备 / 系统输出未切到 BlackHole / 会中一直静音；音频文件仍保留在会话目录，可自行试听确认"
+MSG_ERR_TRANSCRIPT_PARSE_FAILED="❌ 解析转录结果失败（退出码 %s），原始结果见 log/transcribe-raw.json"
+MSG_NOTIFY_AUDIO_SILENT="录音是静音的，已跳过转录"
+MSG_NOTIFY_NO_SPEECH="未识别到语音，已跳过纪要生成"
 
 # ── 纪要生成（元信息，纪要正文永远中文）──
 MSG_ERR_TRANSCRIPT_MISSING="⚠️ transcript.txt not found in log/, skipping summarization"
@@ -184,11 +190,17 @@ MSG_USAGE_START="  start [-t]   开始录制（-t 显示详细设备信息）"
 MSG_USAGE_STOP="  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
 MSG_USAGE_STATUS="  status       查看当前录制状态"
 MSG_USAGE_AGAIN="  again [目录名] 重新生成会议纪要（默认最近一次；先放资料到 materials/ 或写 extra-requirements.md）"
+MSG_USAGE_PORTAL="  portal       启动本机 web 控制台（浏览器里录制、看纪要、改配置）"
 MSG_USAGE_SETUP="  setup        一键配置 Zoom + Teams + 腾讯会议（只需一次）"
 MSG_USAGE_CONFIG="  config       打开编辑器修改配置（\$EDITOR）"
 MSG_USAGE_CONFIG_SHOW="  config show  显示当前配置"
 MSG_USAGE_VERSION="  version      显示版本号"
 MSG_USAGE_HINT="首次使用请先运行: meetap setup"
+
+# ── Web Portal ──
+MSG_ERR_PORTAL_MISSING="❌ 未找到 portal 程序: %s"
+MSG_WARN_PORTAL_VENV_MISSING="⚠ 未找到 venv，改用系统 python3（纪要将以纯文本显示）"
+MSG_ERR_PORTAL_NO_PYTHON="❌ 未找到 python3，无法启动 portal"
 
 # ── 版本 ──
 MSG_VERSION_LINE="MeeTap v%s"
