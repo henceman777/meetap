@@ -773,18 +773,36 @@ summarize_via_bedrock() {
     local MODEL_ID="$CFG_MODEL"
 
     "$VENV_PYTHON" - "$PROMPT_FILE" "$OUTPUT" "$AWS_REGION" "$MODEL_ID" <<'PYEOF'
-import sys, boto3
+import sys, time, boto3
+from botocore.config import Config
+from botocore.exceptions import (ReadTimeoutError, ConnectTimeoutError,
+                                 ConnectionError as BotoConnectionError, ClientError)
+from botocore.eventstream import EventStreamError
 
 prompt_path = sys.argv[1]
 output_path = sys.argv[2]
 region = sys.argv[3]
 model_id = sys.argv[4]
 
+# converse_stream 的 read_timeout 是「等首个字节」的时限，不是整段生成的总时长。
+# botocore 默认 60s，会在模型正常工作期间把连接掐断：实测这份约 16KB prompt
+# （约 5.4k token）首 token 需 38~96s，抖动正好跨过 60s，于是表现为「一直失败、
+# 偶尔成功」，还把真实的 internalServerException 一并掩盖成 "Read timed out"。
+# 300s 留足余量；重试交给 botocore，adaptive 模式对服务端 5xx 与限流都会退避。
+READ_TIMEOUT = 300
+
 with open(prompt_path, "r") as f:
     prompt = f.read()
 
+t0 = time.monotonic()
+first_token_at = None
+
 try:
-    client = boto3.client("bedrock-runtime", region_name=region)
+    client = boto3.client(
+        "bedrock-runtime", region_name=region,
+        config=Config(read_timeout=READ_TIMEOUT, connect_timeout=15,
+                      retries={"max_attempts": 3, "mode": "adaptive"}),
+    )
     response = client.converse_stream(
         modelId=model_id,
         messages=[{"role": "user", "content": [{"text": prompt}]}],
@@ -796,21 +814,53 @@ try:
         if "contentBlockDelta" in event:
             delta = event["contentBlockDelta"]["delta"]
             if "text" in delta:
+                if first_token_at is None:
+                    first_token_at = time.monotonic() - t0
                 text_parts.append(delta["text"])
 
     text = "".join(text_parts)
 
     if not text.strip():
-        print("Error: empty response from Bedrock")
+        # 与超时区分开：流是正常结束的（没有异常），只是一个 delta 都没收到。
+        # 实测 maxTokens 偏小时出现过这种 55s 返回 0 字符的情况。
+        print("Error: Bedrock stream ended normally but delivered no content "
+              "(model=%s, %.1fs) — retry with: meetap again <session>"
+              % (model_id, time.monotonic() - t0))
         sys.exit(1)
 
     with open(output_path, "w") as f:
         f.write(text)
 
-    print(f"Meeting notes saved: {output_path}")
+    # 耗时是排查「慢」与「错」的唯一依据——上一次故障就是因为日志里没有它，
+    # 才把「模型正常但客户端不等」误读成「模型失败」。
+    print("Meeting notes saved: %s (%.1fs total, first token %s)"
+          % (output_path, time.monotonic() - t0,
+             "%.1fs" % first_token_at if first_token_at else "n/a"))
 
+except EventStreamError as e:
+    # 服务端在流中途报错（如 internalServerException）。实测重试常能成功。
+    # 注意顺序：EventStreamError 是 ClientError 的子类，必须排在它前面，
+    # 否则流中途的错误会被下面那个「请求被拒」分支吞掉，报错方向就指反了。
+    print("Error: Bedrock service error while streaming (%.1fs): %s\n"
+          "       This is a server-side error, not a local failure — "
+          "retry with: meetap again <session>" % (time.monotonic() - t0, e))
+    sys.exit(1)
+except ClientError as e:
+    # 请求本身被拒：ValidationException（模型 ID 写错/未开通）、AccessDenied、
+    # ThrottlingException 等。code 比堆栈更能指明该改什么。
+    code = e.response.get("Error", {}).get("Code", "Unknown")
+    msg = e.response.get("Error", {}).get("Message", str(e))
+    print("Error: Bedrock rejected the request [%s] (model=%s, region=%s): %s"
+          % (code, model_id, region, msg))
+    sys.exit(1)
+except (ReadTimeoutError, ConnectTimeoutError, BotoConnectionError) as e:
+    print("Error: client-side timeout after %.1fs (read_timeout=%ds) — the model "
+          "may still have been working.\n"
+          "       If this recurs, raise READ_TIMEOUT in summarize_via_bedrock(). "
+          "Detail: %s" % (time.monotonic() - t0, READ_TIMEOUT, e))
+    sys.exit(1)
 except Exception as e:
-    print(f"Error: {e}")
+    print("Error: %s: %s (%.1fs)" % (type(e).__name__, e, time.monotonic() - t0))
     sys.exit(1)
 PYEOF
 }
