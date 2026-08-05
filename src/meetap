@@ -676,7 +676,8 @@ summarize_via_bedrock() {
     local MODEL_ID="$CFG_MODEL"
 
     "$VENV_PYTHON" - "$PROMPT_FILE" "$OUTPUT" "$AWS_REGION" "$MODEL_ID" <<'PYEOF'
-import sys, boto3
+import sys, time, boto3
+from botocore.config import Config
 
 prompt_path = sys.argv[1]
 output_path = sys.argv[2]
@@ -686,35 +687,50 @@ model_id = sys.argv[4]
 with open(prompt_path, "r") as f:
     prompt = f.read()
 
-try:
-    client = boto3.client("bedrock-runtime", region_name=region)
-    response = client.converse_stream(
-        modelId=model_id,
-        messages=[{"role": "user", "content": [{"text": prompt}]}],
-        inferenceConfig={"maxTokens": 16000},
-    )
+# 大 transcript 的首字节延迟可能超过 boto3 默认的 60s read_timeout，
+# 曾出现「转录成功、纪要因 Read timed out 空手而归」。这里放宽超时，
+# 并在整段流被中途掐断时重发整个请求（streaming 断流 botocore 的
+# retries 兜不住，必须外层重试）。
+cfg = Config(read_timeout=300, connect_timeout=15, retries={"max_attempts": 0})
+client = boto3.client("bedrock-runtime", region_name=region, config=cfg)
 
-    text_parts = []
-    for event in response["stream"]:
-        if "contentBlockDelta" in event:
-            delta = event["contentBlockDelta"]["delta"]
-            if "text" in delta:
-                text_parts.append(delta["text"])
+MAX_TRIES = 3
+last_err = None
+for attempt in range(1, MAX_TRIES + 1):
+    try:
+        response = client.converse_stream(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 16000},
+        )
 
-    text = "".join(text_parts)
+        text_parts = []
+        for event in response["stream"]:
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"]["delta"]
+                if "text" in delta:
+                    text_parts.append(delta["text"])
 
-    if not text.strip():
-        print("Error: empty response from Bedrock")
-        sys.exit(1)
+        text = "".join(text_parts)
 
-    with open(output_path, "w") as f:
-        f.write(text)
+        if not text.strip():
+            raise RuntimeError("empty response from Bedrock")
 
-    print(f"Meeting notes saved: {output_path}")
+        with open(output_path, "w") as f:
+            f.write(text)
 
-except Exception as e:
-    print(f"Error: {e}")
-    sys.exit(1)
+        print(f"Meeting notes saved: {output_path}")
+        sys.exit(0)
+
+    except Exception as e:
+        last_err = e
+        if attempt < MAX_TRIES:
+            wait = 5 * attempt   # 递增退避：5s、10s
+            print(f"Bedrock attempt {attempt}/{MAX_TRIES} failed: {e} — retrying in {wait}s")
+            time.sleep(wait)
+
+print(f"Error: {last_err}")
+sys.exit(1)
 PYEOF
 }
 
