@@ -1146,6 +1146,7 @@ again_session() {
 
     local LOG_DIR="$SESSION_DIR/log"
     local TRANSCRIPT="$LOG_DIR/transcript.txt"
+    mkdir -p "$LOG_DIR"
     _t AGAIN_TARGET "$(basename "$SESSION_DIR")"
 
     # 命令行补充要求：写入 extra-requirements.md，复用 build_prompt 的
@@ -1170,9 +1171,15 @@ again_session() {
     done
 
     if [[ -f "$TRANSCRIPT" ]]; then
-        # 已有转录：只重新生成纪要（吸收新 materials / extra-requirements）
+        # 已有转录：只重新生成纪要（吸收新 materials / extra-requirements）。
+        # 该路径不经 transcribe_recording 的日志重定向，这里显式把过程写入
+        # meetap.log，与 start 保持一致。again 是前台命令，用 tee 兼顾终端可见；
+        # 追加模式保留本会话既有日志（只归档旧纪要，不清空 log）。
         _t AGAIN_FROM_NOTES
-        summarize_transcript "$SESSION_DIR"
+        {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
+            summarize_transcript "$SESSION_DIR"
+        } 2>&1 | tee -a "$LOG_DIR/meetap.log"
     else
         # 无转录：从音频重跑全链路
         local AUDIO_FILE
