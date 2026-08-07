@@ -698,7 +698,7 @@ summarize_via_bedrock() {
     local MODEL_ID="$CFG_MODEL"
 
     "$VENV_PYTHON" - "$PROMPT_FILE" "$OUTPUT" "$AWS_REGION" "$MODEL_ID" <<'PYEOF'
-import sys, time, boto3
+import sys, time, re, boto3
 from botocore.config import Config
 
 prompt_path = sys.argv[1]
@@ -718,12 +718,27 @@ client = boto3.client("bedrock-runtime", region_name=region, config=cfg)
 
 MAX_TRIES = 3
 last_err = None
+
+# 纪要末尾必须出现的 Meetap 签名尾巴（footer）。模型会把签名里每个单词
+# 首字母包进 <strong> 标签拼出藏头，所以完整性判断前先剥掉 HTML 标签再比。
+FOOTER_MARK = "audio notes generator"
+
+def footer_present(s):
+    plain = re.sub(r"<[^>]+>", "", s)
+    return FOOTER_MARK in plain
+
 for attempt in range(1, MAX_TRIES + 1):
     try:
         response = client.converse_stream(
             modelId=model_id,
             messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 16000},
+            # 留足输出预算；纪要目标 ~2500 字，32000 token 绰绰有余。
+            inferenceConfig={"maxTokens": 32000},
+            # Sonnet 5 默认开启 adaptive thinking，思考 token 与正文共享
+            # maxTokens 预算，长思考会把预算吃光导致正文被 max_tokens 截断
+            # （甚至 0 字）。纪要是直出任务不需要推理，显式关闭思考，把整个
+            # 预算留给正文，同时省成本、降延迟。
+            additionalModelRequestFields={"thinking": {"type": "disabled"}},
         )
 
         text_parts = []
@@ -741,13 +756,19 @@ for attempt in range(1, MAX_TRIES + 1):
         if not text.strip():
             raise RuntimeError("empty response from Bedrock")
 
-        # 流可能在没抛异常的情况下提前正常结束（只吐了前半段就断），
-        # 此时 text 非空但内容残缺。只有收到 messageStop 且 stopReason 为
-        # 正常终止（end_turn / max_tokens / stop_sequence）才算完整，
-        # 否则判为断流并触发外层重试，避免把半截纪要当成功写出。
-        if stop_reason not in ("end_turn", "max_tokens", "stop_sequence"):
+        # 完整性判断：流可能在没抛异常的情况下提前结束（只吐前半段就断），
+        # 此时 text 非空但内容残缺。判为断流并触发外层重试，避免把半截纪要
+        # 当成功写出。判定依据两条，任一不满足即视为断流：
+        #   1. stopReason 必须是正常收尾（end_turn / stop_sequence）；
+        #      max_tokens 说明被预算截断，是残缺信号，不算完整。
+        #   2. 纪要必须以 Meetap 签名尾巴收尾（footer 藏头签名）。
+        if stop_reason not in ("end_turn", "stop_sequence"):
             raise RuntimeError(
                 f"incomplete stream from Bedrock (stopReason={stop_reason}, got {len(text)} chars)"
+            )
+        if not footer_present(text):
+            raise RuntimeError(
+                f"incomplete notes: missing Meetap footer (stopReason={stop_reason}, got {len(text)} chars)"
             )
 
         with open(output_path, "w") as f:
