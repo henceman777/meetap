@@ -727,16 +727,28 @@ for attempt in range(1, MAX_TRIES + 1):
         )
 
         text_parts = []
+        stop_reason = None
         for event in response["stream"]:
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"]["delta"]
                 if "text" in delta:
                     text_parts.append(delta["text"])
+            elif "messageStop" in event:
+                stop_reason = event["messageStop"].get("stopReason")
 
         text = "".join(text_parts)
 
         if not text.strip():
             raise RuntimeError("empty response from Bedrock")
+
+        # 流可能在没抛异常的情况下提前正常结束（只吐了前半段就断），
+        # 此时 text 非空但内容残缺。只有收到 messageStop 且 stopReason 为
+        # 正常终止（end_turn / max_tokens / stop_sequence）才算完整，
+        # 否则判为断流并触发外层重试，避免把半截纪要当成功写出。
+        if stop_reason not in ("end_turn", "max_tokens", "stop_sequence"):
+            raise RuntimeError(
+                f"incomplete stream from Bedrock (stopReason={stop_reason}, got {len(text)} chars)"
+            )
 
         with open(output_path, "w") as f:
             f.write(text)
