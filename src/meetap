@@ -931,6 +931,60 @@ if html is None:
     _inject_style('td', 'border:1px solid #d0d7de;padding:6px 10px')
     body_html = body_html_local[0]
 
+    # --- 会议信息 blockquote → 分行卡片 ---
+    # 模板里「会议时间/会议性质/关键词/与会人员」四行同在一个 blockquote，
+    # markdown 转成单个 <p> 靠软换行分隔，浏览器会折叠成一整段。这里拆成
+    # 「字段名加粗 + 内容」的两列表格逐行显示；关键词的 <code> 转蓝色胶囊。
+    def _render_meta(bq_inner):
+        m = re.search(r'<p>(.*?)</p>', bq_inner, re.DOTALL)
+        inner = m.group(1) if m else bq_inner
+        # 以 <strong>字段名</strong> 为界切成 (label, content) 对
+        parts = re.split(r'<strong>(.*?)</strong>', inner)
+        rows = []
+        for i in range(1, len(parts), 2):
+            label = parts[i].strip()
+            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            content = content.lstrip("　 ").rstrip()
+            rows.append((label, content))
+        if not rows:
+            return bq_inner  # 结构不符预期则原样保留，绝不吞内容
+        def _chipify(c):
+            return re.sub(
+                r'<code>(.*?)</code>',
+                r'<span style="display:inline-block;background:#dce8f6;color:#2f5074;'
+                r'border:1px solid #c2d5ea;font-family:Consolas,Monaco,monospace;'
+                r'font-size:11px;padding:1px 6px;border-radius:4px;margin:1px 1px">\1</span>', c)
+        # 整块小字紧凑：会议信息只是元数据，不该抢关键结论的版面。
+        # 外包浅蓝底容器把这块元数据圈起来，与正文和琥珀色的关键结论区分。
+        out = ['<div style="background:#eef4fb;border-radius:8px;padding:10px 16px;margin:2px 0 10px">']
+        out.append('<table role="presentation" cellspacing="0" cellpadding="0" border="0" '
+                   'style="border-collapse:collapse;margin:0;font-size:12px">')
+        for label, content in rows:
+            out.append(
+                '<tr>'
+                '<td style="padding:1px 10px 1px 0;white-space:nowrap;vertical-align:top;'
+                'font-weight:700;color:#1a1a1a;line-height:1">' + label + '</td>'
+                '<td style="padding:1px 0;vertical-align:top;color:#555;line-height:1">'
+                + _chipify(content) + '</td></tr>')
+        out.append('</table>')
+        out.append('</div>')
+        return '\n'.join(out)
+
+    body_html = re.sub(r'<blockquote>(.*?)</blockquote>',
+                       lambda m: _render_meta(m.group(1)), body_html, flags=re.DOTALL)
+
+    # --- 关键结论区块加浅琥珀高亮底 ---
+    # 「关键结论」是全文重点，用暖米黄底 + 左侧金色强调边与正文区分（其余
+    # 章节保持白底层次分明）。整块（h2 + 紧随的 ol）包进带背景的 div。
+    def _highlight_key(m):
+        block = m.group(1).replace(
+            '<h2>关键结论</h2>',
+            '<h2 style="margin:14px 0 6px;font-size:17px;color:#1a1a1a">关键结论</h2>')
+        return ('<div style="background:#fdf7e8;border-left:4px solid #e8b84b;'
+                'border-radius:8px;padding:4px 20px 12px;margin:14px 0">' + block + '</div>')
+    body_html = re.sub(r'(<h2>关键结论</h2>\s*<ol>.*?</ol>)',
+                       _highlight_key, body_html, flags=re.DOTALL)
+
     # 正文里 Claude 按模板要求写了 LARRY 页脚；模板外框会再注入 footer，
     # 先剥掉正文里的那份，避免邮件出现双页脚；连同落款上方的分割线 <hr> 一起剥
     # （模板 footer 自带浅灰细线，md 的 --- 转成的黑色 <hr> 会重复且突兀）
