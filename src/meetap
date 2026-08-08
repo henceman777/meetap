@@ -953,7 +953,7 @@ if html is None:
                 r'<code>(.*?)</code>',
                 r'<span style="display:inline-block;background:#dce8f6;color:#2f5074;'
                 r'border:1px solid #c2d5ea;font-family:Consolas,Monaco,monospace;'
-                r'font-size:11px;padding:1px 6px;border-radius:4px;margin:1px 1px">\1</span>', c)
+                r'font-weight:700;font-size:11px;padding:1px 6px;border-radius:4px;margin:1px 1px">\1</span>', c)
         # 整块小字紧凑：会议信息只是元数据，不该抢关键结论的版面。
         # 外包浅蓝底容器把这块元数据圈起来，与正文和琥珀色的关键结论区分。
         out = ['<div style="background:#eef4fb;border-radius:8px;padding:10px 16px;margin:2px 0 10px">']
