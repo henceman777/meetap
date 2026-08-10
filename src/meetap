@@ -1268,6 +1268,24 @@ again_session() {
     fi
 }
 
+# tap 健康探针：判断 ffmpeg 是否已从 FIFO 读到真实 PCM。
+# 原理：ffmpeg 只有拿到音频数据才会在日志里推进 "time=NN"；若 Process Tap
+# 的 IO 回调没启动（AudioDeviceStart 返回成功但回调静默——macOS 偶发），
+# FIFO 无数据、ffmpeg 阻塞在读取，日志停在 "Press [q] to stop" 且 time 永远
+# 为 0。用 time 是否 > 0 作为「音频真的在流动」的确定性信号——不能用波形/
+# tap-level（那是麦克风电平，回调独立，静默空录时照样在动）。
+_tap_audio_flowing() {
+    local logf="$1"
+    # 取日志里最后一个 time=HH:MM:SS.xx，判断是否已越过 0
+    local t
+    t=$(grep -oE 'time=[0-9:.]+' "$logf" 2>/dev/null | tail -1 | cut -d= -f2)
+    [[ -z "$t" ]] && return 1
+    # 归一化去掉冒号和点，非零即为在推进（00:00:00.00 → 0）
+    local digits="${t//[:.]/}"
+    [[ "$digits" =~ ^0*$ ]] && return 1
+    return 0
+}
+
 start_recording() {
     local VERBOSE=false
     local MAX_DURATION_MIN=""   # 会议时长上限（分钟，可选）
@@ -1390,28 +1408,75 @@ start_recording() {
         # 访问——彻底消灭 avfoundation 与 tap 的设备竞态（用户环境必现卡死）。
         # 电平双文件由 audio-tap 内部输出（tap-level 系统音 / mic-level 麦克风）。
         local TAP_FIFO="$STATE_DIR/tap.fifo"
-        rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO"
-        mkfifo "$TAP_FIFO"
 
-        "$TAP_TOOL" tap-start --with-mic \
-            --level-file "$STATE_DIR/tap-level" \
-            --mic-level-file "$STATE_DIR/mic-level" \
-            > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
-        TAP_PID=$!
-        echo $TAP_PID > "$TAP_PID_FILE"
-        disown $TAP_PID
+        # tap+ffmpeg 启动 + 自愈重启：Process Tap 的 IO 回调偶发不启动
+        # （AudioDeviceStart 返回成功却静默不喂数据），此时 ffmpeg 阻塞在读
+        # FIFO、输出恒为 0 字节 → 转录报 empty，整段会议静默丢失。这里启动后
+        # 探测音频是否真在流动（见 _tap_audio_flowing），不流动就杀掉重启，
+        # 最多 3 次；仍失败则明确报错，绝不留下静默空录。
+        local TAP_MAX_TRIES=3
+        local tap_try=1
+        local tap_ok=false
+        while (( tap_try <= TAP_MAX_TRIES )); do
+            rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO" "$STATE_DIR/ffmpeg.log"
+            mkfifo "$TAP_FIFO"
 
-        ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
-            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
-            -movflags frag_keyframe+empty_moov \
-            "$OUTPUT_FILE" \
-            < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
+            "$TAP_TOOL" tap-start --with-mic \
+                --level-file "$STATE_DIR/tap-level" \
+                --mic-level-file "$STATE_DIR/mic-level" \
+                > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
+            TAP_PID=$!
+            echo $TAP_PID > "$TAP_PID_FILE"
+            disown $TAP_PID
 
-        FFMPEG_PID=$!
-        echo $FFMPEG_PID > "$PID_FILE"
-        disown $FFMPEG_PID
+            ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
+                -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
+                -movflags frag_keyframe+empty_moov \
+                "$OUTPUT_FILE" \
+                < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
-        sleep 1
+            FFMPEG_PID=$!
+            echo $FFMPEG_PID > "$PID_FILE"
+            disown $FFMPEG_PID
+
+            # 健康探测：等最多 ~3s 观察 ffmpeg 是否开始推进 time=（即 tap 真在喂数据）。
+            # 正常情况下首帧在 1s 内到达；给足 3s 覆盖设备初始化抖动。
+            local waited=0
+            while (( waited < 30 )); do
+                sleep 0.1
+                waited=$((waited + 1))
+                kill -0 $FFMPEG_PID 2>/dev/null || break
+                if _tap_audio_flowing "$STATE_DIR/ffmpeg.log"; then
+                    tap_ok=true
+                    break
+                fi
+            done
+            $tap_ok && break
+
+            # 未流动：杀掉本轮 tap+ffmpeg，清理孤儿后重试
+            kill -9 $FFMPEG_PID 2>/dev/null
+            kill $TAP_PID 2>/dev/null; sleep 0.3; kill -9 $TAP_PID 2>/dev/null
+            pkill -f "audio-tap tap-start" 2>/dev/null
+            rm -f "$PID_FILE" "$TAP_PID_FILE"
+            if (( tap_try < TAP_MAX_TRIES )); then
+                _t TAP_STALL_RETRY "$tap_try" "$TAP_MAX_TRIES"
+                sleep 0.5
+            fi
+            tap_try=$((tap_try + 1))
+        done
+
+        if ! $tap_ok; then
+            rm -f "$STATE_DIR/tap.fifo" "$STATE_DIR/tap-level" "$STATE_DIR/mic-level"
+            rm -f "$OUTPUT_FILE_MARKER" "$STATE_DIR/session-dir"
+            # 清理本次未成功录音留下的空 session 目录（只有 0 字节 m4a + 空
+            # materials），避免残留误导后续 meetap again / 列表。仅当目录里没有
+            # 任何非空文件时才删，绝不误删已有内容。
+            rm -f "$OUTPUT_FILE"
+            [[ -d "$SESSION_DIR" ]] && rmdir "$SESSION_DIR/materials" "$SESSION_DIR" 2>/dev/null
+            _t ERR_TAP_STALL "$0"
+            exit 1
+        fi
+
         if kill -0 $FFMPEG_PID 2>/dev/null; then
             # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护，到点自动结束。
             # 无 -d 则不自动结束，需手动 stop（静默自停特性已废止）。
