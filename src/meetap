@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.5.0"
+VERSION="1.5.2"
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
@@ -571,6 +571,27 @@ build_prompt() {
 [... 内容过长，已截断 ...]"
     fi
 
+    # 纪要篇幅按转录字数分档：字数比时长更能反映真实信息量（静音/停顿不计入）。
+    # 用 perl -CSD 按 Unicode 字符计数，避免 C locale 下 ${#} 退化为字节数（中文膨胀约 3 倍）。
+    local transcript_chars
+    transcript_chars=$(perl -CSD -e 'local $/; my $s = <>; print length($s)' "$TRANSCRIPT" 2>/dev/null)
+    [[ -z "$transcript_chars" ]] && transcript_chars=${#transcript}
+    local length_directive
+    if (( transcript_chars >= 40000 )); then
+        # 超长、高信息量会议：议题纪要充分展开（对应约 75 分钟以上）
+        length_directive="本次会议转录约 ${transcript_chars} 字，属超长、高信息量会议，「议题纪要」需充分展开。正文（不含标题区和落款）目标约 2500 字，这是软目标不是硬上限：允许上下 100 字浮动，若为保住关键数据或故事线需要略微超出也可接受——信息完整优先于卡字数，绝不能为压到字数而删掉硬数据或战果。放宽出来的篇幅集中用于「议题纪要」章节：
+- 每个议题可写成一个小段落，保留 **核心结论 + 完整的关键量化数据（金额、百分比、增长倍数、规模、日期，尽量不丢硬数字）+ 一条故事线/来龙去脉**（这件事如何从起点或困境走到结果、谁提出了关键转折）。
+- 严禁把含有硬数据或具体战果的整块内容压成一句带过、或只塞进标题/页眉——宁可为它单列一个小节。
+- 可保留 1-2 句有信息量的金句（客观第三人称转述，不渲染情绪）。
+- 底线不变：每个事实全文只出现一次、不回放逐句对话、不为凑字数注水。"
+    elif (( transcript_chars >= 30000 )); then
+        # 信息量偏大：议题纪要适度展开（对应约 60-75 分钟）
+        length_directive="本次会议转录约 ${transcript_chars} 字，信息量偏大，「议题纪要」可适度展开。正文（不含标题区和落款）目标约 2000 字，这是软目标不是硬上限：允许上下 100 字浮动，为保住关键数据可略微超出，信息完整优先于卡字数。放宽出来的篇幅优先给「议题纪要」章节：每个议题写 4-6 句，除结论、关键原因或分歧、下一步外，**额外保留该议题出现的关键量化数据**（金额、百分比、增长倍数、规模、日期）；有明显决策转折的议题补一句转折点。关键结论与行动计划表仍保持精炼。仍禁止回放逐句对话、禁止流水账、不为凑字数注水。"
+    else
+        # 常规会议：保持精炼（对应约 1 小时以内）
+        length_directive="本次会议转录约 ${transcript_chars} 字，属常规篇幅。「议题纪要」保持精炼：每个议题 3-4 句（结论一句、关键原因或分歧一句、下一步一句）。正文（不含标题区和落款）目标约 1500 字，允许上下 100 字浮动、信息很少时可更短；这是软目标不是硬切，不要为凑字数注水，也不要为卡上限删掉关键结论。宁可短，不可重复。"
+    fi
+
     local speaker_stats=""
     [[ -f "$SPEAKER_STATS" ]] && speaker_stats=$(cat "$SPEAKER_STATS")
 
@@ -664,8 +685,9 @@ ${mtext}
     # materials_context 是可选占位符：模板里有就替换（可能为空），没有也不报错。
     SESSION_DATE="$SESSION_DATE" speaker_stats="$speaker_stats" transcript="$transcript" \
     materials_context="$materials_context" extra_requirements="$extra_requirements" \
+    length_directive="$length_directive" \
     perl -pe '
-        s/\$\{(SESSION_DATE|speaker_stats|transcript|materials_context|extra_requirements)\}/$ENV{$1}/g;
+        s/\$\{(SESSION_DATE|speaker_stats|transcript|materials_context|extra_requirements|length_directive)\}/$ENV{$1}/g;
     ' "$template"
 }
 
@@ -676,7 +698,8 @@ summarize_via_bedrock() {
     local MODEL_ID="$CFG_MODEL"
 
     "$VENV_PYTHON" - "$PROMPT_FILE" "$OUTPUT" "$AWS_REGION" "$MODEL_ID" <<'PYEOF'
-import sys, boto3
+import sys, time, re, boto3
+from botocore.config import Config
 
 prompt_path = sys.argv[1]
 output_path = sys.argv[2]
@@ -686,35 +709,83 @@ model_id = sys.argv[4]
 with open(prompt_path, "r") as f:
     prompt = f.read()
 
-try:
-    client = boto3.client("bedrock-runtime", region_name=region)
-    response = client.converse_stream(
-        modelId=model_id,
-        messages=[{"role": "user", "content": [{"text": prompt}]}],
-        inferenceConfig={"maxTokens": 16000},
-    )
+# 大 transcript 的首字节延迟可能超过 boto3 默认的 60s read_timeout，
+# 曾出现「转录成功、纪要因 Read timed out 空手而归」。这里放宽超时，
+# 并在整段流被中途掐断时重发整个请求（streaming 断流 botocore 的
+# retries 兜不住，必须外层重试）。
+cfg = Config(read_timeout=300, connect_timeout=15, retries={"max_attempts": 0})
+client = boto3.client("bedrock-runtime", region_name=region, config=cfg)
 
-    text_parts = []
-    for event in response["stream"]:
-        if "contentBlockDelta" in event:
-            delta = event["contentBlockDelta"]["delta"]
-            if "text" in delta:
-                text_parts.append(delta["text"])
+MAX_TRIES = 3
+last_err = None
 
-    text = "".join(text_parts)
+# 纪要末尾必须出现的 Meetap 签名尾巴（footer）。模型会把签名里每个单词
+# 首字母包进 <strong> 标签拼出藏头，所以完整性判断前先剥掉 HTML 标签再比。
+FOOTER_MARK = "audio notes generator"
 
-    if not text.strip():
-        print("Error: empty response from Bedrock")
-        sys.exit(1)
+def footer_present(s):
+    plain = re.sub(r"<[^>]+>", "", s)
+    return FOOTER_MARK in plain
 
-    with open(output_path, "w") as f:
-        f.write(text)
+for attempt in range(1, MAX_TRIES + 1):
+    try:
+        response = client.converse_stream(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            # 留足输出预算；纪要目标 ~2500 字，32000 token 绰绰有余。
+            inferenceConfig={"maxTokens": 32000},
+            # Sonnet 5 默认开启 adaptive thinking，思考 token 与正文共享
+            # maxTokens 预算，长思考会把预算吃光导致正文被 max_tokens 截断
+            # （甚至 0 字）。纪要是直出任务不需要推理，显式关闭思考，把整个
+            # 预算留给正文，同时省成本、降延迟。
+            additionalModelRequestFields={"thinking": {"type": "disabled"}},
+        )
 
-    print(f"Meeting notes saved: {output_path}")
+        text_parts = []
+        stop_reason = None
+        for event in response["stream"]:
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"]["delta"]
+                if "text" in delta:
+                    text_parts.append(delta["text"])
+            elif "messageStop" in event:
+                stop_reason = event["messageStop"].get("stopReason")
 
-except Exception as e:
-    print(f"Error: {e}")
-    sys.exit(1)
+        text = "".join(text_parts)
+
+        if not text.strip():
+            raise RuntimeError("empty response from Bedrock")
+
+        # 完整性判断：流可能在没抛异常的情况下提前结束（只吐前半段就断），
+        # 此时 text 非空但内容残缺。判为断流并触发外层重试，避免把半截纪要
+        # 当成功写出。判定依据两条，任一不满足即视为断流：
+        #   1. stopReason 必须是正常收尾（end_turn / stop_sequence）；
+        #      max_tokens 说明被预算截断，是残缺信号，不算完整。
+        #   2. 纪要必须以 Meetap 签名尾巴收尾（footer 藏头签名）。
+        if stop_reason not in ("end_turn", "stop_sequence"):
+            raise RuntimeError(
+                f"incomplete stream from Bedrock (stopReason={stop_reason}, got {len(text)} chars)"
+            )
+        if not footer_present(text):
+            raise RuntimeError(
+                f"incomplete notes: missing Meetap footer (stopReason={stop_reason}, got {len(text)} chars)"
+            )
+
+        with open(output_path, "w") as f:
+            f.write(text)
+
+        print(f"Meeting notes saved: {output_path}")
+        sys.exit(0)
+
+    except Exception as e:
+        last_err = e
+        if attempt < MAX_TRIES:
+            wait = 5 * attempt   # 递增退避：5s、10s
+            print(f"Bedrock attempt {attempt}/{MAX_TRIES} failed: {e} — retrying in {wait}s")
+            time.sleep(wait)
+
+print(f"Error: {last_err}")
+sys.exit(1)
 PYEOF
 }
 
@@ -859,6 +930,60 @@ if html is None:
     _inject_style('th', 'border:1px solid #d0d7de;padding:6px 10px;background:#f6f8fa')
     _inject_style('td', 'border:1px solid #d0d7de;padding:6px 10px')
     body_html = body_html_local[0]
+
+    # --- 会议信息 blockquote → 分行卡片 ---
+    # 模板里「会议时间/会议性质/关键词/与会人员」四行同在一个 blockquote，
+    # markdown 转成单个 <p> 靠软换行分隔，浏览器会折叠成一整段。这里拆成
+    # 「字段名加粗 + 内容」的两列表格逐行显示；关键词的 <code> 转蓝色胶囊。
+    def _render_meta(bq_inner):
+        m = re.search(r'<p>(.*?)</p>', bq_inner, re.DOTALL)
+        inner = m.group(1) if m else bq_inner
+        # 以 <strong>字段名</strong> 为界切成 (label, content) 对
+        parts = re.split(r'<strong>(.*?)</strong>', inner)
+        rows = []
+        for i in range(1, len(parts), 2):
+            label = parts[i].strip()
+            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            content = content.lstrip("　 ").rstrip()
+            rows.append((label, content))
+        if not rows:
+            return bq_inner  # 结构不符预期则原样保留，绝不吞内容
+        def _chipify(c):
+            return re.sub(
+                r'<code>(.*?)</code>',
+                r'<span style="display:inline-block;background:#dce8f6;color:#2f5074;'
+                r'border:1px solid #c2d5ea;font-family:Consolas,Monaco,monospace;'
+                r'font-weight:700;font-size:11px;padding:1px 6px;border-radius:4px;margin:1px 1px">\1</span>', c)
+        # 整块小字紧凑：会议信息只是元数据，不该抢关键结论的版面。
+        # 外包浅蓝底容器把这块元数据圈起来，与正文和琥珀色的关键结论区分。
+        out = ['<div style="background:#eef4fb;border-radius:8px;padding:10px 16px;margin:2px 0 10px">']
+        out.append('<table role="presentation" cellspacing="0" cellpadding="0" border="0" '
+                   'style="border-collapse:collapse;margin:0;font-size:12px">')
+        for label, content in rows:
+            out.append(
+                '<tr>'
+                '<td style="padding:1px 10px 1px 0;white-space:nowrap;vertical-align:top;'
+                'font-weight:700;color:#1a1a1a;line-height:1">' + label + '</td>'
+                '<td style="padding:1px 0;vertical-align:top;color:#555;line-height:1">'
+                + _chipify(content) + '</td></tr>')
+        out.append('</table>')
+        out.append('</div>')
+        return '\n'.join(out)
+
+    body_html = re.sub(r'<blockquote>(.*?)</blockquote>',
+                       lambda m: _render_meta(m.group(1)), body_html, flags=re.DOTALL)
+
+    # --- 关键结论区块加浅琥珀高亮底 ---
+    # 「关键结论」是全文重点，用暖米黄底 + 左侧金色强调边与正文区分（其余
+    # 章节保持白底层次分明）。整块（h2 + 紧随的 ol）包进带背景的 div。
+    def _highlight_key(m):
+        block = m.group(1).replace(
+            '<h2>关键结论</h2>',
+            '<h2 style="margin:14px 0 6px;font-size:17px;color:#1a1a1a">关键结论</h2>')
+        return ('<div style="background:#fdf7e8;border-left:4px solid #e8b84b;'
+                'border-radius:8px;padding:4px 20px 12px;margin:14px 0">' + block + '</div>')
+    body_html = re.sub(r'(<h2>关键结论</h2>\s*<ol>.*?</ol>)',
+                       _highlight_key, body_html, flags=re.DOTALL)
 
     # 正文里 Claude 按模板要求写了 LARRY 页脚；模板外框会再注入 footer，
     # 先剥掉正文里的那份，避免邮件出现双页脚；连同落款上方的分割线 <hr> 一起剥
@@ -1096,6 +1221,7 @@ again_session() {
 
     local LOG_DIR="$SESSION_DIR/log"
     local TRANSCRIPT="$LOG_DIR/transcript.txt"
+    mkdir -p "$LOG_DIR"
     _t AGAIN_TARGET "$(basename "$SESSION_DIR")"
 
     # 命令行补充要求：写入 extra-requirements.md，复用 build_prompt 的
@@ -1120,9 +1246,15 @@ again_session() {
     done
 
     if [[ -f "$TRANSCRIPT" ]]; then
-        # 已有转录：只重新生成纪要（吸收新 materials / extra-requirements）
+        # 已有转录：只重新生成纪要（吸收新 materials / extra-requirements）。
+        # 该路径不经 transcribe_recording 的日志重定向，这里显式把过程写入
+        # meetap.log，与 start 保持一致。again 是前台命令，用 tee 兼顾终端可见；
+        # 追加模式保留本会话既有日志（只归档旧纪要，不清空 log）。
         _t AGAIN_FROM_NOTES
-        summarize_transcript "$SESSION_DIR"
+        {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
+            summarize_transcript "$SESSION_DIR"
+        } 2>&1 | tee -a "$LOG_DIR/meetap.log"
     else
         # 无转录：从音频重跑全链路
         local AUDIO_FILE
@@ -1134,6 +1266,24 @@ again_session() {
         _t AGAIN_FROM_TRANSCRIBE "$(basename "$AUDIO_FILE")"
         transcribe_recording "$AUDIO_FILE" "$SESSION_DIR"
     fi
+}
+
+# tap 健康探针：判断 ffmpeg 是否已从 FIFO 读到真实 PCM。
+# 原理：ffmpeg 只有拿到音频数据才会在日志里推进 "time=NN"；若 Process Tap
+# 的 IO 回调没启动（AudioDeviceStart 返回成功但回调静默——macOS 偶发），
+# FIFO 无数据、ffmpeg 阻塞在读取，日志停在 "Press [q] to stop" 且 time 永远
+# 为 0。用 time 是否 > 0 作为「音频真的在流动」的确定性信号——不能用波形/
+# tap-level（那是麦克风电平，回调独立，静默空录时照样在动）。
+_tap_audio_flowing() {
+    local logf="$1"
+    # 取日志里最后一个 time=HH:MM:SS.xx，判断是否已越过 0
+    local t
+    t=$(grep -oE 'time=[0-9:.]+' "$logf" 2>/dev/null | tail -1 | cut -d= -f2)
+    [[ -z "$t" ]] && return 1
+    # 归一化去掉冒号和点，非零即为在推进（00:00:00.00 → 0）
+    local digits="${t//[:.]/}"
+    [[ "$digits" =~ ^0*$ ]] && return 1
+    return 0
 }
 
 start_recording() {
@@ -1258,28 +1408,75 @@ start_recording() {
         # 访问——彻底消灭 avfoundation 与 tap 的设备竞态（用户环境必现卡死）。
         # 电平双文件由 audio-tap 内部输出（tap-level 系统音 / mic-level 麦克风）。
         local TAP_FIFO="$STATE_DIR/tap.fifo"
-        rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO"
-        mkfifo "$TAP_FIFO"
 
-        "$TAP_TOOL" tap-start --with-mic \
-            --level-file "$STATE_DIR/tap-level" \
-            --mic-level-file "$STATE_DIR/mic-level" \
-            > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
-        TAP_PID=$!
-        echo $TAP_PID > "$TAP_PID_FILE"
-        disown $TAP_PID
+        # tap+ffmpeg 启动 + 自愈重启：Process Tap 的 IO 回调偶发不启动
+        # （AudioDeviceStart 返回成功却静默不喂数据），此时 ffmpeg 阻塞在读
+        # FIFO、输出恒为 0 字节 → 转录报 empty，整段会议静默丢失。这里启动后
+        # 探测音频是否真在流动（见 _tap_audio_flowing），不流动就杀掉重启，
+        # 最多 3 次；仍失败则明确报错，绝不留下静默空录。
+        local TAP_MAX_TRIES=3
+        local tap_try=1
+        local tap_ok=false
+        while (( tap_try <= TAP_MAX_TRIES )); do
+            rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO" "$STATE_DIR/ffmpeg.log"
+            mkfifo "$TAP_FIFO"
 
-        ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
-            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
-            -movflags frag_keyframe+empty_moov \
-            "$OUTPUT_FILE" \
-            < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
+            "$TAP_TOOL" tap-start --with-mic \
+                --level-file "$STATE_DIR/tap-level" \
+                --mic-level-file "$STATE_DIR/mic-level" \
+                > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
+            TAP_PID=$!
+            echo $TAP_PID > "$TAP_PID_FILE"
+            disown $TAP_PID
 
-        FFMPEG_PID=$!
-        echo $FFMPEG_PID > "$PID_FILE"
-        disown $FFMPEG_PID
+            ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
+                -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
+                -movflags frag_keyframe+empty_moov \
+                "$OUTPUT_FILE" \
+                < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
-        sleep 1
+            FFMPEG_PID=$!
+            echo $FFMPEG_PID > "$PID_FILE"
+            disown $FFMPEG_PID
+
+            # 健康探测：等最多 ~3s 观察 ffmpeg 是否开始推进 time=（即 tap 真在喂数据）。
+            # 正常情况下首帧在 1s 内到达；给足 3s 覆盖设备初始化抖动。
+            local waited=0
+            while (( waited < 30 )); do
+                sleep 0.1
+                waited=$((waited + 1))
+                kill -0 $FFMPEG_PID 2>/dev/null || break
+                if _tap_audio_flowing "$STATE_DIR/ffmpeg.log"; then
+                    tap_ok=true
+                    break
+                fi
+            done
+            $tap_ok && break
+
+            # 未流动：杀掉本轮 tap+ffmpeg，清理孤儿后重试
+            kill -9 $FFMPEG_PID 2>/dev/null
+            kill $TAP_PID 2>/dev/null; sleep 0.3; kill -9 $TAP_PID 2>/dev/null
+            pkill -f "audio-tap tap-start" 2>/dev/null
+            rm -f "$PID_FILE" "$TAP_PID_FILE"
+            if (( tap_try < TAP_MAX_TRIES )); then
+                _t TAP_STALL_RETRY "$tap_try" "$TAP_MAX_TRIES"
+                sleep 0.5
+            fi
+            tap_try=$((tap_try + 1))
+        done
+
+        if ! $tap_ok; then
+            rm -f "$STATE_DIR/tap.fifo" "$STATE_DIR/tap-level" "$STATE_DIR/mic-level"
+            rm -f "$OUTPUT_FILE_MARKER" "$STATE_DIR/session-dir"
+            # 清理本次未成功录音留下的空 session 目录（只有 0 字节 m4a + 空
+            # materials），避免残留误导后续 meetap again / 列表。仅当目录里没有
+            # 任何非空文件时才删，绝不误删已有内容。
+            rm -f "$OUTPUT_FILE"
+            [[ -d "$SESSION_DIR" ]] && rmdir "$SESSION_DIR/materials" "$SESSION_DIR" 2>/dev/null
+            _t ERR_TAP_STALL "$0"
+            exit 1
+        fi
+
         if kill -0 $FFMPEG_PID 2>/dev/null; then
             # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护，到点自动结束。
             # 无 -d 则不自动结束，需手动 stop（静默自停特性已废止）。
