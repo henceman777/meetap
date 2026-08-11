@@ -141,7 +141,10 @@ with open(sys.argv[1], 'r', encoding='utf-8') as f:
 with open(sys.argv[2], 'r', encoding='utf-8') as f:
     llm_out = f.read()
 
-if strip_marks(original) == strip_marks(llm_out):
+# 剥掉 <mark> 后比对正文。文档首尾整体空白（开头空行、末尾换行的增减）是
+# LLM 复述长文时的无害抖动，先 strip 首尾空白再比；中间正文仍逐字节严格，
+# 动一个字即拒。
+if strip_marks(original).strip() == strip_marks(llm_out).strip():
     sys.exit(0)
 sys.exit(2)
 PYEOF

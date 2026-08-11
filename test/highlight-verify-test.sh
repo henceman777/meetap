@@ -47,5 +47,17 @@ run_case "tampered-number" \
 run_case "tampered-delete" \
     "这是一句完整的话。" \
     "这是一句话。" 2
+# 通过：仅首尾空白抖动（开头空行/末尾换行增减），中间正文不变 → 放行
+run_case "edge-whitespace" \
+    $'\n开头有空行，结尾无换行。' \
+    "开头有空行，结尾无换行。"$'\n' 0
+# 篡改：正文中间空白被改（不在首尾），仍须拒绝
+run_case "tampered-inner-space" \
+    "两个字 之间有一个空格" \
+    "两个字之间有一个空格" 2
+# 篡改：模型用 **加粗** 代替 <mark>（真实失败场景），剥 mark 后残留 ** → 拒绝
+run_case "tampered-bold" \
+    "他的观点是SSO团队了解不够。" \
+    "他的观点是**SSO团队了解不够**。" 2
 
 exit $fail
