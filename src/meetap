@@ -136,9 +136,9 @@ import re, sys
 def strip_marks(s):
     return re.sub(r'</?mark>', '', s)
 
-with open(sys.argv[1], 'r') as f:
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
     original = f.read()
-with open(sys.argv[2], 'r') as f:
+with open(sys.argv[2], 'r', encoding='utf-8') as f:
     llm_out = f.read()
 
 if strip_marks(original) == strip_marks(llm_out):
@@ -1357,11 +1357,11 @@ highlight_notes() {
     "$PYBIN" - "$TPL" "$NOTES" "$PROMPT_FILE" <<'PYEOF'
 import re, sys
 tpl_path, notes_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(tpl_path) as f: tpl = f.read()
-with open(notes_path) as f: notes = f.read()
+with open(tpl_path, encoding='utf-8') as f: tpl = f.read()
+with open(notes_path, encoding='utf-8') as f: notes = f.read()
 notes = re.sub(r'</?mark>', '', notes)          # 剥旧高亮，保证幂等
 prompt = tpl.replace('${notes}', notes)          # 字面替换，不走 shell
-with open(out_path, 'w') as f: f.write(prompt)
+with open(out_path, 'w', encoding='utf-8') as f: f.write(prompt)
 PYEOF
     # 组装失败即退：模板/纪要读取异常时 PROMPT_FILE 可能为空，避免空 prompt 白调 LLM。
     if [[ ! -s "$PROMPT_FILE" ]]; then
