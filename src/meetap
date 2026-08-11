@@ -1316,13 +1316,17 @@ highlight_notes() {
 
     # 定位实际纪要 md：目录下最新 *.md，排除 archive/、prompt.md、extra-requirements.md。
     # （纪要经 smart_name_notes 已 mv 成 <日期>_<时间>_<主题>.md，文件名不固定）
-    local NOTES="" f
-    for f in $(find "$SESSION_DIR" -maxdepth 1 -type f -name "*.md" | sort); do
-        case "$(basename "$f")" in
-            prompt.md|extra-requirements.md) continue ;;
+    # NUL 分隔安全读取：SESSION_DIR 含空格时避免路径被词法拆词/glob 展开。
+    # meeting-notes.md 是生成中间态（正常会经 smart_name_notes 改名走掉），
+    # 若残留则词法上会误排到最后被当成「最新」，一并排除。
+    local NOTES="" f base
+    while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        case "$base" in
+            prompt.md|extra-requirements.md|meeting-notes.md) continue ;;
         esac
         NOTES="$f"   # sort 升序，最后一个即最新命名
-    done
+    done < <(find "$SESSION_DIR" -maxdepth 1 -type f -name "*.md" -print0 | sort -z)
     if [[ -z "$NOTES" ]]; then
         _t ERR_HL_NO_NOTES "$SESSION_DIR"
         exit 1
@@ -1359,6 +1363,12 @@ notes = re.sub(r'</?mark>', '', notes)          # 剥旧高亮，保证幂等
 prompt = tpl.replace('${notes}', notes)          # 字面替换，不走 shell
 with open(out_path, 'w') as f: f.write(prompt)
 PYEOF
+    # 组装失败即退：模板/纪要读取异常时 PROMPT_FILE 可能为空，避免空 prompt 白调 LLM。
+    if [[ ! -s "$PROMPT_FILE" ]]; then
+        _t ERR_HL_LLM_FAILED
+        rm -f "$PROMPT_FILE" "$LLM_OUT"
+        exit 1
+    fi
 
     _t HL_GENERATING
     # 复用现有 LLM 分派（接口：<prompt文件> <输出文件>）
