@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.5.2"
+VERSION="1.6.0"
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
@@ -123,6 +123,49 @@ _tn() {
     [[ -z "$template" ]] && template="<missing:${key#MSG_}>"
     # shellcheck disable=SC2059
     printf -- "$template" "$@"
+}
+
+# 输出校验闸门的 Python 源码：判断 LLM 输出是否只是原文加了 <mark>。
+# 用 Python 而非 bash 做逐字节比对——bash 处理多字节/换行/特殊字符不可靠。
+# argv[1]=原始纪要, argv[2]=LLM 输出。剥掉所有 <mark>/</mark> 后：
+#   相等 → exit 0（可写回）; 不等 → exit 2（正文被改，拒绝写回）。
+_highlight_verify_py() {
+    cat <<'PYEOF'
+import re, sys
+
+def strip_marks(s):
+    return re.sub(r'</?mark>', '', s)
+
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    original = f.read()
+with open(sys.argv[2], 'r', encoding='utf-8') as f:
+    llm_out = f.read()
+
+# 剥掉 <mark> 后比对正文。文档首尾整体空白（开头空行、末尾换行的增减）是
+# LLM 复述长文时的无害抖动，先 strip 首尾空白再比；中间正文仍逐字节严格，
+# 动一个字即拒。
+if strip_marks(original).strip() == strip_marks(llm_out).strip():
+    sys.exit(0)
+sys.exit(2)
+PYEOF
+}
+
+# 规范化文件末尾为「内容 + 恰好一个尾随空行」。纪要末尾的 Meetap 签名是一段
+# 原始 HTML 块（<p>...<strong>藏头</strong>...</p>），若它紧贴文件末尾，Typora
+# 等编辑器打开时光标默认落点正好在这个 HTML 块里，会把签名显示成源码、需点别处
+# 才渲染。footer 后留一个空行即可让光标默认落在空行、签名直接渲染。
+# 只增删尾部换行，不碰任何可见字符（避免误伤 markdown 行尾两空格的硬换行语义）。
+_normalize_trailing_blank() {
+    local pybin="$1" file="$2"
+    "$pybin" - "$file" <<'PYEOF'
+import sys
+p = sys.argv[1]
+with open(p, encoding='utf-8') as f:
+    s = f.read()
+s = s.rstrip('\n') + '\n\n'
+with open(p, 'w', encoding='utf-8') as f:
+    f.write(s)
+PYEOF
 }
 
 load_i18n
@@ -1177,6 +1220,9 @@ summarize_transcript() {
     rm -f "$PROMPT_FILE"
 
     if [[ -f "$OUTPUT" ]]; then
+        # 规范化末尾空行：保证签名 footer 后有空行，编辑器打开即渲染而非显示源码。
+        local NB_PY="$VENV_PYTHON"; [[ -x "$NB_PY" ]] || NB_PY="$(command -v python3)"
+        [[ -n "$NB_PY" ]] && _normalize_trailing_blank "$NB_PY" "$OUTPUT"
         # smart_name_notes 把 meeting-notes.md 重命名为智能名,返回最终路径
         local FINAL_OUTPUT
         FINAL_OUTPUT=$(smart_name_notes "$OUTPUT" "$SESSION_DIR")
@@ -1266,6 +1312,122 @@ again_session() {
         _t AGAIN_FROM_TRANSCRIBE "$(basename "$AUDIO_FILE")"
         transcribe_recording "$AUDIO_FILE" "$SESSION_DIR"
     fi
+}
+
+# 纪要要点高亮：给已生成的纪要 md 原地补 <mark> 高亮。独立后处理，不碰生成流程。
+# 复用 summarize_via_* 作为 LLM 层；写回前过校验闸门，正文被改则拒写。
+highlight_notes() {
+    local target="${1:-}"
+    local SESSION_DIR
+
+    # 目录解析（与 again_session 一致）
+    if [[ -n "$target" ]]; then
+        if [[ -d "$target" ]]; then
+            SESSION_DIR="$(cd "$target" && pwd)"
+        elif [[ -d "$RECORDING_DIR/$target" ]]; then
+            SESSION_DIR="$RECORDING_DIR/$target"
+        else
+            _t ERR_HL_SESSION_NOT_FOUND "$target" "$RECORDING_DIR"
+            exit 1
+        fi
+    else
+        SESSION_DIR=$(find "$RECORDING_DIR" -maxdepth 1 -type d -name "20*" | sort | tail -1)
+        if [[ -z "$SESSION_DIR" ]]; then
+            _t ERR_HL_NO_SESSIONS "$RECORDING_DIR"
+            exit 1
+        fi
+    fi
+
+    # 定位实际纪要 md：目录下最新 *.md，排除 archive/、prompt.md、extra-requirements.md。
+    # （纪要经 smart_name_notes 已 mv 成 <日期>_<时间>_<主题>.md，文件名不固定）
+    # NUL 分隔安全读取：SESSION_DIR 含空格时避免路径被词法拆词/glob 展开。
+    # meeting-notes.md 是生成中间态（正常会经 smart_name_notes 改名走掉），
+    # 若残留则词法上会误排到最后被当成「最新」，一并排除。
+    local NOTES="" f base
+    while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        case "$base" in
+            prompt.md|extra-requirements.md|meeting-notes.md) continue ;;
+        esac
+        NOTES="$f"   # sort 升序，最后一个即最新命名
+    done < <(find "$SESSION_DIR" -maxdepth 1 -type f -name "*.md" -print0 | sort -z)
+    if [[ -z "$NOTES" ]]; then
+        _t ERR_HL_NO_NOTES "$SESSION_DIR"
+        exit 1
+    fi
+    _t HL_TARGET "$(basename "$NOTES")"
+
+    # 找高亮模板（dev 树 / install 树两种前缀），需含 ${notes} 占位符
+    local TPL="" cand
+    for cand in \
+        "$SCRIPT_DIR/../share/meetap/prompts/highlight.md" \
+        "$SCRIPT_DIR/share/meetap/prompts/highlight.md"; do
+        if [[ -f "$cand" ]] && grep -qF '${notes}' "$cand"; then
+            TPL="$cand"; break
+        fi
+    done
+    if [[ -z "$TPL" ]]; then
+        _t ERR_HL_TEMPLATE_MISSING "share/meetap/prompts/highlight.md"
+        exit 1
+    fi
+
+    # 组装 prompt：先剥掉纪要里可能已有的 <mark>（保证幂等），再替换 ${notes}。
+    # 用 python 做替换：纪要正文含 & / 反斜杠等，sed/bash 替换不安全。
+    local LOG_DIR="$SESSION_DIR/log"; mkdir -p "$LOG_DIR"
+    local PROMPT_FILE="$LOG_DIR/.highlight-prompt.tmp"
+    local LLM_OUT="$LOG_DIR/.highlight-out.tmp"
+    local PYBIN="$VENV_PYTHON"; [[ -x "$PYBIN" ]] || PYBIN="$(command -v python3)"
+
+    "$PYBIN" - "$TPL" "$NOTES" "$PROMPT_FILE" <<'PYEOF'
+import re, sys
+tpl_path, notes_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(tpl_path, encoding='utf-8') as f: tpl = f.read()
+with open(notes_path, encoding='utf-8') as f: notes = f.read()
+notes = re.sub(r'</?mark>', '', notes)          # 剥旧高亮，保证幂等
+prompt = tpl.replace('${notes}', notes)          # 字面替换，不走 shell
+with open(out_path, 'w', encoding='utf-8') as f: f.write(prompt)
+PYEOF
+    # 组装失败即退：模板/纪要读取异常时 PROMPT_FILE 可能为空，避免空 prompt 白调 LLM。
+    if [[ ! -s "$PROMPT_FILE" ]]; then
+        _t ERR_HL_LLM_FAILED
+        rm -f "$PROMPT_FILE" "$LLM_OUT"
+        exit 1
+    fi
+
+    _t HL_GENERATING
+    # 复用现有 LLM 分派（接口：<prompt文件> <输出文件>）
+    rm -f "$LLM_OUT"
+    case "$CFG_AI_BACKEND" in
+        claude-code) summarize_via_claude_code "$PROMPT_FILE" "$LLM_OUT" ;;
+        bedrock|*)   summarize_via_bedrock "$PROMPT_FILE" "$LLM_OUT" ;;
+    esac
+
+    if [[ ! -s "$LLM_OUT" ]]; then
+        _t ERR_HL_LLM_FAILED
+        rm -f "$PROMPT_FILE" "$LLM_OUT"
+        exit 1
+    fi
+
+    # 校验闸门：剥 mark 后与原文逐字节比对（原文同样剥 mark，应对重标）
+    "$PYBIN" -c "$(_highlight_verify_py)" "$NOTES" "$LLM_OUT"
+    local vrc=$?
+    if [[ $vrc -ne 0 ]]; then
+        _t ERR_HL_VERIFY_FAILED
+        rm -f "$PROMPT_FILE" "$LLM_OUT"
+        exit 1
+    fi
+
+    # 通过：写回原文件。若输出与原文完全相同（模型没标任何东西），提示未改动。
+    if cmp -s "$NOTES" "$LLM_OUT"; then
+        _t HL_UNCHANGED
+    else
+        mv "$LLM_OUT" "$NOTES"
+        _t HL_DONE "$(basename "$NOTES")"
+    fi
+    # 规范化末尾空行：LLM 常吞掉尾部换行，且校验闸门宽容首尾空白，需由代码兜底
+    # 保证 footer 后有空行，避免编辑器把签名 HTML 块显示成源码。
+    _normalize_trailing_blank "$PYBIN" "$NOTES"
+    rm -f "$PROMPT_FILE" "$LLM_OUT"
 }
 
 # tap 健康探针：判断 ffmpeg 是否已从 FIFO 读到真实 PCM。
@@ -2033,6 +2195,9 @@ case "${1:-}" in
     again)
         again_session "${2:-}" "${3:-}"
         ;;
+    highlight)
+        highlight_notes "${2:-}"
+        ;;
     setup)
         setup_apps
         ;;
@@ -2106,6 +2271,7 @@ case "${1:-}" in
         _t USAGE_STOP
         _t USAGE_STATUS
         _t USAGE_AGAIN
+        _t USAGE_HIGHLIGHT
         _t USAGE_SETUP
         _t USAGE_CONFIG
         _t USAGE_CONFIG_SHOW
