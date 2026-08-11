@@ -150,6 +150,24 @@ sys.exit(2)
 PYEOF
 }
 
+# 规范化文件末尾为「内容 + 恰好一个尾随空行」。纪要末尾的 Meetap 签名是一段
+# 原始 HTML 块（<p>...<strong>藏头</strong>...</p>），若它紧贴文件末尾，Typora
+# 等编辑器打开时光标默认落点正好在这个 HTML 块里，会把签名显示成源码、需点别处
+# 才渲染。footer 后留一个空行即可让光标默认落在空行、签名直接渲染。
+# 只增删尾部换行，不碰任何可见字符（避免误伤 markdown 行尾两空格的硬换行语义）。
+_normalize_trailing_blank() {
+    local pybin="$1" file="$2"
+    "$pybin" - "$file" <<'PYEOF'
+import sys
+p = sys.argv[1]
+with open(p, encoding='utf-8') as f:
+    s = f.read()
+s = s.rstrip('\n') + '\n\n'
+with open(p, 'w', encoding='utf-8') as f:
+    f.write(s)
+PYEOF
+}
+
 load_i18n
 
 # --- UI 抽象层（gum 可选依赖；无 gum / 无 TTY 时自动降级为纯文本）---
@@ -1202,6 +1220,9 @@ summarize_transcript() {
     rm -f "$PROMPT_FILE"
 
     if [[ -f "$OUTPUT" ]]; then
+        # 规范化末尾空行：保证签名 footer 后有空行，编辑器打开即渲染而非显示源码。
+        local NB_PY="$VENV_PYTHON"; [[ -x "$NB_PY" ]] || NB_PY="$(command -v python3)"
+        [[ -n "$NB_PY" ]] && _normalize_trailing_blank "$NB_PY" "$OUTPUT"
         # smart_name_notes 把 meeting-notes.md 重命名为智能名,返回最终路径
         local FINAL_OUTPUT
         FINAL_OUTPUT=$(smart_name_notes "$OUTPUT" "$SESSION_DIR")
@@ -1403,6 +1424,9 @@ PYEOF
         mv "$LLM_OUT" "$NOTES"
         _t HL_DONE "$(basename "$NOTES")"
     fi
+    # 规范化末尾空行：LLM 常吞掉尾部换行，且校验闸门宽容首尾空白，需由代码兜底
+    # 保证 footer 后有空行，避免编辑器把签名 HTML 块显示成源码。
+    _normalize_trailing_blank "$PYBIN" "$NOTES"
     rm -f "$PROMPT_FILE" "$LLM_OUT"
 }
 
