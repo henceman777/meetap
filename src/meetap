@@ -125,6 +125,28 @@ _tn() {
     printf -- "$template" "$@"
 }
 
+# 输出校验闸门的 Python 源码：判断 LLM 输出是否只是原文加了 <mark>。
+# 用 Python 而非 bash 做逐字节比对——bash 处理多字节/换行/特殊字符不可靠。
+# argv[1]=原始纪要, argv[2]=LLM 输出。剥掉所有 <mark>/</mark> 后：
+#   相等 → exit 0（可写回）; 不等 → exit 2（正文被改，拒绝写回）。
+_highlight_verify_py() {
+    cat <<'PYEOF'
+import re, sys
+
+def strip_marks(s):
+    return re.sub(r'</?mark>', '', s)
+
+with open(sys.argv[1], 'r') as f:
+    original = f.read()
+with open(sys.argv[2], 'r') as f:
+    llm_out = f.read()
+
+if strip_marks(original) == strip_marks(llm_out):
+    sys.exit(0)
+sys.exit(2)
+PYEOF
+}
+
 load_i18n
 
 # --- UI 抽象层（gum 可选依赖；无 gum / 无 TTY 时自动降级为纯文本）---
