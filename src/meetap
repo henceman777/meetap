@@ -2195,7 +2195,7 @@ case "${1:-}" in
     again)
         again_session "${2:-}" "${3:-}"
         ;;
-    highlight)
+    mark)
         highlight_notes "${2:-}"
         ;;
     setup)

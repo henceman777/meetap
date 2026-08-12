@@ -252,8 +252,8 @@ meetap again '' '请用要点列表重写，突出决策项与负责人'   # 附
 
 纪要生成后，想让重点更醒目：
 
-    meetap highlight            # 给最新会话的纪要加要点高亮
-    meetap highlight <目录名>    # 指定某次会议
+    meetap mark            # 给最新会话的纪要加要点高亮
+    meetap mark <目录名>    # 指定某次会议
 
 会用 LLM 给纪要里的关键数字、核心结论、案例结果套上 `<mark>` 标记（在 VS Code / Typora / GitHub / 浏览器里显示为黄色底色）。
 
