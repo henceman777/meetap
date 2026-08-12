@@ -197,7 +197,7 @@ MSG_ERR_HL_VERIFY_FAILED="❌ 模型改动了正文（不只是加高亮），�
 MSG_ERR_HL_LLM_FAILED="❌ 高亮生成失败（LLM 未产出内容）"
 
 MSG_USAGE_HEADER="MeeTap v%s - macOS 会议录制 + 自动转录"
-MSG_USAGE_LINE="用法: meetap {start|stop|status|again|setup|config|version}"
+MSG_USAGE_LINE="用法: meetap {start|stop|status|again|mark|setup|config|version}"
 MSG_USAGE_START="  start [-t] [-d 分钟] [会议名] 开始录制（-t 详细信息；-d 指定时长上限，到点自动结束）"
 MSG_USAGE_STOP="  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
 MSG_USAGE_STATUS="  status       查看当前录制状态"
