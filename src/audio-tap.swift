@@ -79,8 +79,9 @@ var meterTimer: DispatchSourceTimer? = nil
 // avfoundation）碰音频设备——tap 采系统音、进程内采麦克风、ring buffer 混音、
 // 单路 PCM 输出。彻底消灭设备抢占/枚举竞态一类问题。
 
-// 麦克风环形缓冲：mic IO 回调写入，tap IO 回调按需读出（tap 作主时钟）
-final class MicRing {
+// 通用音频环形缓冲：一方 IO 回调写入，另一方 IO 回调按需读出。
+// 现用于「系统音 ring」——tap 回调写入，麦克风回调（主时钟）读出混音。
+final class AudioRing {
     private var buf: [Float]
     private var readIdx = 0, writeIdx = 0, count = 0
     private let lock = NSLock()
@@ -122,14 +123,31 @@ func defaultInputDevice() -> AudioDeviceID? {
     return id
 }
 
-// 麦克风采集：默认输入设备上挂 IO proc，Float32 首声道写 ring buffer
+// 麦克风采集：默认输入设备上挂 IO proc。
+//
+// 主时钟角色（systemRing 已注入时）：麦克风是整条链路里【一直走时钟】的设备
+// ——无论有没有人说话，硬件都按 IO 周期持续交帧。因此让它作主时钟、独占
+// stdout 写出口：本回调去交织成单声道 → 从「系统音 ring」取等量样本混入
+// （tap 回调写进去的）→ 削顶防爆 → 写 stdout。系统静音时 tap 回调不触发、
+// ring 为空，混入的是零，输出即纯麦克风——线下会议（电脑无播放）照录不误。
+// 这修复了老架构「唯一 stdout 出口挂在时有时无的系统音 tap 回调上」的致命缺陷。
 final class MicCapture {
     private var deviceID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private var running = false
     private let ioQueue = DispatchQueue(label: "meetap.audio-tap.mic")
-    let ring = MicRing(capacity: 96000)  // 2s @48k
     private(set) var sampleRate: Float64 = 0
+
+    // 系统音环形缓冲：由 main 注入（--with-mic 主时钟装配）。tap 回调写入、
+    // 本回调读出混音。为 nil 时退化为「仅更新麦克风电平、不写 stdout」的防御分支
+    // （正常装配下不会命中——有麦克风就一定注入 ring 并作主时钟）。
+    var systemRing: AudioRing? = nil
+
+    // 预分配 scratch（实时回调零分配）：outScratch 存去交织后的单声道麦克风+混音结果，
+    // sysScratch 存从 ring 读出的系统音样本。均在 start() 一次性分配、cleanup() 释放。
+    private var outScratch: UnsafeMutablePointer<Float>?
+    private var sysScratch: UnsafeMutablePointer<Float>?
+    private var scratchCap = 0
 
     func start() throws {
         guard let dev = defaultInputDevice() else {
@@ -148,32 +166,77 @@ final class MicCapture {
         // 交错多声道时按 stride 取首声道；CoreAudio 输入默认 Float32
         let channels = max(1, Int(asbd.mChannelsPerFrame))
 
+        // 主时钟模式才需要 scratch（容量取 1 秒样本，远大于任一 IO buffer）
+        if systemRing != nil {
+            let cap = max(48000, Int(sampleRate))
+            outScratch = UnsafeMutablePointer<Float>.allocate(capacity: cap)
+            sysScratch = UnsafeMutablePointer<Float>.allocate(capacity: cap)
+            scratchCap = cap
+        }
+        // 闭包外捕获为局部量：避免回调隐式捕获 self，保证实时线程零分配
+        let ring = systemRing
+        let out = outScratch
+        let sys = sysScratch
+        let cap = scratchCap
+
         var pid: AudioDeviceIOProcID?
         let st = AudioDeviceCreateIOProcIDWithBlock(&pid, dev, ioQueue) {
-            [ring] _, inInputData, _, _, _ in
+            _, inInputData, _, _, _ in
+            if writeFailedFlag.pointee { return }
             let abl = UnsafeMutableAudioBufferListPointer(
                 UnsafeMutablePointer(mutating: inInputData))
             guard abl.count > 0 else { return }
             let buf = abl[0]
             guard let data = buf.mData, buf.mDataByteSize > 0 else { return }
-            let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
+            let total = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
             let fp = data.assumingMemoryBound(to: Float.self)
             let stride = max(1, Int(buf.mNumberChannels > 0 ? buf.mNumberChannels : UInt32(channels)))
-            ring.write(fp, n, stride: stride)
-            var peak: Float = 0
-            var sumsq: Double = 0
-            var cnt = 0
-            var i = 0
-            while i < n {
-                let v = fp[i]; let a = abs(v)
-                if a > peak { peak = a }
-                sumsq += Double(v) * Double(v); cnt += 1
-                i += stride
+            let frames = total / stride
+
+            // 主时钟模式：去交织成单声道 → 混入系统音 → 写 stdout
+            if let ring = ring, let out = out, let sys = sys, frames > 0, frames <= cap {
+                // 去交织取首声道，同时算麦克风电平（混音前的纯麦克风值）
+                var peak: Float = 0
+                var sumsq: Double = 0
+                for f in 0..<frames {
+                    let v = fp[f &* stride]
+                    out[f] = v
+                    let a = abs(v)
+                    if a > peak { peak = a }
+                    sumsq += Double(v) * Double(v)
+                }
+                // 从 ring 取等量系统音叠加（简单相加 + 削顶）。系统静音时 got=0，
+                // out 保持纯麦克风。got 一般 == frames；不等时按可用量混，避免读到旧样本。
+                let got = ring.read(into: sys, frames)
+                for f in 0..<got {
+                    out[f] = max(-1.0, min(1.0, out[f] + sys[f]))
+                }
+                meterLock.lock()
+                if peak > micMeterPeak { micMeterPeak = peak }
+                micMeterSumSq += sumsq; micMeterCount += frames
+                meterLock.unlock()
+                // 唯一 stdout 写出口。EPIPE（ffmpeg 退出）→ 置位交主线程清理
+                if !writeAll(fd: 1, data: out, count: frames * MemoryLayout<Float>.size) {
+                    writeFailedFlag.pointee = true
+                    DispatchQueue.main.async { cleanupAndExit(0) }
+                }
+            } else {
+                // 防御分支（未注入 ring / scratch 缺失）：只更新电平，不写 stdout
+                var peak: Float = 0
+                var sumsq: Double = 0
+                var cnt = 0
+                var i = 0
+                while i < total {
+                    let v = fp[i]; let a = abs(v)
+                    if a > peak { peak = a }
+                    sumsq += Double(v) * Double(v); cnt += 1
+                    i += stride
+                }
+                meterLock.lock()
+                if peak > micMeterPeak { micMeterPeak = peak }
+                micMeterSumSq += sumsq; micMeterCount += cnt
+                meterLock.unlock()
             }
-            meterLock.lock()
-            if peak > micMeterPeak { micMeterPeak = peak }
-            micMeterSumSq += sumsq; micMeterCount += cnt
-            meterLock.unlock()
         }
         guard st == noErr, let createdPid = pid else {
             throw TapError("mic AudioDeviceCreateIOProcIDWithBlock failed (status \(st))")
@@ -191,6 +254,9 @@ final class MicCapture {
     func cleanup() {
         if running, let p = procID { AudioDeviceStop(deviceID, p); running = false }
         if let p = procID { AudioDeviceDestroyIOProcID(deviceID, p); procID = nil }
+        if let o = outScratch { o.deallocate(); outScratch = nil }
+        if let s = sysScratch { s.deallocate(); sysScratch = nil }
+        scratchCap = 0
     }
 }
 
@@ -218,12 +284,10 @@ final class TapCapture {
     private var procID: AudioDeviceIOProcID?
     private var running = false
     private let ioQueue = DispatchQueue(label: "meetap.audio-tap.io")
-    var micRing: MicRing? = nil  // --with-mic 时由 main 注入；tap 回调里混音
-
-    // 混音用 scratch buffer：在 start() 一次性预分配，实时回调里复用，
-    // 绝不在 IO 回调（实时线程）里 malloc/新建数组——那会引发音频 glitch。
-    private var micScratch: UnsafeMutablePointer<Float>?
-    private var micScratchCap = 0
+    // 系统音环形缓冲：由 main 注入（--with-mic 主时钟装配）。非 nil 时 tap 作【从】，
+    // 本回调只把系统音写进 ring，由麦克风回调（主时钟）读出混音并写 stdout；tap 回调
+    // 自身不碰 stdout。为 nil 时（无麦克风降级）tap 作主，直接写 stdout。
+    var systemRing: AudioRing? = nil
 
     private(set) var sampleRate: Float64 = 0
     private(set) var channels: UInt32 = 1
@@ -295,26 +359,21 @@ final class TapCapture {
         }
         aggregateID = aggID
 
-        // 混音 scratch buffer 预分配：容量取 1 秒样本（sampleRate 帧），远大于
-        // 任一 IO buffer（通常几十毫秒）。回调里若 n 超容量则跳过混音（不分配）。
         // 闭包外捕获为局部量，避免回调隐式捕获 self、也保证实时线程零分配。
-        if micRing != nil {
-            let cap = max(48000, Int(sampleRate))
-            micScratch = UnsafeMutablePointer<Float>.allocate(capacity: cap)
-            micScratchCap = cap
-        }
-        let scratch = micScratch
-        let scratchCap = micScratchCap
+        let ring = systemRing
 
-        // 4. IO proc：从回调拿 PCM，直接写 stdout。
+        // 4. IO proc。两种角色：
+        //    - 有麦克风（ring != nil）：tap 作【从】，只把系统音写进 ring，
+        //      不碰 stdout。麦克风回调（主时钟）负责读 ring、混音、写 stdout。
+        //    - 无麦克风（ring == nil）：tap 作主，直接把系统音写 stdout（降级路径）。
         //    mono tap → 单 buffer Float32；管道写通常远快于实时音频速率，不会阻塞回调。
         var pid: AudioDeviceIOProcID?
-        let ring = micRing
         st = AudioDeviceCreateIOProcIDWithBlock(&pid, aggregateID, ioQueue) {
             _, inInputData, _, _, _ in
+            if writeFailedFlag.pointee { return }
             let abl = UnsafeMutableAudioBufferListPointer(
                 UnsafeMutablePointer(mutating: inInputData))
-            guard abl.count > 0, !writeFailedFlag.pointee else { return }
+            guard abl.count > 0 else { return }
             let buf = abl[0]
             guard let data = buf.mData, buf.mDataByteSize > 0 else { return }
             let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
@@ -332,25 +391,17 @@ final class TapCapture {
             meterSumSq += sumsq; meterCount += n
             meterLock.unlock()
 
-            // --with-mic：tap 作主时钟，从 ring 取等量麦克风样本叠加（进程内混音，
-            // 借鉴 meetily pipeline；简单相加 + 削顶防爆音）。
-            // 用预分配 scratch buffer（start() 里按 tap 首帧 n 分配），不在实时
-            // 回调里 malloc。若某帧 n 超出容量（极罕见），跳过混音只保系统音，
-            // 绝不触发实时线程分配。
-            if let ring = ring, let scratch = scratch, n <= scratchCap {
-                let got = ring.read(into: scratch, n)
-                if got > 0 {
-                    for i in 0..<got {
-                        let mixed = fp[i] + scratch[i]
-                        fp[i] = max(-1.0, min(1.0, mixed))
-                    }
+            if let ring = ring {
+                // 从模式：系统音写进 ring，交给麦克风主时钟回调混音输出。
+                // ring 满时自动丢最旧样本（麦克风消费略慢的极端情况下），不阻塞。
+                ring.write(fp, n, stride: 1)
+            } else {
+                // 主模式（无麦克风降级）：直接写 stdout
+                if !writeAll(fd: 1, data: data, count: Int(buf.mDataByteSize)) {
+                    // 下游（ffmpeg）已退出：置位并交给主线程清理，不在实时线程里做重活
+                    writeFailedFlag.pointee = true
+                    DispatchQueue.main.async { cleanupAndExit(0) }
                 }
-            }
-
-            if !writeAll(fd: 1, data: data, count: Int(buf.mDataByteSize)) {
-                // 下游（ffmpeg）已退出：置位并交给主线程清理，不在实时线程里做重活
-                writeFailedFlag.pointee = true
-                DispatchQueue.main.async { cleanupAndExit(0) }
             }
         }
         guard st == noErr, let createdPid = pid else {
@@ -385,11 +436,6 @@ final class TapCapture {
         if tapID != kAudioObjectUnknown {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
-        }
-        if let s = micScratch {
-            s.deallocate()
-            micScratch = nil
-            micScratchCap = 0
         }
     }
 }
@@ -492,13 +538,19 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     let capture = TapCapture()
     activeCapture = capture
 
-    // 麦克风先启动（失败不致命——静默降级为纯系统音，会议不能不录）
+    // 麦克风先启动（失败不致命——静默降级为纯系统音，会议不能不录）。
+    // 装配：麦克风作主时钟、独占 stdout；tap 作从、只把系统音写进共享 ring。
+    // 共享 ring 必须在两者 start() 前注入——两个回调都在各自 start() 里捕获它。
+    // 麦克风启动成功才把 ring 交给 tap；失败则 capture.systemRing 保持 nil，
+    // tap 退化为主时钟直接写 stdout（纯系统音降级路径）。
     if withMic {
         let mic = MicCapture()
+        let sharedRing = AudioRing(capacity: 96000)  // 2s @48k
+        mic.systemRing = sharedRing
         do {
             try mic.start()
             activeMic = mic
-            capture.micRing = mic.ring
+            capture.systemRing = sharedRing
             fputs("MIC=on rate=\(Int(mic.sampleRate))\n", stderr)
         } catch {
             fputs("MIC=off (\(error))\n", stderr)
@@ -524,9 +576,12 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
             + "mixing without resample will distort mic audio\n", stderr)
     }
 
-    // 元信息走 stderr（stdout 只有 PCM 数据），供调用方构造 ffmpeg 参数
-    fputs("SAMPLE_RATE=\(Int(capture.sampleRate))\n", stderr)
-    fputs("CHANNELS=\(capture.channels)\n", stderr)
+    // 元信息走 stderr（stdout 只有 PCM 数据），供调用方构造 ffmpeg 参数。
+    // 麦克风作主时钟时 stdout 流是【麦克风采样率】；无麦克风降级时才是 tap 率。
+    // 二者在现代 Mac 上同为 48kHz（不等已在上面告警）。
+    let outputRate = activeMic.map { Int($0.sampleRate) } ?? Int(capture.sampleRate)
+    fputs("SAMPLE_RATE=\(outputRate)\n", stderr)
+    fputs("CHANNELS=1\n", stderr)
     fputs("FORMAT=f32le\n", stderr)
 
     // SIGINT/SIGTERM → 显式清理后退出（用 DispatchSource，避免在信号处理器里做非安全调用）
