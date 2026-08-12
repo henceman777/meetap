@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.6.0"
+VERSION="1.6.1"
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
@@ -1591,7 +1591,11 @@ start_recording() {
             echo $TAP_PID > "$TAP_PID_FILE"
             disown $TAP_PID
 
-            ffmpeg -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
+            # -y：覆盖已存在的输出文件。会话目录名精确到分钟，同一分钟内重跑
+            # start 会撞上同名 m4a；缺 -y 时 ffmpeg 弹交互式 Overwrite?[y/N]，
+            # stdin=/dev/null 读到 EOF 判为 N 而秒退 → time= 不推进 → 健康探测
+            # 误判「tap 无数据」触发自愈，3 次全撞同一文件 → 假报“反复无数据”。
+            ffmpeg -y -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
                 -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
                 -movflags frag_keyframe+empty_moov \
                 "$OUTPUT_FILE" \
@@ -1738,7 +1742,9 @@ start_recording() {
     local MIC_NAME
     MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
     $VERBOSE && _t MIC_DEVICE "$MIC_NAME"
-    ffmpeg -f avfoundation -i ":BlackHole 2ch" \
+    # -y：覆盖已存在的输出文件（同一分钟内重跑 start 会撞同名 m4a，缺 -y 会
+    # 弹交互式 Overwrite? 而秒退，详见 tap 分支说明）。
+    ffmpeg -y -f avfoundation -i ":BlackHole 2ch" \
         -f avfoundation -i ":default" \
         -filter_complex amix=inputs=2:duration=longest \
         -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
