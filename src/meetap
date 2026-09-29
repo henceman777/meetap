@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.6.1"
+VERSION="1.7.0"
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
@@ -391,6 +391,17 @@ transcribe_recording() {
 
     exec > "$LOG_FILE" 2>&1
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
+
+    # 整段是数字静音（全 0 样本）就不上传转录：多半是没授权系统音频录制，
+    # 或 --mute-microphone 时电脑一直没出声。必须在上传前查，上传步骤会删本地音频。
+    local max_vol
+    max_vol=$(ffmpeg -nostdin -i "$AUDIO_FILE" -af volumedetect -f null - 2>&1 \
+        | sed -n 's/.*max_volume: \([-0-9.]*\) dB.*/\1/p')
+    if [[ -n "$max_vol" ]] && (( ${max_vol%%.*} <= -90 )); then
+        _t ERR_RECORDING_SILENT "$AUDIO_FILE" "$0"
+        osascript -e "display notification \"$(_tn NOTIFY_RECORDING_SILENT)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
+    fi
 
     if ! command -v aws &>/dev/null; then
         _t ERR_AWS_CLI_MISSING
@@ -1451,9 +1462,13 @@ _tap_audio_flowing() {
 start_recording() {
     local VERBOSE=false
     local MAX_DURATION_MIN=""   # 会议时长上限（分钟，可选）
-    # 解析选项：-t/--test 显示详情；-d/--duration N 指定会议时长上限（分钟）
-    # 选项可任意顺序，之后的位置参数为会议名称
-    while [[ "${1:-}" == -* ]]; do
+    local MUTE_MIC=false        # 只录系统音（录网页直播时屏蔽现场环境声）
+    # 解析选项：-t/--test 显示详情；-d/--duration N 指定会议时长上限（分钟）；
+    # --mute-microphone 不录麦克风
+    # 选项可任意顺序、可写在会议名前后；第一个非选项参数为会议名称
+    # （meetap start 季度架构评审）
+    local MEETING_NAME=""
+    while (( $# > 0 )); do
         case "$1" in
             -t|--test)
                 VERBOSE=true
@@ -1468,15 +1483,21 @@ start_recording() {
                 fi
                 shift 2
                 ;;
-            *)
+            --mute-microphone)
+                MUTE_MIC=true
+                shift
+                ;;
+            -*)
                 _t ERR_UNKNOWN_OPTION "$1"
                 exit 1
+                ;;
+            *)
+                [[ -z "$MEETING_NAME" ]] && MEETING_NAME="$1"
+                shift
                 ;;
         esac
     done
     [[ "$VERBOSE" == "false" ]] && rm -f "$STATE_DIR/test-mode"
-    # 可选位置参数：会议名称（meetap start 季度架构评审）
-    local MEETING_NAME="${1:-}"
 
     # 检查是否已在录制
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -1569,13 +1590,15 @@ start_recording() {
         # IO proc)，ring buffer 混音后输出单路 PCM；ffmpeg 只做编码、零设备
         # 访问——彻底消灭 avfoundation 与 tap 的设备竞态（用户环境必现卡死）。
         # 电平双文件由 audio-tap 内部输出（tap-level 系统音 / mic-level 麦克风）。
+        # audio-tap 的输出自带时钟：系统没播放、也没麦克风时按时补零，stdout
+        # 不断流。所以 --mute-microphone 直接不开麦克风（不传 --with-mic）。
         local TAP_FIFO="$STATE_DIR/tap.fifo"
 
-        # tap+ffmpeg 启动 + 自愈重启：Process Tap 的 IO 回调偶发不启动
-        # （AudioDeviceStart 返回成功却静默不喂数据），此时 ffmpeg 阻塞在读
-        # FIFO、输出恒为 0 字节 → 转录报 empty，整段会议静默丢失。这里启动后
-        # 探测音频是否真在流动（见 _tap_audio_flowing），不流动就杀掉重启，
-        # 最多 3 次；仍失败则明确报错，绝不留下静默空录。
+        # tap+ffmpeg 启动 + 自愈重启：启动后探测 ffmpeg 是否真在收数据（见
+        # _tap_audio_flowing），没收到就杀掉重启，最多 3 次；仍失败则明确报错，
+        # 绝不留下静默空录。Process Tap 回调偶发不启动的问题由 audio-tap 进程内
+        # 的看门狗处理（有声音在放但 tap 没回调就重建 tap），这里管的是
+        # audio-tap / ffmpeg 本身没起来。
         local TAP_MAX_TRIES=3
         local tap_try=1
         local tap_ok=false
@@ -1583,9 +1606,10 @@ start_recording() {
             rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO" "$STATE_DIR/ffmpeg.log"
             mkfifo "$TAP_FIFO"
 
-            "$TAP_TOOL" tap-start --with-mic \
+            local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level")
+            $MUTE_MIC && mic_args=()
+            "$TAP_TOOL" tap-start "${mic_args[@]}" \
                 --level-file "$STATE_DIR/tap-level" \
-                --mic-level-file "$STATE_DIR/mic-level" \
                 > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
             TAP_PID=$!
             echo $TAP_PID > "$TAP_PID_FILE"
@@ -1657,6 +1681,7 @@ start_recording() {
             _t RECORDING_STARTED
             $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
             _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
+            $MUTE_MIC && _t FIELD_MIC_MUTED
             _t FIELD_STOP_CMD "$0"
             if [[ -n "$MAX_DURATION_MIN" ]]; then
                 _t FIELD_MAX_DURATION "$MAX_DURATION_MIN" "$(date -v+"${MAX_DURATION_MIN}"M +%H:%M)"
@@ -1737,16 +1762,21 @@ start_recording() {
     fi
     $VERBOSE && _t MONITOR_STARTED "$ORIG_NAME"
 
-    # 开始录制（系统音频 + 麦克风混录）
+    # 开始录制（系统音频 + 麦克风混录；--mute-microphone 时只录系统音）
     # 会话目录与 OUTPUT_FILE 已在捕获方式分支前生成（两分支共用）
-    local MIC_NAME
-    MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
-    $VERBOSE && _t MIC_DEVICE "$MIC_NAME"
+    # 静音时用 volume=0.5 代替 amix：amix 两路输入各压一半，去掉后音量会
+    # 高 6dB，响的地方还会削顶。保持和混录时一样的电平。
+    local mic_args=(-af volume=0.5)
+    if ! $MUTE_MIC; then
+        local MIC_NAME
+        MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
+        $VERBOSE && _t MIC_DEVICE "$MIC_NAME"
+        mic_args=(-f avfoundation -i ":default" -filter_complex amix=inputs=2:duration=longest)
+    fi
     # -y：覆盖已存在的输出文件（同一分钟内重跑 start 会撞同名 m4a，缺 -y 会
     # 弹交互式 Overwrite? 而秒退，详见 tap 分支说明）。
     ffmpeg -y -f avfoundation -i ":BlackHole 2ch" \
-        -f avfoundation -i ":default" \
-        -filter_complex amix=inputs=2:duration=longest \
+        "${mic_args[@]}" \
         -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
         -movflags frag_keyframe+empty_moov \
         "$OUTPUT_FILE" \
@@ -1770,6 +1800,7 @@ start_recording() {
         _t RECORDING_STARTED
         $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
         _t FIELD_PLAYBACK "$ORIG_NAME"
+        $MUTE_MIC && _t FIELD_MIC_MUTED
         if [[ -n "$MAX_DURATION_MIN" ]]; then
             _t FIELD_MAX_DURATION "$MAX_DURATION_MIN" "$(date -v+"${MAX_DURATION_MIN}"M +%H:%M)"
         else
