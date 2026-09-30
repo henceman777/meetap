@@ -212,10 +212,24 @@ $ meetap start -d 60
    自动停止: 60 分钟后（约 15:30）
 ```
 
+录网页直播、线上分享这类只需要电脑声音的场景，现场环境声会干扰转录，加 `--mute-microphone` 只录系统音：
+
+```bash
+$ meetap start --mute-microphone -d 150
+
+🎙️  录制已开始
+   播放: MacBook Pro Speakers (Process Tap)
+   麦克风: 已静音（只录系统音）
+   停止录制: /Users/you/bin/meetap stop
+   自动停止: 150 分钟后（约 17:00）
+```
+
+加了这个选项，麦克风全程不打开，菜单栏不会亮橙点，AirPods 也不会被切到通话音质。选项写在会议名前后都行。如果整段录音都是静音（比如没授权系统音频录制），`stop` 之后不会上传转录，音频会留在本地，并弹通知提醒你。
+
 音频采集期间：
 
 - **你正常开会**，音频照常从原来的扬声器 / 耳机里播放（Process Tap 不切换输出设备；BlackHole 回退时由 audio-monitor 实时转发）
-- **终端底部**会显示麦克风电平 + 时长
+- **终端底部**会显示音量电平 + 时长（`--mute-microphone` 时只跟电脑声音走）
 - 指定了 `-d` 时，到达时长上限会自动停止；否则一直录到你手动 `stop`
 - **走 BlackHole 回退时，不要手动切换系统音频输出**，否则音频采集会无声（Process Tap 模式无此限制）
 
@@ -393,7 +407,7 @@ sequenceDiagram
 | 症状 | 原因 / 解决 |
 |---|---|
 | 首次 `start` 提示无系统音频权限 / 录音全静音 | 运行 `meetap setup` 完成 Process Tap 授权；或在系统设置 → 隐私与安全性 → 系统音频录制 中允许 |
-| 录出 **0 字节音频** / 转录报 `input file empty`（短会议偶发） | macOS Process Tap 的 IO 回调偶发不启动（`AudioDeviceStart` 成功但静默不喂数据），ffmpeg 收不到 PCM。**注意点阵波形读的是麦克风电平，此时仍会跳动，不代表在正常录音**。`start` 已内置自愈：检测到无数据会自动重启音频链路最多 3 次，仍失败则明确报错——按提示重跑 `meetap setup` 查授权或重新 `start` 即可 |
+| 录出 **0 字节音频** / 转录报 `input file empty`（短会议偶发） | macOS Process Tap 的 IO 回调偶发不启动（`AudioDeviceStart` 成功但静默不喂数据），ffmpeg 收不到 PCM。**注意点阵波形读的是麦克风电平，此时仍会跳动，不代表在正常录音**。录音过程中 audio-tap 会自己盯着：有声音在放、tap 却一直没数据，就在进程内重建 tap，录音不中断。`start` 时 audio-tap 或 ffmpeg 起不来，会自动重试最多 3 次，仍失败则明确报错，按提示重跑 `meetap setup` 查授权或重新 `start` 即可 |
 | 转录失败：`AWS credentials not configured` | 跑 `aws configure` 或检查 `AWS_PROFILE` |
 | 转录失败：`AccessDenied` / `ValidationException` | 确认账号已开通 Bedrock Model access，且 IAM 有 `bedrock:InvokeModelWithResponseStream` 权限 |
 | 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../log/meetap.log` 查看具体 AWS 报错 |

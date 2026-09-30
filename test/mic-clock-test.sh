@@ -1,5 +1,6 @@
 #!/bin/bash
-# 麦克风主时钟回归测试：系统静音时，--with-mic 的 PCM 输出必须持续。
+# 输出时钟回归测试：系统静音时，tap-start 的 PCM 输出必须持续
+# （带 --with-mic 与不带都要测；不带即 meetap start --mute-microphone 的路径）。
 #
 # 用法:
 #   test/mic-clock-test.sh
@@ -15,6 +16,7 @@
 #   持续收到 PCM 字节（麦克风按 IO 周期产帧，即便静音也是零值样本、仍是字节）。
 #   - 修复前：tap 回调不触发 → 约 0 字节 → 本测试 FAIL（复现 bug）
 #   - 修复后：麦克风作主时钟驱动 stdout → 字节数 >> 0 → PASS
+#   不带 --with-mic 时同理：audio-tap 输出自带时钟，系统静音时按时补零。
 #
 # 前提: macOS 14.4+、终端已授予「系统音频录制」权限、有可用输入设备。
 set -euo pipefail
@@ -48,23 +50,22 @@ if ! "$BIN" tap-supported >/dev/null 2>&1; then
     exit 0
 fi
 
-echo "== 采集 ${DUR}s（期间【不要】播放任何音频，模拟线下会议电脑静音）=="
+echo "== 采集（期间【不要】播放任何音频，模拟线下会议电脑静音）=="
 echo "   （可对着麦克风说话，但不说话也应通过——静音样本仍是字节流）"
 # 关键：全程不 afplay、不放音乐/视频，让系统音保持静默。
-"$BIN" tap-start --with-mic --duration "$DUR" > "$OUT" 2> "$ERRLOG" || true
-
-BYTES=$(wc -c < "$OUT" | tr -d ' ')
-echo ""
-echo "== audio-tap stderr =="
-cat "$ERRLOG"
-echo ""
-echo "== 结果：stdout PCM 字节数 = ${BYTES} (阈值 ${MIN_BYTES}) =="
-
-if [[ "$BYTES" -ge "$MIN_BYTES" ]]; then
-    echo "PASS: 系统静音时麦克风仍持续输出 PCM，链路健康。"
-    exit 0
-else
-    echo "FAIL: 系统静音时 stdout 几乎无数据（$BYTES < $MIN_BYTES）。"
-    echo "      说明 PCM 写出仍依赖系统音 tap 回调——线下会议会录成空。"
-    exit 1
-fi
+FAIL=0
+for MODE in "--with-mic" ""; do
+    "$BIN" tap-start $MODE --duration "$DUR" > "$OUT" 2> "$ERRLOG" || true
+    BYTES=$(wc -c < "$OUT" | tr -d ' ')
+    echo ""
+    echo "== [${MODE:-无麦克风}] audio-tap stderr =="
+    cat "$ERRLOG"
+    echo "== [${MODE:-无麦克风}] stdout PCM 字节数 = ${BYTES} (阈值 ${MIN_BYTES}) =="
+    if [[ "$BYTES" -ge "$MIN_BYTES" ]]; then
+        echo "PASS: 系统静音时仍持续输出 PCM。"
+    else
+        echo "FAIL: 系统静音时 stdout 几乎无数据（$BYTES < $MIN_BYTES），录音会断流/录成空。"
+        FAIL=1
+    fi
+done
+exit $FAIL

@@ -9,7 +9,8 @@ import Foundation
 //   tap-supported             检测系统是否支持 Process Tap（≥14.4 输出 "yes" exit 0）
 //   tap-rate                  打印默认输出设备标称采样率（整数 Hz，仅参考）
 //   tap-format                打印 Process Tap 实际采样率（整数 Hz，采集/编码以此为准）
-//   tap-start [--duration N]  捕获系统音频，Float32 LE mono PCM 写 stdout
+//   tap-start [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH]
+//                             捕获系统音频（--with-mic 混入麦克风），Float32 LE mono PCM 写 stdout
 //                             ffmpeg 读法: ffmpeg -f f32le -ar <rate> -ac 1 -i pipe:0 ...
 //
 // tap-start 启动后 stderr 输出 "SAMPLE_RATE=<rate>" 等元信息（数据只走 stdout）。
@@ -73,19 +74,22 @@ var micMeterPeak: Float = 0     // 麦克风峰值
 var micMeterSumSq: Double = 0
 var micMeterCount: Int = 0
 var meterTimer: DispatchSourceTimer? = nil
+// tap 回调最近一次触发的时刻（uptime ns，meterLock 保护），供 tap 卡死看门狗用
+var tapLastNs: UInt64 = 0
 
 // MARK: - 麦克风采集与混音（--with-mic，借鉴 meetily ring-buffer 混音架构）
 // meetily 经验（core_audio.rs / pipeline.rs, MIT）：绝不让外部进程（ffmpeg
 // avfoundation）碰音频设备——tap 采系统音、进程内采麦克风、ring buffer 混音、
 // 单路 PCM 输出。彻底消灭设备抢占/枚举竞态一类问题。
 
-// 通用音频环形缓冲：一方 IO 回调写入，另一方 IO 回调按需读出。
-// 现用于「系统音 ring」——tap 回调写入，麦克风回调（主时钟）读出混音。
+// 通用音频环形缓冲：IO 回调写入，输出写线程（OutputWriter）按需读出。
+// 系统音、麦克风各一个。
 final class AudioRing {
     private var buf: [Float]
     private var readIdx = 0, writeIdx = 0, count = 0
     private let lock = NSLock()
     init(capacity: Int) { buf = [Float](repeating: 0, count: capacity) }
+    var available: Int { lock.lock(); defer { lock.unlock() }; return count }
     func write(_ data: UnsafePointer<Float>, _ n: Int, stride: Int) {
         lock.lock(); defer { lock.unlock() }
         var i = 0
@@ -123,31 +127,17 @@ func defaultInputDevice() -> AudioDeviceID? {
     return id
 }
 
-// 麦克风采集：默认输入设备上挂 IO proc。
-//
-// 主时钟角色（systemRing 已注入时）：麦克风是整条链路里【一直走时钟】的设备
-// ——无论有没有人说话，硬件都按 IO 周期持续交帧。因此让它作主时钟、独占
-// stdout 写出口：本回调去交织成单声道 → 从「系统音 ring」取等量样本混入
-// （tap 回调写进去的）→ 削顶防爆 → 写 stdout。系统静音时 tap 回调不触发、
-// ring 为空，混入的是零，输出即纯麦克风——线下会议（电脑无播放）照录不误。
-// 这修复了老架构「唯一 stdout 出口挂在时有时无的系统音 tap 回调上」的致命缺陷。
+// 麦克风采集：默认输入设备上挂 IO proc，取首声道写进麦克风 ring，
+// 由 OutputWriter 读出混音。本回调不碰 stdout。
 final class MicCapture {
     private var deviceID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private var running = false
     private let ioQueue = DispatchQueue(label: "meetap.audio-tap.mic")
+    private let ring: AudioRing
     private(set) var sampleRate: Float64 = 0
 
-    // 系统音环形缓冲：由 main 注入（--with-mic 主时钟装配）。tap 回调写入、
-    // 本回调读出混音。为 nil 时退化为「仅更新麦克风电平、不写 stdout」的防御分支
-    // （正常装配下不会命中——有麦克风就一定注入 ring 并作主时钟）。
-    var systemRing: AudioRing? = nil
-
-    // 预分配 scratch（实时回调零分配）：outScratch 存去交织后的单声道麦克风+混音结果，
-    // sysScratch 存从 ring 读出的系统音样本。均在 start() 一次性分配、cleanup() 释放。
-    private var outScratch: UnsafeMutablePointer<Float>?
-    private var sysScratch: UnsafeMutablePointer<Float>?
-    private var scratchCap = 0
+    init(ring: AudioRing) { self.ring = ring }
 
     func start() throws {
         guard let dev = defaultInputDevice() else {
@@ -165,19 +155,8 @@ final class MicCapture {
         _ = AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &asbd)
         // 交错多声道时按 stride 取首声道；CoreAudio 输入默认 Float32
         let channels = max(1, Int(asbd.mChannelsPerFrame))
-
-        // 主时钟模式才需要 scratch（容量取 1 秒样本，远大于任一 IO buffer）
-        if systemRing != nil {
-            let cap = max(48000, Int(sampleRate))
-            outScratch = UnsafeMutablePointer<Float>.allocate(capacity: cap)
-            sysScratch = UnsafeMutablePointer<Float>.allocate(capacity: cap)
-            scratchCap = cap
-        }
         // 闭包外捕获为局部量：避免回调隐式捕获 self，保证实时线程零分配
-        let ring = systemRing
-        let out = outScratch
-        let sys = sysScratch
-        let cap = scratchCap
+        let ring = self.ring
 
         var pid: AudioDeviceIOProcID?
         let st = AudioDeviceCreateIOProcIDWithBlock(&pid, dev, ioQueue) {
@@ -191,52 +170,22 @@ final class MicCapture {
             let total = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
             let fp = data.assumingMemoryBound(to: Float.self)
             let stride = max(1, Int(buf.mNumberChannels > 0 ? buf.mNumberChannels : UInt32(channels)))
-            let frames = total / stride
 
-            // 主时钟模式：去交织成单声道 → 混入系统音 → 写 stdout
-            if let ring = ring, let out = out, let sys = sys, frames > 0, frames <= cap {
-                // 去交织取首声道，同时算麦克风电平（混音前的纯麦克风值）
-                var peak: Float = 0
-                var sumsq: Double = 0
-                for f in 0..<frames {
-                    let v = fp[f &* stride]
-                    out[f] = v
-                    let a = abs(v)
-                    if a > peak { peak = a }
-                    sumsq += Double(v) * Double(v)
-                }
-                // 从 ring 取等量系统音叠加（简单相加 + 削顶）。系统静音时 got=0，
-                // out 保持纯麦克风。got 一般 == frames；不等时按可用量混，避免读到旧样本。
-                let got = ring.read(into: sys, frames)
-                for f in 0..<got {
-                    out[f] = max(-1.0, min(1.0, out[f] + sys[f]))
-                }
-                meterLock.lock()
-                if peak > micMeterPeak { micMeterPeak = peak }
-                micMeterSumSq += sumsq; micMeterCount += frames
-                meterLock.unlock()
-                // 唯一 stdout 写出口。EPIPE（ffmpeg 退出）→ 置位交主线程清理
-                if !writeAll(fd: 1, data: out, count: frames * MemoryLayout<Float>.size) {
-                    writeFailedFlag.pointee = true
-                    DispatchQueue.main.async { cleanupAndExit(0) }
-                }
-            } else {
-                // 防御分支（未注入 ring / scratch 缺失）：只更新电平，不写 stdout
-                var peak: Float = 0
-                var sumsq: Double = 0
-                var cnt = 0
-                var i = 0
-                while i < total {
-                    let v = fp[i]; let a = abs(v)
-                    if a > peak { peak = a }
-                    sumsq += Double(v) * Double(v); cnt += 1
-                    i += stride
-                }
-                meterLock.lock()
-                if peak > micMeterPeak { micMeterPeak = peak }
-                micMeterSumSq += sumsq; micMeterCount += cnt
-                meterLock.unlock()
+            var peak: Float = 0
+            var sumsq: Double = 0
+            var cnt = 0
+            var i = 0
+            while i < total {
+                let v = fp[i]; let a = abs(v)
+                if a > peak { peak = a }
+                sumsq += Double(v) * Double(v); cnt += 1
+                i += stride
             }
+            meterLock.lock()
+            if peak > micMeterPeak { micMeterPeak = peak }
+            micMeterSumSq += sumsq; micMeterCount += cnt
+            meterLock.unlock()
+            ring.write(fp, total, stride: stride)
         }
         guard st == noErr, let createdPid = pid else {
             throw TapError("mic AudioDeviceCreateIOProcIDWithBlock failed (status \(st))")
@@ -254,9 +203,6 @@ final class MicCapture {
     func cleanup() {
         if running, let p = procID { AudioDeviceStop(deviceID, p); running = false }
         if let p = procID { AudioDeviceDestroyIOProcID(deviceID, p); procID = nil }
-        if let o = outScratch { o.deallocate(); outScratch = nil }
-        if let s = sysScratch { s.deallocate(); sysScratch = nil }
-        scratchCap = 0
     }
 }
 
@@ -273,6 +219,119 @@ func writeAll(fd: Int32, data: UnsafeRawPointer, count: Int) -> Bool {
     return true
 }
 
+// MARK: - 输出写线程（自带时钟）
+// stdout 的唯一写出口，每 10ms 从系统音、麦克风两个 ring 取数混音写出。
+// 有源在出数据（最近 250ms 内来过样本）时，按活跃源里可用量最少的那个取，
+// 时间轴跟着设备硬件时钟走，哪一路都不会被插零。所有源都安静时（系统没播放，
+// 且没开麦克风或麦克风被拔掉），按系统时钟补零，录音照常往前走。
+// 老架构把时钟借给 tap 或麦克风，借来的那个一停，stdout 就断流、录音就停。
+final class OutputWriter {
+    private static let idleNs: UInt64 = 250_000_000
+    private let rate: Double
+    private let sysRing: AudioRing
+    private let micRing: AudioRing?
+    private let queue = DispatchQueue(label: "meetap.audio-tap.writer", qos: .userInteractive)
+    private var timer: DispatchSourceTimer?
+    private let cap: Int
+    private let out, sys, mic: UnsafeMutablePointer<Float>
+    private var written = 0
+    // 补零用的时钟锚点：anchorNs 时刻对应已写出 anchorWritten 帧
+    private var anchorNs: UInt64 = 0
+    private var anchorWritten = 0
+    private var sysSeenNs: UInt64 = 0
+    private var micSeenNs: UInt64 = 0
+
+    init(rate: Double, sysRing: AudioRing, micRing: AudioRing?) {
+        self.rate = rate
+        self.sysRing = sysRing
+        self.micRing = micRing
+        cap = max(48000, Int(rate))  // 单拍上限 1 秒
+        out = .allocate(capacity: cap)
+        sys = .allocate(capacity: cap)
+        mic = .allocate(capacity: cap)
+    }
+
+    func start() {
+        anchorNs = DispatchTime.now().uptimeNanoseconds
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(2))
+        t.setEventHandler { [unowned self] in self.tick() }
+        t.resume()
+        timer = t
+    }
+
+    private func tick() {
+        if writeFailedFlag.pointee { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let sysAvail = sysRing.available
+        let micAvail = micRing?.available ?? 0
+        if sysAvail > 0 { sysSeenNs = now }
+        if micAvail > 0 { micSeenNs = now }
+        let sysActive = now - sysSeenNs < Self.idleNs
+        let micActive = now - micSeenNs < Self.idleNs
+        let active = sysActive || micActive
+
+        var n: Int
+        if active {
+            n = min(sysActive ? sysAvail : Int.max, micActive ? micAvail : Int.max)
+        } else {
+            n = anchorWritten + Int(Double(now - anchorNs) * rate / 1e9) - written
+        }
+        // 超过单拍上限（写线程曾被下游阻塞很久）：只补一拍，多出的不追
+        let clipped = n > cap
+        n = min(n, cap)
+        guard n > 0 else { return }
+
+        let s = sysRing.read(into: sys, n)
+        let m = micRing?.read(into: mic, n) ?? 0
+        for i in 0..<n {
+            let v = (i < s ? sys[i] : 0) + (i < m ? mic[i] : 0)
+            out[i] = max(-1.0, min(1.0, v))
+        }
+        if !writeAll(fd: 1, data: out, count: n * MemoryLayout<Float>.size) {
+            // 下游（ffmpeg）已退出：置位并交给主线程清理
+            writeFailedFlag.pointee = true
+            DispatchQueue.main.async { cleanupAndExit(0) }
+            return
+        }
+        written += n
+        if active || clipped {
+            anchorNs = now
+            anchorWritten = written
+        }
+    }
+}
+
+// 除本进程外，是否有进程正在往外放声音。用来区分「系统本来就没声音」
+// 和「有声音但 tap 回调没触发（卡死）」。设备级的 IsRunningSomewhere 不行：
+// 输入输出同一设备的 USB 耳机，本进程开麦克风就会让它显示 running。
+@available(macOS 14.4, *)
+func otherProcessPlaying() -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    let sysObj = AudioObjectID(kAudioObjectSystemObject)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(sysObj, &addr, 0, nil, &size) == noErr else { return false }
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(sysObj, &addr, 0, nil, &size, &ids) == noErr else { return false }
+    let me = getpid()
+    for id in ids {
+        var pid: pid_t = 0
+        var running: UInt32 = 0
+        var sz = UInt32(MemoryLayout<pid_t>.size)
+        addr.mSelector = kAudioProcessPropertyPID
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &pid) == noErr, pid != me else { continue }
+        sz = UInt32(MemoryLayout<UInt32>.size)
+        addr.mSelector = kAudioProcessPropertyIsRunningOutput
+        if AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &running) == noErr, running != 0 {
+            return true
+        }
+    }
+    return false
+}
+
 // MARK: - Process Tap 捕获（macOS 14.4+）
 
 struct TapError: Error { let message: String; init(_ m: String) { message = m } }
@@ -284,10 +343,10 @@ final class TapCapture {
     private var procID: AudioDeviceIOProcID?
     private var running = false
     private let ioQueue = DispatchQueue(label: "meetap.audio-tap.io")
-    // 系统音环形缓冲：由 main 注入（--with-mic 主时钟装配）。非 nil 时 tap 作【从】，
-    // 本回调只把系统音写进 ring，由麦克风回调（主时钟）读出混音并写 stdout；tap 回调
-    // 自身不碰 stdout。为 nil 时（无麦克风降级）tap 作主，直接写 stdout。
-    var systemRing: AudioRing? = nil
+    // 系统音 ring：本回调写入，OutputWriter 读出。看门狗重建 tap 时沿用同一个 ring。
+    private let ring: AudioRing
+
+    init(ring: AudioRing) { self.ring = ring }
 
     private(set) var sampleRate: Float64 = 0
     private(set) var channels: UInt32 = 1
@@ -360,13 +419,10 @@ final class TapCapture {
         aggregateID = aggID
 
         // 闭包外捕获为局部量，避免回调隐式捕获 self、也保证实时线程零分配。
-        let ring = systemRing
+        let ring = self.ring
 
-        // 4. IO proc。两种角色：
-        //    - 有麦克风（ring != nil）：tap 作【从】，只把系统音写进 ring，
-        //      不碰 stdout。麦克风回调（主时钟）负责读 ring、混音、写 stdout。
-        //    - 无麦克风（ring == nil）：tap 作主，直接把系统音写 stdout（降级路径）。
-        //    mono tap → 单 buffer Float32；管道写通常远快于实时音频速率，不会阻塞回调。
+        // 4. IO proc：只把系统音写进 ring，不碰 stdout（由 OutputWriter 写出）。
+        //    mono tap → 单 buffer Float32。
         var pid: AudioDeviceIOProcID?
         st = AudioDeviceCreateIOProcIDWithBlock(&pid, aggregateID, ioQueue) {
             _, inInputData, _, _, _ in
@@ -389,20 +445,10 @@ final class TapCapture {
             meterLock.lock()
             if peak > meterPeak { meterPeak = peak }
             meterSumSq += sumsq; meterCount += n
+            tapLastNs = DispatchTime.now().uptimeNanoseconds
             meterLock.unlock()
-
-            if let ring = ring {
-                // 从模式：系统音写进 ring，交给麦克风主时钟回调混音输出。
-                // ring 满时自动丢最旧样本（麦克风消费略慢的极端情况下），不阻塞。
-                ring.write(fp, n, stride: 1)
-            } else {
-                // 主模式（无麦克风降级）：直接写 stdout
-                if !writeAll(fd: 1, data: data, count: Int(buf.mDataByteSize)) {
-                    // 下游（ffmpeg）已退出：置位并交给主线程清理，不在实时线程里做重活
-                    writeFailedFlag.pointee = true
-                    DispatchQueue.main.async { cleanupAndExit(0) }
-                }
-            }
+            // ring 满时自动丢最旧样本（写线程被阻塞的极端情况），不阻塞回调
+            ring.write(fp, n, stride: 1)
         }
         guard st == noErr, let createdPid = pid else {
             cleanup()
@@ -525,6 +571,8 @@ func runTapFormat() -> Never {
 }
 
 var activeMic: MicCapture? = nil
+var activeWriter: OutputWriter? = nil
+var tapWatchdog: DispatchSourceTimer? = nil
 
 func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, withMic: Bool) -> Never {
     guard #available(macOS 14.4, *) else {
@@ -535,24 +583,23 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     writeFailedFlag.pointee = false
     signal(SIGPIPE, SIG_IGN)  // 管道断开由 write 返回 EPIPE 处理，不让信号杀进程
 
-    let capture = TapCapture()
+    // 装配：tap、麦克风各写自己的 ring，OutputWriter 按自带时钟读出混音写 stdout。
+    let sysRing = AudioRing(capacity: 96000)  // 2s @48k
+    let capture = TapCapture(ring: sysRing)
     activeCapture = capture
 
-    // 麦克风先启动（失败不致命——静默降级为纯系统音，会议不能不录）。
-    // 装配：麦克风作主时钟、独占 stdout；tap 作从、只把系统音写进共享 ring。
-    // 共享 ring 必须在两者 start() 前注入——两个回调都在各自 start() 里捕获它。
-    // 麦克风启动成功才把 ring 交给 tap；失败则 capture.systemRing 保持 nil，
-    // tap 退化为主时钟直接写 stdout（纯系统音降级路径）。
+    // 麦克风失败不致命：降级为纯系统音，会议不能不录
+    var micRing: AudioRing? = nil
     if withMic {
-        let mic = MicCapture()
-        let sharedRing = AudioRing(capacity: 96000)  // 2s @48k
-        mic.systemRing = sharedRing
+        let ring = AudioRing(capacity: 96000)
+        let mic = MicCapture(ring: ring)
         do {
             try mic.start()
             activeMic = mic
-            capture.systemRing = sharedRing
+            micRing = ring
             fputs("MIC=on rate=\(Int(mic.sampleRate))\n", stderr)
         } catch {
+            mic.cleanup()
             fputs("MIC=off (\(error))\n", stderr)
         }
     }
@@ -577,12 +624,47 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     }
 
     // 元信息走 stderr（stdout 只有 PCM 数据），供调用方构造 ffmpeg 参数。
-    // 麦克风作主时钟时 stdout 流是【麦克风采样率】；无麦克风降级时才是 tap 率。
-    // 二者在现代 Mac 上同为 48kHz（不等已在上面告警）。
-    let outputRate = activeMic.map { Int($0.sampleRate) } ?? Int(capture.sampleRate)
-    fputs("SAMPLE_RATE=\(outputRate)\n", stderr)
+    // stdout 流按 tap 采样率输出（与 tap-format 一致）。
+    let outputRate = capture.sampleRate
+    fputs("SAMPLE_RATE=\(Int(outputRate))\n", stderr)
     fputs("CHANNELS=1\n", stderr)
     fputs("FORMAT=f32le\n", stderr)
+
+    let writer = OutputWriter(rate: outputRate, sysRing: sysRing, micRing: micRing)
+    activeWriter = writer
+    writer.start()
+
+    // tap 卡死看门狗：Process Tap 的 IO 回调偶发不启动（AudioDeviceStart 成功却不
+    // 喂数据）。有别的进程在放声音、tap 却迟迟没回调，就在进程内重建 tap，录音不断。
+    // 重建间隔 3s 起步、每次翻倍、上限 60s，tap 一出数据就恢复 3s。
+    var tapStartNs = DispatchTime.now().uptimeNanoseconds
+    var backoffNs: UInt64 = 3_000_000_000
+    var restarts = 0
+    let wd = DispatchSource.makeTimerSource(queue: .main)
+    wd.schedule(deadline: .now() + 1, repeating: 1)
+    wd.setEventHandler {
+        let now = DispatchTime.now().uptimeNanoseconds
+        meterLock.lock(); let last = tapLastNs; meterLock.unlock()
+        if last > tapStartNs { backoffNs = 3_000_000_000; return }
+        guard now - tapStartNs > backoffNs, otherProcessPlaying() else { return }
+        restarts += 1
+        fputs("TAP_RESTART \(restarts) (audio playing but tap delivered nothing)\n", stderr)
+        (activeCapture as? TapCapture)?.cleanup()
+        let c = TapCapture(ring: sysRing)
+        activeCapture = c
+        do {
+            try c.start()
+            if c.sampleRate != outputRate {
+                fputs("WARNING: tap rate changed \(Int(outputRate)) -> \(Int(c.sampleRate)) after restart\n", stderr)
+            }
+        } catch {
+            fputs("Error: tap restart failed (\(error))\n", stderr)
+        }
+        tapStartNs = now
+        backoffNs = min(backoffNs * 2, 60_000_000_000)
+    }
+    wd.resume()
+    tapWatchdog = wd
 
     // SIGINT/SIGTERM → 显式清理后退出（用 DispatchSource，避免在信号处理器里做非安全调用）
     signal(SIGINT, SIG_IGN)
@@ -642,8 +724,9 @@ guard let cmd = args.first else {
       tap-supported             检测 Process Tap 是否可用（yes / 原因）
       tap-rate                  打印默认输出设备标称采样率（Hz）
       tap-format                打印 Process Tap 实际采样率（Hz，采集/编码应以此为准）
-      tap-start [--duration N] [--level-file PATH]
+      tap-start [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH]
                                 捕获系统音频，Float32 LE mono PCM 写 stdout
+                                --with-mic: 混入默认输入设备（麦克风）
                                 --level-file: 每 0.4s 写当前电平(dBFS)到文件，
                                 供波形显示读取（SIGINT/SIGTERM 停止并清理）
 
