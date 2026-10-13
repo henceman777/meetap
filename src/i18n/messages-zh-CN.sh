@@ -201,7 +201,7 @@ MSG_ERR_HL_LLM_FAILED="❌ 高亮生成失败（LLM 未产出内容）"
 
 MSG_USAGE_HEADER="MeeTap v%s - macOS 会议录制 + 自动转录"
 MSG_USAGE_LINE="用法: meetap {start|stop|status|again|mark|setup|config|version}"
-MSG_USAGE_START="  start [-t] [-d 分钟] [--mute-microphone] [会议名] 开始录制（-t 详细信息；-d 指定时长上限，到点自动结束；--mute-microphone 不开麦克风，只录电脑声音）"
+MSG_USAGE_START="  start [-t] [-d 分钟] [-m] [会议名] 开始录制（-t 详细信息；-d 指定时长上限，到点自动结束；-m/--mute-mic 不开麦克风，只录电脑声音）"
 MSG_USAGE_STOP="  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
 MSG_USAGE_STATUS="  status       查看当前录制状态"
 MSG_USAGE_AGAIN="  again [目录名] [补充要求] 重新生成会议纪要（默认最近一次；补充要求直接作为额外 prompt 传给 LLM，也可放资料到 materials/）"

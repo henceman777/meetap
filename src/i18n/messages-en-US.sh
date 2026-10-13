@@ -200,7 +200,7 @@ MSG_ERR_HL_LLM_FAILED="❌ Highlight generation failed (LLM produced no content)
 
 MSG_USAGE_HEADER="MeeTap v%s - macOS meeting recorder + auto-transcription"
 MSG_USAGE_LINE="Usage: meetap {start|stop|status|again|mark|setup|config|version}"
-MSG_USAGE_START="  start [-t] [-d MIN] [--mute-microphone] [name] Start recording (-t verbose; -d sets a time limit, auto-stops when reached; --mute-microphone leaves the mic off and records computer audio only)"
+MSG_USAGE_START="  start [-t] [-d MIN] [-m] [name] Start recording (-t verbose; -d sets a time limit, auto-stops when reached; -m/--mute-mic leaves the mic off and records computer audio only)"
 MSG_USAGE_STOP="  stop [-t]    Stop recording, restore audio device, auto-transcribe (-t shows verbose file info)"
 MSG_USAGE_STATUS="  status       Show current recording status"
 MSG_USAGE_AGAIN="  again [dir] [extra prompt]  Re-generate meeting notes (default: latest; extra prompt is passed to the LLM as an added instruction; or put files in materials/)"

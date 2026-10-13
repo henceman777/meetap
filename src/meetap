@@ -1464,7 +1464,7 @@ start_recording() {
     local MAX_DURATION_MIN=""   # 会议时长上限（分钟，可选）
     local MUTE_MIC=false        # 只录系统音（录网页直播时屏蔽现场环境声）
     # 解析选项：-t/--test 显示详情；-d/--duration N 指定会议时长上限（分钟）；
-    # --mute-microphone 不录麦克风
+    # -m/--mute-mic/--mute-microphone 不录麦克风
     # 选项可任意顺序、可写在会议名前后；第一个非选项参数为会议名称
     # （meetap start 季度架构评审）
     local MEETING_NAME=""
@@ -1483,7 +1483,7 @@ start_recording() {
                 fi
                 shift 2
                 ;;
-            --mute-microphone)
+            -m|--mute-mic|--mute-microphone)
                 MUTE_MIC=true
                 shift
                 ;;
