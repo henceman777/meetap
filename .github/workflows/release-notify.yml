@@ -39,6 +39,8 @@ jobs:
             notes=$(sed -nE 's/^#{1,6}[[:space:]]+(.*[：:].*)$/• \1/p' <<<"$body" | sed -E 's/`//g')
           fi
           [[ -z "$notes" ]] && notes="详见发布说明"
+          # Slack 工作流变量按纯文本显示（* ` _ 不渲染），去掉反引号；重点用 emoji 和【】标注
+          notes=$(sed -E 's/`//g' <<<"$notes")
 
           payload=$(jq -n \
             --arg version "$TAG" \
