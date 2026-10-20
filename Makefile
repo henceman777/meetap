@@ -7,7 +7,7 @@ all: $(BUILD)/audio-multi-output $(BUILD)/audio-monitor $(BUILD)/audio-tap
 
 $(BUILD)/audio-multi-output: src/audio-multi-output.swift
 	mkdir -p $(BUILD)
-	swiftc -O -framework CoreAudio -framework AudioToolbox $< -o $@
+	swiftc -O -framework CoreAudio -framework AudioToolbox -framework IOKit $< -o $@
 
 $(BUILD)/audio-monitor: src/audio-monitor.swift
 	mkdir -p $(BUILD)
