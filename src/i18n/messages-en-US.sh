@@ -50,6 +50,7 @@ MSG_NOTES_NAMED="📄 Smart-named notes copy created: %s"
 MSG_NOTIFY_NOTES_DONE="Meeting notes ready: meeting-notes.md"
 MSG_NOTES_FAILED="⚠️ Meeting notes generation failed, transcript.txt is still available"
 MSG_NOTIFY_NOTES_FAILED="Notes generation failed, transcript available"
+MSG_NOTIFY_SLEEP_STOPPED="Recording ended because the Mac went to sleep. Run meetap again %s to generate notes"
 MSG_CLAUDE_CLI_MISSING_FALLBACK="⚠️ claude CLI not found, falling back to bedrock"
 MSG_CLAUDE_EMPTY_FALLBACK="⚠️ claude-code returned empty output, falling back to bedrock"
 
@@ -114,6 +115,7 @@ MSG_STATUS_AUTOSTOP_ON="   Auto-stop: time limit set"
 MSG_STATUS_MONITOR_RUN="   Audio forward: running"
 MSG_STATUS_VISUALIZER_RUN="   Waveform: running (bottom of terminal)"
 MSG_STATUS_IDLE="⏹️  Not recording"
+MSG_STATUS_PENDING_AGAIN="   Last recording ended on sleep, notes pending: %s again %s"
 
 # ── Setup: Zoom ──
 MSG_SETUP_ZOOM_NO_CONFIG="⚠️  Zoom config not found, please launch Zoom once first"

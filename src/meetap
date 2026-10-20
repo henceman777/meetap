@@ -1325,6 +1325,12 @@ again_session() {
         _t AGAIN_FROM_TRANSCRIBE "$(basename "$AUDIO_FILE")"
         transcribe_recording "$AUDIO_FILE" "$SESSION_DIR"
     fi
+
+    # 因休眠结束的会话补跑出转录后，清除待办提示
+    if [[ -f "$PENDING_AGAIN_FILE" && -f "$TRANSCRIPT" ]] \
+        && [[ "$(cat "$PENDING_AGAIN_FILE")" == "$(basename "$SESSION_DIR")" ]]; then
+        rm -f "$PENDING_AGAIN_FILE"
+    fi
 }
 
 # 纪要要点高亮：给已生成的纪要 md 原地补 <mark> 高亮。独立后处理，不碰生成流程。
@@ -1974,6 +1980,16 @@ stop_recording() {
     fi
 }
 
+# 唤醒通知（内部子命令，由 sleep-watch 在唤醒后调用）：提示用 again 补跑转录与纪要。
+# 通知里写具体会话名——again 不带参数取最新会话，唤醒后若先开了新会议会选错。
+wake_notify() {
+    [[ -f "$PENDING_AGAIN_FILE" ]] || return 0
+    local session
+    session=$(cat "$PENDING_AGAIN_FILE")
+    osascript -e "display notification \"$(_tn NOTIFY_SLEEP_STOPPED "$session")\" with title \"MeeTap\"" 2>/dev/null
+    return 0
+}
+
 show_status() {
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         local start_time
@@ -1999,7 +2015,10 @@ show_status() {
         fi
         ui_card "${status_lines[@]}"
     else
-        ui_card "$(_tn STATUS_IDLE)"
+        local idle_lines=("$(_tn STATUS_IDLE)")
+        [[ -f "$PENDING_AGAIN_FILE" ]] && \
+            idle_lines+=("$(_tn STATUS_PENDING_AGAIN "$0" "$(cat "$PENDING_AGAIN_FILE")")")
+        ui_card "${idle_lines[@]}"
         rm -f "$PID_FILE"
     fi
 }
@@ -2257,6 +2276,9 @@ case "${1:-}" in
         ;;
     again)
         again_session "${2:-}" "${3:-}"
+        ;;
+    _wake-notify)
+        wake_notify
         ;;
     mark)
         highlight_notes "${2:-}"

@@ -87,5 +87,37 @@ echo "== 用例 4: 什么都没有 → 报无录音、exit 1（回归） =="
 [[ $rc -eq 1 ]] && grep -q "没有正在进行的录制" "$TMP/out4.txt" \
     && pass "无录音提示" || fail "rc=$rc out=$(cat "$TMP/out4.txt")"
 
+echo "== 用例 5: _wake-notify 发通知，带会话名 =="
+echo "20261020_1000_sleep" > "$MEETAP_STATE_DIR/pending-again"
+rm -f "$TMP/osascript.log"
+"$MEETAP" _wake-notify; rc=$?
+[[ $rc -eq 0 ]] && grep -q "20261020_1000_sleep" "$TMP/osascript.log" 2>/dev/null \
+    && pass "通知含会话名" || fail "rc=$rc osascript=$(cat "$TMP/osascript.log" 2>/dev/null)"
+
+echo "== 用例 6: 无待办时 _wake-notify 静默 =="
+rm -f "$MEETAP_STATE_DIR/pending-again" "$TMP/osascript.log"
+"$MEETAP" _wake-notify; rc=$?
+[[ $rc -eq 0 && ! -e "$TMP/osascript.log" ]] && pass "静默" || fail "rc=$rc 或误发通知"
+
+echo "== 用例 7: status 空闲时提示待办 =="
+echo "20261020_1000_sleep" > "$MEETAP_STATE_DIR/pending-again"
+"$MEETAP" status > "$TMP/out7.txt" 2>&1
+grep -q "again 20261020_1000_sleep" "$TMP/out7.txt" \
+    && pass "status 显示待办" || fail "status 输出: $(cat "$TMP/out7.txt")"
+
+echo "== 用例 8: again 已有转录的待办会话 → 清除待办 =="
+# 用 claude-code 后端 + 假 claude，避免调用 Bedrock
+SESSION="$TMP/rec/20261020_1000_sleep"
+mkdir -p "$SESSION/log"
+echo "spk_0: 测试" > "$SESSION/log/transcript.txt"
+cat > "$TMP/fakebin/claude" <<'EOF'
+#!/bin/bash
+echo "# 测试纪要"
+EOF
+chmod +x "$TMP/fakebin/claude"
+printf 'recording_dir = %s\nlanguage = zh-CN\nai_backend = claude-code\n' "$TMP/rec" > "$XDG_CONFIG_HOME/meetap/config"
+"$MEETAP" again 20261020_1000_sleep > "$TMP/out8.txt" 2>&1
+[[ ! -e "$MEETAP_STATE_DIR/pending-again" ]] && pass "待办已清除" || fail "待办残留；again 输出: $(tail -5 "$TMP/out8.txt")"
+
 echo ""
 if (( FAIL )); then echo "❌ 有用例失败"; exit 1; else echo "✅ 全部通过"; fi

@@ -51,6 +51,7 @@ MSG_NOTES_NAMED="📄 智能命名纪要副本已生成: %s"
 MSG_NOTIFY_NOTES_DONE="会议纪要已生成: meeting-notes.md"
 MSG_NOTES_FAILED="⚠️ Meeting notes generation failed, transcript.txt is still available"
 MSG_NOTIFY_NOTES_FAILED="纪要生成失败，转录文件可用"
+MSG_NOTIFY_SLEEP_STOPPED="录音已因休眠结束。运行 meetap again %s 生成纪要"
 MSG_CLAUDE_CLI_MISSING_FALLBACK="⚠️ claude CLI not found, falling back to bedrock"
 MSG_CLAUDE_EMPTY_FALLBACK="⚠️ claude-code returned empty output, falling back to bedrock"
 
@@ -115,6 +116,7 @@ MSG_STATUS_AUTOSTOP_ON="   自动停止: 已设时长上限"
 MSG_STATUS_MONITOR_RUN="   音频转发: 运行中"
 MSG_STATUS_VISUALIZER_RUN="   波形显示: 运行中（终端底部）"
 MSG_STATUS_IDLE="⏹️  未在录制"
+MSG_STATUS_PENDING_AGAIN="   上次录音因休眠结束，待生成纪要: %s again %s"
 
 # ── Setup: Zoom ──
 MSG_SETUP_ZOOM_NO_CONFIG="⚠️  未找到 Zoom 配置文件，请先运行一次 Zoom"
