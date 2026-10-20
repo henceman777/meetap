@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.7.0"
+VERSION="1.7.1"
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
@@ -194,7 +194,7 @@ TOOL="$SCRIPT_DIR/audio-multi-output"
 MONITOR="$SCRIPT_DIR/audio-monitor"
 VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
 RECORDING_DIR="$CFG_RECORDING_DIR"
-STATE_DIR="/tmp/meeting-record"
+STATE_DIR="${MEETAP_STATE_DIR:-/tmp/meeting-record}"   # 测试可用 MEETAP_STATE_DIR 隔离
 
 mkdir -p "$RECORDING_DIR" "$STATE_DIR"
 
@@ -209,6 +209,10 @@ AUTOSTOP_PID_FILE="$STATE_DIR/autostop.pid"
 MAX_DURATION_FILE="$STATE_DIR/max-duration-deadline"   # 达到该 epoch 秒即自动结束（可选）
 MEETING_APPS_FILE="$STATE_DIR/meeting-apps"
 VISUALIZER_PID_FILE="$STATE_DIR/visualizer.pid"
+SLEEPWATCH_PID_FILE="$STATE_DIR/sleepwatch.pid"
+PENDING_AGAIN_FILE="$STATE_DIR/pending-again"   # 因休眠结束、待 meetap again 补跑的会话名
+FOREGROUND=false   # start 前台模式（有 TTY 且未加 -b），由 start_recording 设置
+START_TTY=""
 
 # Process Tap 授权标记（持久化于配置目录，非 /tmp）：一旦通过授权自检即写入，
 # 之后 start 直接信任、跳过探测，避免每次录制都做 2 秒实测并播提示音。
@@ -440,11 +444,6 @@ transcribe_recording() {
         return 1
     fi
 
-    if [[ "$CFG_AUDIO_PERSIST" != "true" && ! -f "$STATE_DIR/test-mode" ]]; then
-        rm -f "$AUDIO_FILE"
-        echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
-    fi
-
     # Start transcription
     local LANG_FLAG="--identify-language"
     if [[ "$CFG_MULTI_LANGUAGE" == "true" ]]; then
@@ -551,6 +550,13 @@ with open(output_txt, "w") as f:
 
 print(f"Transcript saved: {len(lines)} speaker turns")
 PYEOF
+
+    # 本地音频要等转录文本落盘后再删：上传后立刻删的话，转录中途休眠/断网，
+    # transcript 没出来、音频也没了，meetap again 无从重跑
+    if [[ "$CFG_AUDIO_PERSIST" != "true" && ! -f "$STATE_DIR/test-mode" && -s "$LOG_DIR/transcript.txt" ]]; then
+        rm -f "$AUDIO_FILE"
+        echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
+    fi
 
     # Cleanup S3 bucket and Transcribe job
     aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
@@ -1323,6 +1329,12 @@ again_session() {
         _t AGAIN_FROM_TRANSCRIBE "$(basename "$AUDIO_FILE")"
         transcribe_recording "$AUDIO_FILE" "$SESSION_DIR"
     fi
+
+    # 因休眠结束的会话补跑出转录后，清除待办提示
+    if [[ -f "$PENDING_AGAIN_FILE" && -f "$TRANSCRIPT" ]] \
+        && [[ "$(cat "$PENDING_AGAIN_FILE")" == "$(basename "$SESSION_DIR")" ]]; then
+        rm -f "$PENDING_AGAIN_FILE"
+    fi
 }
 
 # 纪要要点高亮：给已生成的纪要 md 原地补 <mark> 高亮。独立后处理，不碰生成流程。
@@ -1459,10 +1471,81 @@ _tap_audio_flowing() {
     return 0
 }
 
+# 前台模式下，后台子进程放进独立进程组（set -m），终端 Ctrl-C 只打到 start 本身、
+# 由 trap 走有序 stop；否则 SIGINT 会同时打到 ffmpeg / tap，与收尾抢跑。
+# 只包住 `cmd &` 那一行：-m 常开会让前台的 sleep 等命令也各自成组、抢走终端信号。
+_jobctl_on()  { $FOREGROUND && set -m; }
+_jobctl_off() { set +m; }
+
+# start 前台模式下 Ctrl-C / 关窗口 / kill：等效 meetap stop
+_on_start_interrupt() {
+    trap '' INT TERM HUP QUIT     # 防止 stop 过程中再次 Ctrl-C 重入
+    # trap 在命令之间执行：若恰好落在 `cmd &` 与写 PID 文件之间，刚拉起的子进程
+    # 没登记，stop 找不到它（典型：ffmpeg 卡在打开 tap.fifo，tap 被杀后永远阻塞）。
+    # $! 此时已是它的 PID：未出现在任何 PID 文件里就直接清掉
+    local last=$!
+    if [[ -n "$last" ]] && kill -0 "$last" 2>/dev/null \
+        && ! cat "$PID_FILE" "$TAP_PID_FILE" "$MONITOR_PID_FILE" "$AUTOSTOP_PID_FILE" \
+                 "$SLEEPWATCH_PID_FILE" 2>/dev/null | grep -qx "$last"; then
+        kill "$last" 2>/dev/null; sleep 0.3; kill -9 "$last" 2>/dev/null
+    fi
+    teardown_statusbar "$START_TTY" 2>/dev/null
+    stop_recording
+    exit 0
+}
+
+# 结束 sleep-watch：PID 文件可能残留（PID 已被无关进程复用），校验命令行再 kill
+_kill_sleepwatch() {
+    local pid
+    pid=$(cat "$SLEEPWATCH_PID_FILE" 2>/dev/null)
+    if [[ -n "$pid" ]] && ps -p "$pid" -o command= 2>/dev/null | grep -q 'sleep-watch'; then
+        kill "$pid" 2>/dev/null
+    fi
+    rm -f "$SLEEPWATCH_PID_FILE"
+}
+
+# 休眠监听：系统休眠前以 stop --sleep 结束录音，唤醒后发通知（所有运行模式都启动）
+start_sleepwatch() {
+    _kill_sleepwatch
+    _jobctl_on
+    "$TOOL" sleep-watch "$SCRIPT_DIR/meetap" "$PID_FILE" \
+        < /dev/null > "$STATE_DIR/sleepwatch.log" 2>&1 &
+    local pid=$!
+    _jobctl_off
+    echo "$pid" > "$SLEEPWATCH_PID_FILE"
+    disown "$pid"
+}
+
+# 前台等待：在当前终端跑波形直到录音结束。Ctrl-C 走 trap；-d 自停或休眠触发的
+# stop 杀掉 ffmpeg 后循环自然退出
+foreground_wait() {
+    sleep 0.1
+    setup_statusbar "$START_TTY"
+    start_visualizer "$START_TTY"
+    # 波形写终端失败会提前跳出循环；录音仍在就继续守着，保证 Ctrl-C 依然有效
+    while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do sleep 1; done
+    # 录音已由别处结束（-d 自停 / 休眠 / 其他终端 stop）：再按 Ctrl-C 直接退出，不再进 stop
+    trap - INT TERM HUP QUIT
+    teardown_statusbar "$START_TTY" 2>/dev/null
+    # ffmpeg 退出时 stop 还在收尾（杀 tap、恢复设备、ffprobe…）：
+    # session-dir 被删即表示待办已写入（stop 先写待办再删 session-dir），最多等 10s
+    local i
+    for ((i = 0; i < 50; i++)); do
+        [[ -f "$STATE_DIR/session-dir" ]] || break
+        sleep 0.2
+    done
+    local session
+    session=$(basename "$SESSION_DIR")
+    if [[ -f "$PENDING_AGAIN_FILE" && "$(cat "$PENDING_AGAIN_FILE")" == "$session" ]]; then
+        _t SLEEP_STOPPED_HINT "$0" "$session"
+    fi
+}
+
 start_recording() {
     local VERBOSE=false
     local MAX_DURATION_MIN=""   # 会议时长上限（分钟，可选）
     local MUTE_MIC=false        # 只录系统音（录网页直播时屏蔽现场环境声）
+    local BACKGROUND=false      # -b：维持旧的后台行为，不占用终端
     # 解析选项：-t/--test 显示详情；-d/--duration N 指定会议时长上限（分钟）；
     # -m/--mute-mic/--mute-microphone 不录麦克风
     # 选项可任意顺序、可写在会议名前后；第一个非选项参数为会议名称
@@ -1482,6 +1565,10 @@ start_recording() {
                     exit 1
                 fi
                 shift 2
+                ;;
+            -b|--background)
+                BACKGROUND=true
+                shift
                 ;;
             -m|--mute-mic|--mute-microphone)
                 MUTE_MIC=true
@@ -1505,6 +1592,17 @@ start_recording() {
         _t HINT_STOP_FIRST "$0"
         exit 1
     fi
+    # 前台模式：有 TTY 且未加 -b。start 不退出、跑波形，Ctrl-C / 关窗口 ≡ meetap stop。
+    # trap 必须在拉起任何子进程之前装：子进程在独立进程组里收不到 Ctrl-C，装晚了，
+    # 启动阶段的 Ctrl-C 只会杀掉 start 自己，留下孤儿录音。
+    # 也必须在「已在录制」检查之后装，否则那时的 Ctrl-C 会误停正在进行的录音。
+    START_TTY=$(tty 2>/dev/null)
+    [[ "$START_TTY" == "not a tty" ]] && START_TTY=""
+    if ! $BACKGROUND && [[ -n "$START_TTY" ]]; then
+        FOREGROUND=true
+        trap '_on_start_interrupt' INT TERM HUP QUIT
+    fi
+
     # 清理残留状态。关键：上次异常停止可能留下孤儿 audio-tap（stop 只杀
     # ffmpeg；tap 依赖 EPIPE 自杀，但 IO 回调停摆时永不触发）。孤儿会占住
     # 音频链路，让新 ffmpeg 打不开麦克风输入 → 卡死 → 录音全丢，必须先清扫。
@@ -1608,10 +1706,12 @@ start_recording() {
 
             local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level")
             $MUTE_MIC && mic_args=()
+            _jobctl_on
             "$TAP_TOOL" tap-start "${mic_args[@]}" \
                 --level-file "$STATE_DIR/tap-level" \
-                > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
+                < /dev/null > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
             TAP_PID=$!
+            _jobctl_off
             echo $TAP_PID > "$TAP_PID_FILE"
             disown $TAP_PID
 
@@ -1619,6 +1719,7 @@ start_recording() {
             # start 会撞上同名 m4a；缺 -y 时 ffmpeg 弹交互式 Overwrite?[y/N]，
             # stdin=/dev/null 读到 EOF 判为 N 而秒退 → time= 不推进 → 健康探测
             # 误判「tap 无数据」触发自愈，3 次全撞同一文件 → 假报“反复无数据”。
+            _jobctl_on
             ffmpeg -y -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
                 -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
                 -movflags frag_keyframe+empty_moov \
@@ -1626,6 +1727,7 @@ start_recording() {
                 < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
             FFMPEG_PID=$!
+            _jobctl_off
             echo $FFMPEG_PID > "$PID_FILE"
             disown $FFMPEG_PID
 
@@ -1671,8 +1773,9 @@ start_recording() {
             # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护，到点自动结束。
             # 无 -d 则不自动结束，需手动 stop（静默自停特性已废止）。
             if [[ -n "$MAX_DURATION_MIN" ]]; then
-                autostop_daemon &
+                _jobctl_on; autostop_daemon < /dev/null &
                 AUTOSTOP_PID=$!
+                _jobctl_off
                 echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
                 disown $AUTOSTOP_PID
             fi
@@ -1682,24 +1785,13 @@ start_recording() {
             $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
             _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
             $MUTE_MIC && _t FIELD_MIC_MUTED
-            _t FIELD_STOP_CMD "$0"
+            if $FOREGROUND; then _t FIELD_STOP_CTRL_C "$0"; else _t FIELD_STOP_CMD "$0"; fi
             if [[ -n "$MAX_DURATION_MIN" ]]; then
                 _t FIELD_MAX_DURATION "$MAX_DURATION_MIN" "$(date -v+"${MAX_DURATION_MIN}"M +%H:%M)"
             else
                 _t FIELD_STOP_MANUAL
             fi
             echo ""
-
-            # 点阵波形 + 状态栏（与 BlackHole 分支一致；电平来自 tap-level 文件）
-            local TTY_DEV
-            TTY_DEV=$(tty 2>/dev/null)
-            if [[ -n "$TTY_DEV" && "$TTY_DEV" != "not a tty" ]]; then
-                sleep 0.1
-                setup_statusbar "$TTY_DEV"
-                start_visualizer "$TTY_DEV" &
-                echo $! > "$VISUALIZER_PID_FILE"
-                disown $!
-            fi
         else
             _t ERR_FFMPEG_FAIL
             cat "$STATE_DIR/ffmpeg.log"
@@ -1747,8 +1839,10 @@ start_recording() {
 
     # 启动 audio-monitor：BlackHole → 原始设备（实时转发，用户能听到）
     $VERBOSE && _t STARTING_MONITOR "$ORIG_NAME"
-    "$MONITOR" "$BH_UID" "$ORIG_UID" > "$STATE_DIR/monitor.log" 2>&1 &
+    _jobctl_on
+    "$MONITOR" "$BH_UID" "$ORIG_UID" < /dev/null > "$STATE_DIR/monitor.log" 2>&1 &
     MONITOR_PID=$!
+    _jobctl_off
     echo $MONITOR_PID > "$MONITOR_PID_FILE"
     disown $MONITOR_PID
     sleep 1
@@ -1775,6 +1869,7 @@ start_recording() {
     fi
     # -y：覆盖已存在的输出文件（同一分钟内重跑 start 会撞同名 m4a，缺 -y 会
     # 弹交互式 Overwrite? 而秒退，详见 tap 分支说明）。
+    _jobctl_on
     ffmpeg -y -f avfoundation -i ":BlackHole 2ch" \
         "${mic_args[@]}" \
         -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
@@ -1783,6 +1878,7 @@ start_recording() {
         < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
     FFMPEG_PID=$!
+    _jobctl_off
     echo $FFMPEG_PID > "$PID_FILE"
     disown $FFMPEG_PID
 
@@ -1790,8 +1886,9 @@ start_recording() {
     if kill -0 $FFMPEG_PID 2>/dev/null; then
         # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护（静默自停已废止）
         if [[ -n "$MAX_DURATION_MIN" ]]; then
-            autostop_daemon &
+            _jobctl_on; autostop_daemon < /dev/null &
             AUTOSTOP_PID=$!
+            _jobctl_off
             echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
             disown $AUTOSTOP_PID
         fi
@@ -1806,18 +1903,8 @@ start_recording() {
         else
             _t FIELD_STOP_MANUAL
         fi
-        _t FIELD_STOP_CMD "$0"
+        if $FOREGROUND; then _t FIELD_STOP_CTRL_C "$0"; else _t FIELD_STOP_CMD "$0"; fi
         echo ""
-
-        local TTY_DEV
-        TTY_DEV=$(tty 2>/dev/null)
-        if [[ -n "$TTY_DEV" && "$TTY_DEV" != "not a tty" ]]; then
-            sleep 0.1
-            setup_statusbar "$TTY_DEV"
-            start_visualizer "$TTY_DEV" &
-            echo $! > "$VISUALIZER_PID_FILE"
-            disown $!
-        fi
     else
         _t ERR_FFMPEG_FAIL
         cat "$STATE_DIR/ffmpeg.log"
@@ -1829,11 +1916,31 @@ start_recording() {
     fi
 
     fi  # 闭合 if use_tap / else (BlackHole 分支结束)
+
+    # 走到这里说明录音已成功启动（两个分支失败时都已 exit）
+    start_sleepwatch
+    if $FOREGROUND; then
+        foreground_wait
+    elif [[ -n "$START_TTY" ]]; then
+        # -b 后台模式：保持旧行为，波形在后台画到终端底部
+        sleep 0.1
+        setup_statusbar "$START_TTY"
+        start_visualizer "$START_TTY" &
+        echo $! > "$VISUALIZER_PID_FILE"
+        disown $!
+    fi
 }
 
 stop_recording() {
     local VERBOSE=false
-    [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]] && VERBOSE=true
+    local SLEEP_MODE=false   # 休眠触发：只收尾录音，不转录，留待唤醒后 meetap again
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -t|--test) VERBOSE=true ;;
+            --sleep)   SLEEP_MODE=true ;;
+        esac
+    done
     stop_visualizer
 
     # 停止自动停止守护进程
@@ -1843,29 +1950,36 @@ stop_recording() {
     fi
     rm -f "$MAX_DURATION_FILE"
 
-    if [[ ! -f "$PID_FILE" ]]; then
+    # 休眠监听：普通 stop 一并结束；--sleep 是 sleep-watch 自己调的，它要活到唤醒发通知
+    $SLEEP_MODE || _kill_sleepwatch
+
+    # 没有 ffmpeg PID 也可能有残留要收拾：start 启动阶段被 Ctrl-C 打断时，
+    # tap / monitor 已起、输出设备已切到 BlackHole，但 ffmpeg 还没写 PID
+    if [[ ! -f "$PID_FILE" && ! -f "$TAP_PID_FILE" && ! -f "$MONITOR_PID_FILE" \
+          && ! -f "$ORIGINAL_NAME_FILE" ]]; then
         _t ERR_NO_ACTIVE_RECORDING
         exit 1
     fi
 
-    FFMPEG_PID=$(cat "$PID_FILE")
-
     # 停止 ffmpeg
-    if kill -0 "$FFMPEG_PID" 2>/dev/null; then
-        kill -INT "$FFMPEG_PID"
-        _t WAITING_RECORDING
-        for i in $(seq 1 15); do
-            kill -0 "$FFMPEG_PID" 2>/dev/null || break
-            sleep 1
-        done
-        # 如果 15 秒后仍未退出，强制终止
+    if [[ -f "$PID_FILE" ]]; then
+        FFMPEG_PID=$(cat "$PID_FILE")
         if kill -0 "$FFMPEG_PID" 2>/dev/null; then
-            _t FFMPEG_FORCE_KILL
-            kill -9 "$FFMPEG_PID" 2>/dev/null
-            sleep 1
+            kill -INT "$FFMPEG_PID"
+            _t WAITING_RECORDING
+            for i in $(seq 1 15); do
+                kill -0 "$FFMPEG_PID" 2>/dev/null || break
+                sleep 1
+            done
+            # 如果 15 秒后仍未退出，强制终止
+            if kill -0 "$FFMPEG_PID" 2>/dev/null; then
+                _t FFMPEG_FORCE_KILL
+                kill -9 "$FFMPEG_PID" 2>/dev/null
+                sleep 1
+            fi
         fi
+        rm -f "$PID_FILE"
     fi
-    rm -f "$PID_FILE"
 
     # 停止 audio-monitor
     if [[ -f "$MONITOR_PID_FILE" ]]; then
@@ -1936,16 +2050,39 @@ stop_recording() {
     # 清理空的会话目录，或启动后台转录
     if [[ -f "$STATE_DIR/session-dir" ]]; then
         SESSION_DIR=$(cat "$STATE_DIR/session-dir")
-        rm -f "$STATE_DIR/session-dir"
         if [[ -d "$SESSION_DIR" ]] && [ -z "$(ls -A "$SESSION_DIR")" ]; then
+            rm -f "$STATE_DIR/session-dir"
             rmdir "$SESSION_DIR"
             _t EMPTY_SESSION_REMOVED "$SESSION_DIR"
         elif [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
-            _t TRANSCRIBE_BACKGROUND
-            transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" &
-            disown
+            if $SLEEP_MODE; then
+                # 马上要休眠，上传会被打断：只记下会话，唤醒后提示 meetap again。
+                # 先写待办再删 session-dir：保证「session-dir 消失」⇒ 待办已写入
+                basename "$SESSION_DIR" > "$PENDING_AGAIN_FILE"
+                rm -f "$STATE_DIR/session-dir"
+            else
+                rm -f "$STATE_DIR/session-dir"
+                _t TRANSCRIBE_BACKGROUND
+                # 忽略 HUP：关闭终端窗口触发的 stop 之后，转录不能被连带杀死
+                # （transcribe_recording 是函数，nohup 包不了，只能在子 shell 里 trap）
+                ( trap '' HUP; transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" ) < /dev/null &
+                disown
+            fi
+        else
+            rm -f "$STATE_DIR/session-dir"
         fi
     fi
+}
+
+# 唤醒通知（内部子命令，由 sleep-watch 在唤醒后调用）：提示用 again 补跑转录与纪要。
+# 通知里写具体会话名——again 不带参数取最新会话，唤醒后若先开了新会议会选错。
+wake_notify() {
+    rm -f "$SLEEPWATCH_PID_FILE"   # sleep-watch 发完通知即退出，PID 文件不再有效
+    [[ -f "$PENDING_AGAIN_FILE" ]] || return 0
+    local session
+    session=$(cat "$PENDING_AGAIN_FILE")
+    osascript -e "display notification \"$(_tn NOTIFY_SLEEP_STOPPED "$session")\" with title \"MeeTap\"" 2>/dev/null
+    return 0
 }
 
 show_status() {
@@ -1973,7 +2110,10 @@ show_status() {
         fi
         ui_card "${status_lines[@]}"
     else
-        ui_card "$(_tn STATUS_IDLE)"
+        local idle_lines=("$(_tn STATUS_IDLE)")
+        [[ -f "$PENDING_AGAIN_FILE" ]] && \
+            idle_lines+=("$(_tn STATUS_PENDING_AGAIN "$0" "$(cat "$PENDING_AGAIN_FILE")")")
+        ui_card "${idle_lines[@]}"
         rm -f "$PID_FILE"
     fi
 }
@@ -2224,13 +2364,16 @@ case "${1:-}" in
         start_recording "${@:2}"
         ;;
     stop)
-        stop_recording "${2:-}"
+        stop_recording "${@:2}"
         ;;
     status)
         show_status
         ;;
     again)
         again_session "${2:-}" "${3:-}"
+        ;;
+    _wake-notify)
+        wake_notify
         ;;
     mark)
         highlight_notes "${2:-}"

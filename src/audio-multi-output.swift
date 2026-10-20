@@ -1,5 +1,6 @@
 import CoreAudio
 import Foundation
+import IOKit.pwr_mgt
 
 // MARK: - CoreAudio Helpers
 
@@ -153,6 +154,82 @@ func cleanup() {
     }
 }
 
+// MARK: - sleep-watch：系统休眠前结束录音，唤醒后发通知
+
+// IOKit 的消息常量是函数式宏（iokit_common_msg），Swift 导入不了，按定义手算：
+// sys_iokit(0xE0000000) | sub_iokit_common(0) | message
+let kMsgCanSystemSleep: UInt32 = 0xE000_0270
+let kMsgSystemWillSleep: UInt32 = 0xE000_0280
+let kMsgSystemHasPoweredOn: UInt32 = 0xE000_0300
+
+// IOKit 回调是 C 函数指针，不能捕获上下文，状态放全局
+var swRootPort: io_connect_t = 0
+var swMeetap = ""
+var swSleepHandled = false
+
+/// 同步执行 meetap 子命令，最多等 timeout 秒（休眠回调里不能无限阻塞，系统上限约 30s）
+func swRunMeetap(_ arguments: [String], timeout: TimeInterval) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: swMeetap)
+    p.arguments = arguments
+    p.standardInput = FileHandle.nullDevice
+    p.standardOutput = FileHandle.nullDevice
+    do { try p.run() } catch {
+        fputs("sleep-watch: failed to run \(swMeetap): \(error)\n", stderr); return }
+    let deadline = Date().addingTimeInterval(timeout)
+    while p.isRunning && Date() < deadline { usleep(100_000) }
+    if p.isRunning {
+        fputs("sleep-watch: \(arguments.joined(separator: " ")) timed out after \(Int(timeout))s\n", stderr)
+    }
+}
+
+func swHandleWillSleep() {
+    guard !swSleepHandled else { return }
+    swRunMeetap(["stop", "--sleep"], timeout: 25)
+    swSleepHandled = true
+}
+
+func swHandlePoweredOn() {
+    guard swSleepHandled else { return }
+    swRunMeetap(["_wake-notify"], timeout: 10)
+    exit(0)
+}
+
+func runSleepWatch(meetap: String, pidFile: String, simulate: Bool) {
+    swMeetap = meetap
+    if simulate {   // 测试用：不注册 IOKit，直接走一遍休眠→唤醒
+        swHandleWillSleep()
+        swHandlePoweredOn()
+        exit(0)
+    }
+    var notifyPort: IONotificationPortRef?
+    var notifier: io_object_t = 0
+    swRootPort = IORegisterForSystemPower(nil, &notifyPort, { _, _, messageType, messageArgument in
+        switch messageType {
+        case kMsgCanSystemSleep:
+            IOAllowPowerChange(swRootPort, Int(bitPattern: messageArgument))
+        case kMsgSystemWillSleep:
+            swHandleWillSleep()
+            IOAllowPowerChange(swRootPort, Int(bitPattern: messageArgument))
+        case kMsgSystemHasPoweredOn:
+            swHandlePoweredOn()
+        default:
+            break
+        }
+    }, &notifier)
+    guard swRootPort != 0, let port = notifyPort else {
+        fputs("sleep-watch: IORegisterForSystemPower failed\n", stderr); exit(1) }
+    CFRunLoopAddSource(CFRunLoopGetCurrent(),
+                       IONotificationPortGetRunLoopSource(port).takeUnretainedValue(),
+                       .defaultMode)
+    // 录音被手动 stop / 自停后 PID 文件消失 → 退出。处理过休眠后不再检查：
+    // stop --sleep 本身会删 PID 文件，watcher 要活到唤醒发通知
+    Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+        if !swSleepHandled && !FileManager.default.fileExists(atPath: pidFile) { exit(0) }
+    }
+    CFRunLoopRun()
+}
+
 // MARK: - Main
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -172,6 +249,7 @@ guard let cmd = args.first else {
       set-default <id>     设置默认输出设备
       find-uid <uid>       通过 UID 查找设备 ID
       cleanup              清理遗留的 Meeting Multi-Output 设备
+      sleep-watch <meetap> <pid-file>  休眠前执行 meetap stop --sleep，唤醒后 _wake-notify
 
     """, stderr)
     exit(1)
@@ -222,6 +300,10 @@ case "find-uid":
     guard let id = findByUID(args[1]) else {
         fputs("Error: device not found\n", stderr); exit(1) }
     print(id)
+case "sleep-watch":
+    guard args.count >= 3 else {
+        fputs("Usage: sleep-watch <meetap-path> <ffmpeg-pid-file> [--simulate-sleep]\n", stderr); exit(1) }
+    runSleepWatch(meetap: args[1], pidFile: args[2], simulate: args.contains("--simulate-sleep"))
 case "cleanup":
     cleanup()
 case "set-sample-rate":
