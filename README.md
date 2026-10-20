@@ -190,7 +190,9 @@ meetap start   # 开会前或开会过程中随时可以敲；终端底部显示
                # 会议结束按 Ctrl-C（等同 meetap stop）：自动转录 + 生成纪要
 ```
 
-`meetap start` 默认在前台运行、占用当前终端。想继续用这个终端，加 `-b` 在后台运行，结束时再敲 `meetap stop`。录音期间关闭终端窗口，也会像 `stop` 一样正常收尾。
+`meetap start` 默认在前台运行、占用当前终端。想继续用这个终端，加 `-b` 在后台运行，结束时再敲 `meetap stop`。前台模式下录音期间关闭终端窗口，也会像 `stop` 一样正常收尾（`-b` 模式关窗口不会收尾，录音继续）。
+
+> **注意**：从 v1.7 起 `meetap start` 默认前台运行并阻塞终端。在脚本、alias、shell 函数、快捷指令里调用 `meetap start` 并希望立即返回的（如 `meetap start x && open zoommtg://...`），请改用 `meetap start -b`。
 
 ### 开始音频采集
 
