@@ -41,31 +41,66 @@ FAIL=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAIL=1; }
 
-# pty 驱动：启动 meetap start -m，delay 秒后写入 ^C，返回退出所用秒数（超时 40 输出 TIMEOUT）。
+# pty 驱动：启动 meetap start -m，按 trigger 发 ^C，打印退出所用秒数。
+#   trigger = 秒数        → 固定延时后发 ^C
+#   trigger = file:<路径> → 等该文件出现（最多 10s，否则输出 NOFILE）后立刻发 ^C
+#   trigger = none        → 不发 ^C，只等 start 自行退出（由别的进程结束录音）
+# 发 ^C 前 start 已退出 → 输出 EARLY_EXIT；40s 内未退出 → TIMEOUT。
+# 第 3 个参数为 pty 输出落盘路径（可选）。
 # 必须持续读 master fd，否则 bash 退出时卡在 tty 输出（实测 STAT=E）。
 run_pty_ctrl_c() {
-    local delay="$1" name="$2"
-    python3 - "$PREFIX/meetap" "$delay" "$name" <<'PYEOF'
+    local trigger="$1" name="$2" out="${3:-/dev/null}"
+    python3 - "$PREFIX/meetap" "$trigger" "$name" "$out" <<'PYEOF'
 import os, pty, sys, threading, time
-meetap, delay, name = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+meetap, trigger, name, out = sys.argv[1:5]
 pid, fd = pty.fork()
 if pid == 0:
     os.execv(meetap, [meetap, "start", "-m", name])
+log = open(out, "wb")
 def drain():
     try:
-        while os.read(fd, 4096): pass
+        while True:
+            b = os.read(fd, 4096)
+            if not b: break
+            log.write(b); log.flush()
     except OSError: pass
 threading.Thread(target=drain, daemon=True).start()
-time.sleep(delay)
-os.write(fd, b"\x03")
+def exited():
+    return os.waitpid(pid, os.WNOHANG)[0] != 0
+def send_ctrl_c():
+    try: os.write(fd, b"\x03"); return True
+    except OSError: return False
+result = None
+if trigger.startswith("file:"):
+    path, t0 = trigger[5:], time.time()
+    while not os.path.exists(path) and time.time() - t0 < 10:
+        if exited(): result = "EARLY_EXIT"; break
+        time.sleep(0.02)
+    if result is None and not os.path.exists(path):
+        result = "NOFILE"
+        send_ctrl_c()          # 仍发 ^C 收尾，避免留下录音
+elif trigger != "none":
+    t0 = time.time()
+    while time.time() - t0 < float(trigger):
+        if exited(): result = "EARLY_EXIT"; break
+        time.sleep(0.05)
+if result is None and trigger != "none":
+    if exited() or not send_ctrl_c():
+        result = "EARLY_EXIT"
 t0 = time.time()
-while time.time() - t0 < 40:
-    if os.waitpid(pid, os.WNOHANG)[0]:
-        print(f"{time.time() - t0:.1f}"); sys.exit(0)
+done = result == "EARLY_EXIT"
+while not done and time.time() - t0 < 40:
+    if exited(): done = True; break
     time.sleep(0.2)
-print("TIMEOUT")
+if result is None:
+    result = f"{time.time() - t0:.1f}" if done else "TIMEOUT"
+time.sleep(0.3)   # 让 drain 读完尾部输出
+print(result)
 PYEOF
 }
+
+# 驱动结果是否为正常退出秒数（EARLY_EXIT / NOFILE / TIMEOUT / 空 均视为失败）
+exited_ok() { [[ "$1" =~ ^[0-9]+\.[0-9]$ ]]; }
 
 no_leftovers() {
     ! pgrep -f "$PREFIX/audio-tap tap-start" >/dev/null && ! pgrep -f "ffmpeg.*$TMP/rec" >/dev/null
@@ -73,7 +108,7 @@ no_leftovers() {
 
 echo "== 用例 1: 录音中 Ctrl-C → 有序 stop =="
 r=$(run_pty_ctrl_c 6 ctrlc)
-[[ "$r" != "TIMEOUT" ]] && pass "start 已退出（${r}s）" || fail "Ctrl-C 后 start 未退出"
+exited_ok "$r" && pass "start 已退出（${r}s）" || fail "Ctrl-C 后 start 未正常退出: ${r:-空}"
 sleep 2
 no_leftovers && pass "无残留 tap/ffmpeg" || fail "残留进程: $(pgrep -fl "$PREFIX/|$TMP/rec")"
 M4A=$(find "$TMP/rec" -name '*.m4a' -path '*ctrlc*' | head -1)
@@ -84,10 +119,16 @@ DUR=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$M4A" 2>/dev/n
     && pass "sleep-watch 已结束" || fail "sleep-watch 残留"
 
 echo "== 用例 2: 启动阶段 Ctrl-C → 无残留 =="
-r=$(run_pty_ctrl_c 0.8 early)
-[[ "$r" != "TIMEOUT" ]] && pass "start 已退出（${r}s）" || fail "start 未退出"
+# tap.pid 出现时 tap 已拉起、健康探测进行中，此刻发 ^C
+r=$(run_pty_ctrl_c "file:$MEETAP_STATE_DIR/tap.pid" early)
+exited_ok "$r" && pass "start 已退出（${r}s）" || fail "start 未正常退出: ${r:-空}"
 sleep 2
 no_leftovers && pass "无残留 tap/ffmpeg" || fail "残留进程: $(pgrep -fl "$PREFIX/|$TMP/rec")"
+left=""
+for f in ffmpeg.pid tap.pid monitor.pid sleepwatch.pid; do
+    [[ -e "$MEETAP_STATE_DIR/$f" ]] && left+=" $f"
+done
+[[ -z "$left" ]] && pass "无残留 pid 文件" || fail "残留 pid 文件:$left"
 
 echo "== 用例 3: 无 TTY → 立即返回（回归），stop 正常 =="
 t0=$(date +%s)
@@ -100,6 +141,22 @@ sleep 2
 "$PREFIX/meetap" stop < /dev/null > "$TMP/notty-stop.txt" 2>&1
 sleep 2
 no_leftovers && pass "stop 后无残留" || fail "stop 后残留"
+
+echo "== 用例 4: 前台录音中被 stop --sleep 结束 → 💤 提示且 start 自行退出 =="
+run_pty_ctrl_c none sleepy "$TMP/sleepy.out" > "$TMP/sleepy.r" &
+drv=$!
+for _ in $(seq 1 100); do [[ -f "$MEETAP_STATE_DIR/sleepwatch.pid" ]] && break; sleep 0.1; done
+sleep 5
+"$PREFIX/meetap" stop --sleep < /dev/null > "$TMP/sleepy-stop.txt" 2>&1
+wait "$drv"
+r=$(cat "$TMP/sleepy.r")
+exited_ok "$r" && pass "start 自行退出（${r}s）" || fail "start 未自行退出: ${r:-空}"
+SESS=$(cat "$MEETAP_STATE_DIR/pending-again" 2>/dev/null)
+[[ "$SESS" == *sleepy ]] && pass "待办会话: $SESS" || fail "未写待办: ${SESS:-空}"
+grep -q "again $SESS" "$TMP/sleepy.out" 2>/dev/null && grep -q "💤" "$TMP/sleepy.out" \
+    && pass "pty 输出含 💤 again $SESS" || fail "pty 输出缺休眠提示: $(tail -c 300 "$TMP/sleepy.out" | LC_ALL=C tr -d '\033')"
+sleep 1
+no_leftovers && pass "无残留 tap/ffmpeg" || fail "残留进程: $(pgrep -fl "$PREFIX/|$TMP/rec")"
 
 echo ""
 if (( FAIL )); then echo "❌ 有用例失败"; exit 1; else echo "✅ 全部通过"; fi

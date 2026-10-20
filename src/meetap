@@ -1480,6 +1480,15 @@ _jobctl_off() { set +m; }
 # start 前台模式下 Ctrl-C / 关窗口 / kill：等效 meetap stop
 _on_start_interrupt() {
     trap '' INT TERM HUP      # 防止 stop 过程中再次 Ctrl-C 重入
+    # trap 在命令之间执行：若恰好落在 `cmd &` 与写 PID 文件之间，刚拉起的子进程
+    # 没登记，stop 找不到它（典型：ffmpeg 卡在打开 tap.fifo，tap 被杀后永远阻塞）。
+    # $! 此时已是它的 PID：未出现在任何 PID 文件里就直接清掉
+    local last=$!
+    if [[ -n "$last" ]] && kill -0 "$last" 2>/dev/null \
+        && ! cat "$PID_FILE" "$TAP_PID_FILE" "$MONITOR_PID_FILE" "$AUTOSTOP_PID_FILE" \
+                 "$SLEEPWATCH_PID_FILE" 2>/dev/null | grep -qx "$last"; then
+        kill "$last" 2>/dev/null; sleep 0.3; kill -9 "$last" 2>/dev/null
+    fi
     teardown_statusbar "$START_TTY" 2>/dev/null
     stop_recording
     exit 0
@@ -1505,7 +1514,17 @@ foreground_wait() {
     start_visualizer "$START_TTY"
     # 波形写终端失败会提前跳出循环；录音仍在就继续守着，保证 Ctrl-C 依然有效
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do sleep 1; done
+    # 录音已由别处结束（-d 自停 / 休眠 / 其他终端 stop）：再按 Ctrl-C 直接退出，不再进 stop
+    trap - INT TERM HUP
     teardown_statusbar "$START_TTY" 2>/dev/null
+    # ffmpeg 退出时 stop 还在收尾（杀 tap、恢复设备、ffprobe…），待办文件最后才写：
+    # 等 session-dir 被删（紧接着就写 pending）再检查，最多 10s
+    local i
+    for ((i = 0; i < 50; i++)); do
+        [[ -f "$STATE_DIR/session-dir" ]] || break
+        sleep 0.2
+    done
+    sleep 0.2
     local session
     session=$(basename "$SESSION_DIR")
     if [[ -f "$PENDING_AGAIN_FILE" && "$(cat "$PENDING_AGAIN_FILE")" == "$session" ]]; then
