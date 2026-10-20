@@ -186,9 +186,11 @@ meetap config show      # 查看当前所有配置项
 整个工作流只有两行命令：
 
 ```bash
-meetap start   # 开会前或开会过程中随时可以敲
-meetap stop    # 会议结束后敲；自动转录 + 生成纪要
+meetap start   # 开会前或开会过程中随时可以敲；终端底部显示波形
+               # 会议结束按 Ctrl-C（等同 meetap stop）：自动转录 + 生成纪要
 ```
+
+`meetap start` 默认在前台运行、占用当前终端。想继续用这个终端，加 `-b` 在后台运行，结束时再敲 `meetap stop`。录音期间关闭终端窗口，也会像 `stop` 一样正常收尾。
 
 ### 开始音频采集
 
@@ -197,7 +199,7 @@ $ meetap start
 
 🎙️  录制已开始
    播放: MacBook Pro Speakers (Process Tap)
-   停止录制: /Users/you/bin/meetap stop
+   停止录制: Ctrl-C（或在其他终端运行 /Users/you/bin/meetap stop）
    自动停止: 关闭（手动 stop 结束）
 ```
 
@@ -208,7 +210,7 @@ $ meetap start -d 60
 
 🎙️  录制已开始
    播放: MacBook Pro Speakers (Process Tap)
-   停止录制: /Users/you/bin/meetap stop
+   停止录制: Ctrl-C（或在其他终端运行 /Users/you/bin/meetap stop）
    自动停止: 60 分钟后（约 15:30）
 ```
 
@@ -220,7 +222,7 @@ $ meetap start -m -d 150
 🎙️  录制已开始
    播放: MacBook Pro Speakers (Process Tap)
    麦克风: 已静音（只录系统音）
-   停止录制: /Users/you/bin/meetap stop
+   停止录制: Ctrl-C（或在其他终端运行 /Users/you/bin/meetap stop）
    自动停止: 150 分钟后（约 17:00）
 ```
 
@@ -232,6 +234,7 @@ $ meetap start -m -d 150
 - **终端底部**会显示音量电平 + 时长（`-m` 时只跟电脑声音走）
 - 指定了 `-d` 时，到达时长上限会自动停止；否则一直录到你手动 `stop`
 - **走 BlackHole 回退时，不要手动切换系统音频输出**，否则音频采集会无声（Process Tap 模式无此限制）
+- **Mac 休眠（合盖等）时自动结束本场录音**：只把音频文件收尾，不在休眠前上传转录；唤醒后会弹通知，按提示运行 `meetap again <会话名>` 生成纪要（`meetap status` 也会显示这条待办）。锁屏、显示器休眠不受影响
 
 ### 停止 + 自动生成纪要
 
