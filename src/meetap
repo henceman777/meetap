@@ -194,7 +194,7 @@ TOOL="$SCRIPT_DIR/audio-multi-output"
 MONITOR="$SCRIPT_DIR/audio-monitor"
 VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
 RECORDING_DIR="$CFG_RECORDING_DIR"
-STATE_DIR="/tmp/meeting-record"
+STATE_DIR="${MEETAP_STATE_DIR:-/tmp/meeting-record}"   # 测试可用 MEETAP_STATE_DIR 隔离
 
 mkdir -p "$RECORDING_DIR" "$STATE_DIR"
 
@@ -209,6 +209,8 @@ AUTOSTOP_PID_FILE="$STATE_DIR/autostop.pid"
 MAX_DURATION_FILE="$STATE_DIR/max-duration-deadline"   # 达到该 epoch 秒即自动结束（可选）
 MEETING_APPS_FILE="$STATE_DIR/meeting-apps"
 VISUALIZER_PID_FILE="$STATE_DIR/visualizer.pid"
+SLEEPWATCH_PID_FILE="$STATE_DIR/sleepwatch.pid"
+PENDING_AGAIN_FILE="$STATE_DIR/pending-again"   # 因休眠结束、待 meetap again 补跑的会话名
 
 # Process Tap 授权标记（持久化于配置目录，非 /tmp）：一旦通过授权自检即写入，
 # 之后 start 直接信任、跳过探测，避免每次录制都做 2 秒实测并播提示音。
@@ -1833,7 +1835,14 @@ start_recording() {
 
 stop_recording() {
     local VERBOSE=false
-    [[ "${1:-}" == "-t" || "${1:-}" == "--test" ]] && VERBOSE=true
+    local SLEEP_MODE=false   # 休眠触发：只收尾录音，不转录，留待唤醒后 meetap again
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -t|--test) VERBOSE=true ;;
+            --sleep)   SLEEP_MODE=true ;;
+        esac
+    done
     stop_visualizer
 
     # 停止自动停止守护进程
@@ -1843,29 +1852,39 @@ stop_recording() {
     fi
     rm -f "$MAX_DURATION_FILE"
 
-    if [[ ! -f "$PID_FILE" ]]; then
+    # 休眠监听：普通 stop 一并结束；--sleep 是 sleep-watch 自己调的，它要活到唤醒发通知
+    if ! $SLEEP_MODE && [[ -f "$SLEEPWATCH_PID_FILE" ]]; then
+        kill "$(cat "$SLEEPWATCH_PID_FILE")" 2>/dev/null
+        rm -f "$SLEEPWATCH_PID_FILE"
+    fi
+
+    # 没有 ffmpeg PID 也可能有残留要收拾：start 启动阶段被 Ctrl-C 打断时，
+    # tap / monitor 已起、输出设备已切到 BlackHole，但 ffmpeg 还没写 PID
+    if [[ ! -f "$PID_FILE" && ! -f "$TAP_PID_FILE" && ! -f "$MONITOR_PID_FILE" \
+          && ! -f "$ORIGINAL_NAME_FILE" ]]; then
         _t ERR_NO_ACTIVE_RECORDING
         exit 1
     fi
 
-    FFMPEG_PID=$(cat "$PID_FILE")
-
     # 停止 ffmpeg
-    if kill -0 "$FFMPEG_PID" 2>/dev/null; then
-        kill -INT "$FFMPEG_PID"
-        _t WAITING_RECORDING
-        for i in $(seq 1 15); do
-            kill -0 "$FFMPEG_PID" 2>/dev/null || break
-            sleep 1
-        done
-        # 如果 15 秒后仍未退出，强制终止
+    if [[ -f "$PID_FILE" ]]; then
+        FFMPEG_PID=$(cat "$PID_FILE")
         if kill -0 "$FFMPEG_PID" 2>/dev/null; then
-            _t FFMPEG_FORCE_KILL
-            kill -9 "$FFMPEG_PID" 2>/dev/null
-            sleep 1
+            kill -INT "$FFMPEG_PID"
+            _t WAITING_RECORDING
+            for i in $(seq 1 15); do
+                kill -0 "$FFMPEG_PID" 2>/dev/null || break
+                sleep 1
+            done
+            # 如果 15 秒后仍未退出，强制终止
+            if kill -0 "$FFMPEG_PID" 2>/dev/null; then
+                _t FFMPEG_FORCE_KILL
+                kill -9 "$FFMPEG_PID" 2>/dev/null
+                sleep 1
+            fi
         fi
+        rm -f "$PID_FILE"
     fi
-    rm -f "$PID_FILE"
 
     # 停止 audio-monitor
     if [[ -f "$MONITOR_PID_FILE" ]]; then
@@ -1941,9 +1960,16 @@ stop_recording() {
             rmdir "$SESSION_DIR"
             _t EMPTY_SESSION_REMOVED "$SESSION_DIR"
         elif [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
-            _t TRANSCRIBE_BACKGROUND
-            transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" &
-            disown
+            if $SLEEP_MODE; then
+                # 马上要休眠，上传会被打断：只记下会话，唤醒后提示 meetap again
+                basename "$SESSION_DIR" > "$PENDING_AGAIN_FILE"
+            else
+                _t TRANSCRIBE_BACKGROUND
+                # 忽略 HUP：关闭终端窗口触发的 stop 之后，转录不能被连带杀死
+                # （transcribe_recording 是函数，nohup 包不了，只能在子 shell 里 trap）
+                ( trap '' HUP; transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" ) < /dev/null &
+                disown
+            fi
         fi
     fi
 }
@@ -2224,7 +2250,7 @@ case "${1:-}" in
         start_recording "${@:2}"
         ;;
     stop)
-        stop_recording "${2:-}"
+        stop_recording "${@:2}"
         ;;
     status)
         show_status
