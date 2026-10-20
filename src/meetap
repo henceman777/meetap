@@ -442,11 +442,6 @@ transcribe_recording() {
         return 1
     fi
 
-    if [[ "$CFG_AUDIO_PERSIST" != "true" && ! -f "$STATE_DIR/test-mode" ]]; then
-        rm -f "$AUDIO_FILE"
-        echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
-    fi
-
     # Start transcription
     local LANG_FLAG="--identify-language"
     if [[ "$CFG_MULTI_LANGUAGE" == "true" ]]; then
@@ -553,6 +548,13 @@ with open(output_txt, "w") as f:
 
 print(f"Transcript saved: {len(lines)} speaker turns")
 PYEOF
+
+    # 本地音频要等转录文本落盘后再删：上传后立刻删的话，转录中途休眠/断网，
+    # transcript 没出来、音频也没了，meetap again 无从重跑
+    if [[ "$CFG_AUDIO_PERSIST" != "true" && ! -f "$STATE_DIR/test-mode" && -s "$LOG_DIR/transcript.txt" ]]; then
+        rm -f "$AUDIO_FILE"
+        echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
+    fi
 
     # Cleanup S3 bucket and Transcribe job
     aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
