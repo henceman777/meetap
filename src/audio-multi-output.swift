@@ -174,11 +174,13 @@ func swRunMeetap(_ arguments: [String], timeout: TimeInterval) {
     p.arguments = arguments
     p.standardInput = FileHandle.nullDevice
     p.standardOutput = FileHandle.nullDevice
-    p.standardError = FileHandle.nullDevice
     do { try p.run() } catch {
         fputs("sleep-watch: failed to run \(swMeetap): \(error)\n", stderr); return }
     let deadline = Date().addingTimeInterval(timeout)
     while p.isRunning && Date() < deadline { usleep(100_000) }
+    if p.isRunning {
+        fputs("sleep-watch: \(arguments.joined(separator: " ")) timed out after \(Int(timeout))s\n", stderr)
+    }
 }
 
 func swHandleWillSleep() {

@@ -29,6 +29,10 @@ cat > "$TMP/fakebin/osascript" <<EOF
 #!/bin/bash
 echo "\$*" >> "$TMP/osascript.log"
 EOF
+cat > "$TMP/fakebin/fake-sleep-watch" <<'EOF'
+#!/bin/bash
+while :; do sleep 1; done
+EOF
 chmod +x "$TMP/fakebin/"*
 export PATH="$TMP/fakebin:$PATH"
 
@@ -44,7 +48,8 @@ setup_recording() {
     AUDIO="$SESSION/meeting_test.m4a"
     ffmpeg -nostdin -loglevel error -f lavfi -i anullsrc=r=16000:cl=mono -t 1 -c:a aac -y "$AUDIO"
     sleep 300 & FAKE_FFMPEG=$!
-    sleep 300 & FAKE_WATCH=$!
+    # 假 sleep-watch：命令行含 sleep-watch，才能通过 stop 的进程校验
+    "$TMP/fakebin/fake-sleep-watch" & FAKE_WATCH=$!
     echo "$FAKE_FFMPEG" > "$MEETAP_STATE_DIR/ffmpeg.pid"
     echo "$FAKE_WATCH"  > "$MEETAP_STATE_DIR/sleepwatch.pid"
     echo "$SESSION" > "$MEETAP_STATE_DIR/session-dir"
@@ -90,9 +95,11 @@ echo "== 用例 4: 什么都没有 → 报无录音、exit 1（回归） =="
 echo "== 用例 5: _wake-notify 发通知，带会话名 =="
 echo "20261020_1000_sleep" > "$MEETAP_STATE_DIR/pending-again"
 rm -f "$TMP/osascript.log"
+echo "$$" > "$MEETAP_STATE_DIR/sleepwatch.pid"
 "$MEETAP" _wake-notify; rc=$?
 [[ $rc -eq 0 ]] && grep -q "20261020_1000_sleep" "$TMP/osascript.log" 2>/dev/null \
     && pass "通知含会话名" || fail "rc=$rc osascript=$(cat "$TMP/osascript.log" 2>/dev/null)"
+[[ ! -e "$MEETAP_STATE_DIR/sleepwatch.pid" ]] && pass "唤醒后 sleepwatch.pid 已清理" || fail "sleepwatch.pid 残留"
 
 echo "== 用例 6: 无待办时 _wake-notify 静默 =="
 rm -f "$MEETAP_STATE_DIR/pending-again" "$TMP/osascript.log"
@@ -118,6 +125,17 @@ chmod +x "$TMP/fakebin/claude"
 printf 'recording_dir = %s\nlanguage = zh-CN\nai_backend = claude-code\n' "$TMP/rec" > "$XDG_CONFIG_HOME/meetap/config"
 "$MEETAP" again 20261020_1000_sleep > "$TMP/out8.txt" 2>&1
 [[ ! -e "$MEETAP_STATE_DIR/pending-again" ]] && pass "待办已清除" || fail "待办残留；again 输出: $(tail -5 "$TMP/out8.txt")"
+
+echo "== 用例 9: sleepwatch.pid 指向非 sleep-watch 的活进程 → 普通 stop 不误杀、pid 文件删除 =="
+setup_recording "20261020_1200_reuse"
+kill "$FAKE_WATCH" 2>/dev/null
+sleep 300 & INNOCENT=$!
+echo "$INNOCENT" > "$MEETAP_STATE_DIR/sleepwatch.pid"
+"$MEETAP" stop > "$TMP/out9.txt" 2>&1
+sleep 1
+alive "$INNOCENT" && pass "无关进程仍存活" || fail "无关进程被误杀"
+[[ ! -e "$MEETAP_STATE_DIR/sleepwatch.pid" ]] && pass "pid 文件已删" || fail "sleepwatch.pid 残留"
+kill "$INNOCENT" 2>/dev/null
 
 echo ""
 if (( FAIL )); then echo "❌ 有用例失败"; exit 1; else echo "✅ 全部通过"; fi

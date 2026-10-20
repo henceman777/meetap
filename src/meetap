@@ -1479,7 +1479,7 @@ _jobctl_off() { set +m; }
 
 # start 前台模式下 Ctrl-C / 关窗口 / kill：等效 meetap stop
 _on_start_interrupt() {
-    trap '' INT TERM HUP      # 防止 stop 过程中再次 Ctrl-C 重入
+    trap '' INT TERM HUP QUIT     # 防止 stop 过程中再次 Ctrl-C 重入
     # trap 在命令之间执行：若恰好落在 `cmd &` 与写 PID 文件之间，刚拉起的子进程
     # 没登记，stop 找不到它（典型：ffmpeg 卡在打开 tap.fifo，tap 被杀后永远阻塞）。
     # $! 此时已是它的 PID：未出现在任何 PID 文件里就直接清掉
@@ -1494,9 +1494,19 @@ _on_start_interrupt() {
     exit 0
 }
 
+# 结束 sleep-watch：PID 文件可能残留（PID 已被无关进程复用），校验命令行再 kill
+_kill_sleepwatch() {
+    local pid
+    pid=$(cat "$SLEEPWATCH_PID_FILE" 2>/dev/null)
+    if [[ -n "$pid" ]] && ps -p "$pid" -o command= 2>/dev/null | grep -q 'sleep-watch'; then
+        kill "$pid" 2>/dev/null
+    fi
+    rm -f "$SLEEPWATCH_PID_FILE"
+}
+
 # 休眠监听：系统休眠前以 stop --sleep 结束录音，唤醒后发通知（所有运行模式都启动）
 start_sleepwatch() {
-    [[ -f "$SLEEPWATCH_PID_FILE" ]] && kill "$(cat "$SLEEPWATCH_PID_FILE")" 2>/dev/null
+    _kill_sleepwatch
     _jobctl_on
     "$TOOL" sleep-watch "$SCRIPT_DIR/meetap" "$PID_FILE" \
         < /dev/null > "$STATE_DIR/sleepwatch.log" 2>&1 &
@@ -1515,16 +1525,15 @@ foreground_wait() {
     # 波形写终端失败会提前跳出循环；录音仍在就继续守着，保证 Ctrl-C 依然有效
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do sleep 1; done
     # 录音已由别处结束（-d 自停 / 休眠 / 其他终端 stop）：再按 Ctrl-C 直接退出，不再进 stop
-    trap - INT TERM HUP
+    trap - INT TERM HUP QUIT
     teardown_statusbar "$START_TTY" 2>/dev/null
-    # ffmpeg 退出时 stop 还在收尾（杀 tap、恢复设备、ffprobe…），待办文件最后才写：
-    # 等 session-dir 被删（紧接着就写 pending）再检查，最多 10s
+    # ffmpeg 退出时 stop 还在收尾（杀 tap、恢复设备、ffprobe…）：
+    # session-dir 被删即表示待办已写入（stop 先写待办再删 session-dir），最多等 10s
     local i
     for ((i = 0; i < 50; i++)); do
         [[ -f "$STATE_DIR/session-dir" ]] || break
         sleep 0.2
     done
-    sleep 0.2
     local session
     session=$(basename "$SESSION_DIR")
     if [[ -f "$PENDING_AGAIN_FILE" && "$(cat "$PENDING_AGAIN_FILE")" == "$session" ]]; then
@@ -1591,7 +1600,7 @@ start_recording() {
     [[ "$START_TTY" == "not a tty" ]] && START_TTY=""
     if ! $BACKGROUND && [[ -n "$START_TTY" ]]; then
         FOREGROUND=true
-        trap '_on_start_interrupt' INT TERM HUP
+        trap '_on_start_interrupt' INT TERM HUP QUIT
     fi
 
     # 清理残留状态。关键：上次异常停止可能留下孤儿 audio-tap（stop 只杀
@@ -1942,10 +1951,7 @@ stop_recording() {
     rm -f "$MAX_DURATION_FILE"
 
     # 休眠监听：普通 stop 一并结束；--sleep 是 sleep-watch 自己调的，它要活到唤醒发通知
-    if ! $SLEEP_MODE && [[ -f "$SLEEPWATCH_PID_FILE" ]]; then
-        kill "$(cat "$SLEEPWATCH_PID_FILE")" 2>/dev/null
-        rm -f "$SLEEPWATCH_PID_FILE"
-    fi
+    $SLEEP_MODE || _kill_sleepwatch
 
     # 没有 ffmpeg PID 也可能有残留要收拾：start 启动阶段被 Ctrl-C 打断时，
     # tap / monitor 已起、输出设备已切到 BlackHole，但 ffmpeg 还没写 PID
@@ -2044,21 +2050,26 @@ stop_recording() {
     # 清理空的会话目录，或启动后台转录
     if [[ -f "$STATE_DIR/session-dir" ]]; then
         SESSION_DIR=$(cat "$STATE_DIR/session-dir")
-        rm -f "$STATE_DIR/session-dir"
         if [[ -d "$SESSION_DIR" ]] && [ -z "$(ls -A "$SESSION_DIR")" ]; then
+            rm -f "$STATE_DIR/session-dir"
             rmdir "$SESSION_DIR"
             _t EMPTY_SESSION_REMOVED "$SESSION_DIR"
         elif [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
             if $SLEEP_MODE; then
-                # 马上要休眠，上传会被打断：只记下会话，唤醒后提示 meetap again
+                # 马上要休眠，上传会被打断：只记下会话，唤醒后提示 meetap again。
+                # 先写待办再删 session-dir：保证「session-dir 消失」⇒ 待办已写入
                 basename "$SESSION_DIR" > "$PENDING_AGAIN_FILE"
+                rm -f "$STATE_DIR/session-dir"
             else
+                rm -f "$STATE_DIR/session-dir"
                 _t TRANSCRIBE_BACKGROUND
                 # 忽略 HUP：关闭终端窗口触发的 stop 之后，转录不能被连带杀死
                 # （transcribe_recording 是函数，nohup 包不了，只能在子 shell 里 trap）
                 ( trap '' HUP; transcribe_recording "$OUTPUT_FILE" "$SESSION_DIR" ) < /dev/null &
                 disown
             fi
+        else
+            rm -f "$STATE_DIR/session-dir"
         fi
     fi
 }
@@ -2066,6 +2077,7 @@ stop_recording() {
 # 唤醒通知（内部子命令，由 sleep-watch 在唤醒后调用）：提示用 again 补跑转录与纪要。
 # 通知里写具体会话名——again 不带参数取最新会话，唤醒后若先开了新会议会选错。
 wake_notify() {
+    rm -f "$SLEEPWATCH_PID_FILE"   # sleep-watch 发完通知即退出，PID 文件不再有效
     [[ -f "$PENDING_AGAIN_FILE" ]] || return 0
     local session
     session=$(cat "$PENDING_AGAIN_FILE")
