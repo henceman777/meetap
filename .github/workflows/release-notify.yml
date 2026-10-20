@@ -1,5 +1,6 @@
 # 发布 GitHub Release 时，通过 Slack Workflow Builder 的 webhook 通知 #meetap-community。
-# webhook 接收 4 个文本变量：version / title / url / notes（与 Slack 工作流里的变量名一致）。
+# webhook 接收文本变量：version / title / url / notes，以及要点拆分的 k1..k3（关键词）/ d1..d3（说明），
+# 变量名须与 Slack 工作流里的一致。
 name: Release Slack Notify
 
 on:
@@ -42,11 +43,30 @@ jobs:
           # Slack 工作流变量按纯文本显示（* ` _ 不渲染），去掉反引号；重点用 emoji 和【】标注
           notes=$(sed -E 's/`//g' <<<"$notes")
 
+          # 要点拆成「关键词 / 说明」两段（k1..k3 / d1..d3），Slack 模板里把关键词变量设成粗体。
+          # 摘要行形如「🎯 【关键词】说明」；回退的小节标题形如「• 新增：说明」
+          k=("" "" ""); d=("" "" ""); i=0
+          while IFS= read -r line && (( i < 3 )); do
+            [[ -z "${line// /}" ]] && continue
+            if [[ "$line" =~ ^(.*【[^】]+】)[[:space:]]*(.*)$ ]]; then
+              k[i]="${BASH_REMATCH[1]}"; d[i]="${BASH_REMATCH[2]}"
+            elif [[ "$line" =~ ^•[[:space:]]*([^：:]+)[：:][[:space:]]*(.*)$ ]]; then
+              k[i]="【${BASH_REMATCH[1]}】"; d[i]="${BASH_REMATCH[2]}"
+            else
+              d[i]="$line"
+            fi
+            i=$((i + 1))
+          done <<<"$notes"
+
           payload=$(jq -n \
             --arg version "$TAG" \
             --arg title "$title" \
             --arg url "$(jq -r '.url' <<<"$release")" \
             --arg notes "$notes" \
-            '{version: $version, title: $title, url: $url, notes: $notes}')
+            --arg k1 "${k[0]}" --arg d1 "${d[0]}" \
+            --arg k2 "${k[1]}" --arg d2 "${d[1]}" \
+            --arg k3 "${k[2]}" --arg d3 "${d[2]}" \
+            '{version: $version, title: $title, url: $url, notes: $notes,
+              k1: $k1, d1: $d1, k2: $k2, d2: $d2, k3: $k3, d3: $d3}')
 
           curl -fsS -X POST -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
