@@ -1,5 +1,9 @@
 PREFIX ?= $(HOME)/bin
 BUILD  ?= build
+# 源码在 git 仓库里时，install 把「分支@提交号」写进 meetap --version（有未提交改动加 -dirty）
+GIT_SHA   := $(shell git rev-parse --short HEAD 2>/dev/null)
+GIT_DIRTY := $(shell git diff --quiet HEAD -- 2>/dev/null || echo -dirty)
+BUILD_ID  := $(if $(GIT_SHA),$(shell git rev-parse --abbrev-ref HEAD)@$(GIT_SHA)$(GIT_DIRTY))
 
 .PHONY: all install clean
 
@@ -26,6 +30,7 @@ $(BUILD)/audio-tap: src/audio-tap.swift src/audio-tap-Info.plist
 install: all
 	mkdir -p $(PREFIX)
 	cp src/meetap $(PREFIX)/meetap
+	sed -i '' 's|^BUILD_ID=""|BUILD_ID="$(BUILD_ID)"|' $(PREFIX)/meetap
 	cp $(BUILD)/audio-multi-output $(PREFIX)/audio-multi-output
 	cp $(BUILD)/audio-monitor $(PREFIX)/audio-monitor
 	cp $(BUILD)/audio-tap $(PREFIX)/audio-tap

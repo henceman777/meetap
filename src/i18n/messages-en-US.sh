@@ -107,6 +107,7 @@ MSG_FIELD_SIZE="   Size: %s"
 MSG_FIELD_DURATION="   Duration: %sm%ss"
 MSG_RECORDING_SUCCESS="✅ Audio captured successfully"
 MSG_EMPTY_SESSION_REMOVED="🗑️  No audio captured, removed empty directory: %s"
+MSG_REC_CLOCK_DRIFT="⚠️  Recording clock fuse tripped: a device delivered audio at a different rate than it reported; corrected from measurement (duration unaffected, that source may be choppy for a few seconds before the fix). See %s"
 MSG_TRANSCRIBE_BACKGROUND="📝 Background transcription started (you'll be notified when done)"
 
 # ── Status ──

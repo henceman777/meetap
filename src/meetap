@@ -1,6 +1,7 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.7.1"
+VERSION="1.7.2"
+BUILD_ID=""   # make install 写入「分支@提交号」，区分本地试用构建；Homebrew 安装为空
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
@@ -1659,14 +1660,12 @@ start_recording() {
     if [[ "$use_tap" == "true" ]]; then
         # --- Process Tap 分支 ---
         # 不切设备、不需要 BlackHole/audio-monitor,用户听到原声
-        # 采样率：必须用 tap 的【实际】采样率喂 ffmpeg -ar，否则时长错拉、音调失真。
-        # tap-format 读 kAudioTapPropertyFormat（与 tap-start 采集所用同一属性）；
-        # 老的 tap-rate 读设备标称率，某些设备上与 tap 实际率不等 → 错配。
-        # 兜底链：tap-format 失败 → tap-rate → 48000（保证始终有值，不阻断录制）。
-        local TAP_RATE
-        TAP_RATE=$("$TAP_TOOL" tap-format 2>/dev/null)
-        [[ "$TAP_RATE" =~ ^[0-9]+$ ]] || TAP_RATE=$("$TAP_TOOL" tap-rate 2>/dev/null)
-        [[ "$TAP_RATE" =~ ^[0-9]+$ ]] || TAP_RATE=48000
+        # 采样率：由这里定、同一个值同时传给 audio-tap --output-rate 和 ffmpeg -ar。
+        # audio-tap 把 tap、麦克风各自重采样到该率再混音，与设备实际采样率无关。
+        # 不再开录前探测 tap 采样率：蓝牙耳机一开麦就切通话模式（输出 48k→24k、
+        # 麦克风 24k），探测时与录制时的设备状态不同，探到的值不可信；而麦克风
+        # 与 tap 不同率时不重采样会让整段录音 2 倍速 + 升调（AirPods Pro 实录事故）。
+        local TAP_RATE=48000
 
         ORIG_NAME=$("$TOOL" default-output-name 2>/dev/null || echo "Unknown")
         MIC_NAME=$("$TOOL" default-input-name 2>/dev/null || echo "default")
@@ -1707,7 +1706,7 @@ start_recording() {
             local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level")
             $MUTE_MIC && mic_args=()
             _jobctl_on
-            "$TAP_TOOL" tap-start "${mic_args[@]}" \
+            "$TAP_TOOL" tap-start --output-rate "$TAP_RATE" "${mic_args[@]}" \
                 --level-file "$STATE_DIR/tap-level" \
                 < /dev/null > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
             TAP_PID=$!
@@ -2055,6 +2054,12 @@ stop_recording() {
             rmdir "$SESSION_DIR"
             _t EMPTY_SESSION_REMOVED "$SESSION_DIR"
         elif [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
+            # 留存 audio-tap 诊断日志（设备采样率、重采样、时钟自检）：/tmp 下的
+            # tap.log 每次开录都会被覆盖，事后排查录音变速/静音全靠这份副本
+            if [[ -s "$STATE_DIR/tap.log" ]]; then
+                mkdir -p "$SESSION_DIR/log" && cp "$STATE_DIR/tap.log" "$SESSION_DIR/log/audio-tap.log"
+                grep -q "CLOCK_DRIFT" "$STATE_DIR/tap.log" && _t REC_CLOCK_DRIFT "$SESSION_DIR/log/audio-tap.log"
+            fi
             if $SLEEP_MODE; then
                 # 马上要休眠，上传会被打断：只记下会话，唤醒后提示 meetap again。
                 # 先写待办再删 session-dir：保证「session-dir 消失」⇒ 待办已写入
@@ -2440,7 +2445,7 @@ case "${1:-}" in
         esac
         ;;
     -v|--version|version)
-        _t VERSION_LINE "$VERSION"
+        _t VERSION_LINE "$VERSION${BUILD_ID:+ ($BUILD_ID)}"
         ;;
     *)
         _t USAGE_HEADER "$VERSION"

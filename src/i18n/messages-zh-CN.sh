@@ -108,6 +108,7 @@ MSG_FIELD_SIZE="   大小: %s"
 MSG_FIELD_DURATION="   时长: %s分%s秒"
 MSG_RECORDING_SUCCESS="✅ 音频采样成功"
 MSG_EMPTY_SESSION_REMOVED="🗑️  未产生录音文件，已删除空目录: %s"
+MSG_REC_CLOCK_DRIFT="⚠️  录音时钟保险丝触发：有设备的实际采样率与自报不符，已按实测纠正（时长不受影响，纠正前几秒该路声音可能断续）。详见 %s"
 MSG_TRANSCRIBE_BACKGROUND="📝 后台转录已启动（完成后会收到通知）"
 
 # ── 状态 ──
