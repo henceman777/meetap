@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.7.1"
+VERSION="1.7.2"
 BUILD_ID=""   # make install 写入「分支@提交号」，区分本地试用构建；Homebrew 安装为空
 
 # --- Config ---
