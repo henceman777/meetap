@@ -95,6 +95,7 @@ MSG_ERR_TAP_STALL="❌ 系统音频采集反复无数据，录音会是静音。
 MSG_START_TAP_UNVERIFIED="ℹ️  尚未确认系统音频录制授权，建议先跑一次 %s setup 完成授权自检，以免录到静音"
 MSG_ERR_BAD_DURATION="❌ 会议时长上限必须是正整数分钟: %s"
 MSG_ERR_UNKNOWN_OPTION="❌ 未知选项: %s"
+MSG_ERR_UNKNOWN_COMMAND="❌ 未知命令: %s"
 
 # ── 录制停止 ──
 MSG_WAITING_RECORDING="⏳ 等待录制完成..."
@@ -205,7 +206,8 @@ MSG_ERR_HL_VERIFY_FAILED="❌ 模型改动了正文（不只是加高亮），�
 MSG_ERR_HL_LLM_FAILED="❌ 高亮生成失败（LLM 未产出内容）"
 
 MSG_USAGE_HEADER="MeeTap v%s - macOS 会议录制 + 自动转录"
-MSG_USAGE_LINE="用法: meetap {start|stop|status|again|mark|setup|config|version}"
+MSG_USAGE_LINE="用法: meetap [start|stop|status|again|mark|setup|config|version|help]"
+MSG_USAGE_BARE="  （不带参数）直接敲 meetap，等同 meetap start，开始录制"
 MSG_USAGE_START="  start [-t] [-d 分钟] [-m] [-b] [会议名] 开始录制（默认前台运行，Ctrl-C 结束；-b 后台运行，不占用终端；-t 详细信息；-d 指定时长上限，到点自动结束；-m/--mute-mic 不开麦克风，只录电脑声音）"
 MSG_USAGE_STOP="  stop [-t]    停止录制，恢复音频设备，自动转录（-t 显示详细文件信息）"
 MSG_USAGE_STATUS="  status       查看当前录制状态"
@@ -215,6 +217,7 @@ MSG_USAGE_SETUP="  setup        一键配置 Zoom + Teams + 腾讯会议（只�
 MSG_USAGE_CONFIG="  config       打开编辑器修改配置（\$EDITOR）"
 MSG_USAGE_CONFIG_SHOW="  config show  显示当前配置"
 MSG_USAGE_VERSION="  version      显示版本号"
+MSG_USAGE_HELP="  help         显示本帮助（也可用 -h / --help）"
 MSG_USAGE_HINT="首次使用请先运行: meetap setup"
 
 # ── 版本 ──

@@ -186,9 +186,11 @@ meetap config show      # 查看当前所有配置项
 整个工作流只有两行命令：
 
 ```bash
-meetap start   # 开会前或开会过程中随时可以敲；终端底部显示波形
+meetap         # 开会前或开会过程中随时可以敲（等同 meetap start）；终端底部显示波形
                # 会议结束按 Ctrl-C（等同 meetap stop）：自动转录 + 生成纪要
 ```
+
+只敲 `meetap`、不带任何参数，就等同 `meetap start`。要带选项或会议名（`-b`、`-m`、`-d`、`meetap start 周会`）时仍写 `meetap start …`；`meetap 周会` 这类不带子命令的写法会报「未知命令」，不会开录，免得敲错字误开录音。查看所有命令用 `meetap help`。
 
 `meetap start` 默认在前台运行、占用当前终端。想继续用这个终端，加 `-b` 在后台运行，结束时再敲 `meetap stop`。前台模式下录音期间关闭终端窗口，也会像 `stop` 一样正常收尾（`-b` 模式关窗口不会收尾，录音继续）。
 
@@ -304,7 +306,7 @@ meetap status       # 查看当前是否在音频采集
 meetap config       # 编辑配置
 meetap config show  # 查看当前配置值
 meetap version      # 显示版本号
-meetap help         # 显示所有命令
+meetap help         # 显示所有命令（也可用 -h / --help）
 ```
 
 ---
