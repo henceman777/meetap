@@ -3,7 +3,8 @@
 #
 # 用法: test/ctrl-c-test.sh
 # 前提: macOS 14.4+、已 make all、终端已授予「系统音频录制」权限。
-#       测试期间请勿播放音频；不录麦克风（-m），不触达 AWS（假 aws）。
+#       测试期间请勿播放音频；不触达 AWS（假 aws）。
+#       用例 1–4 不录麦克风（-m）；用例 5 测「只敲 meetap」，没法带 -m，会开麦克风。
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,6 +48,7 @@ fail() { echo "FAIL: $1"; FAIL=1; }
 #   trigger = none        → 不发 ^C，只等 start 自行退出（由别的进程结束录音）
 # 发 ^C 前 start 已退出 → 输出 EARLY_EXIT；40s 内未退出 → TIMEOUT。
 # 第 3 个参数为 pty 输出落盘路径（可选）。
+# name 传 BARE 时只执行 meetap（不带任何参数），测「只敲 meetap ≡ start」。
 # 必须持续读 master fd，否则 bash 退出时卡在 tty 输出（实测 STAT=E）。
 run_pty_ctrl_c() {
     local trigger="$1" name="$2" out="${3:-/dev/null}"
@@ -55,7 +57,7 @@ import os, pty, sys, threading, time
 meetap, trigger, name, out = sys.argv[1:5]
 pid, fd = pty.fork()
 if pid == 0:
-    os.execv(meetap, [meetap, "start", "-m", name])
+    os.execv(meetap, [meetap] if name == "BARE" else [meetap, "start", "-m", name])
 log = open(out, "wb")
 def drain():
     try:
@@ -157,6 +159,19 @@ grep -q "again $SESS" "$TMP/sleepy.out" 2>/dev/null && grep -q "💤" "$TMP/slee
     && pass "pty 输出含 💤 again $SESS" || fail "pty 输出缺休眠提示: $(tail -c 300 "$TMP/sleepy.out" | LC_ALL=C tr -d '\033')"
 sleep 1
 no_leftovers && pass "无残留 tap/ffmpeg" || fail "残留进程: $(pgrep -fl "$PREFIX/|$TMP/rec")"
+
+echo "== 用例 5: 只敲 meetap（不带参数）→ 前台开录，Ctrl-C 有序 stop =="
+touch "$TMP/bare.marker"
+run_pty_ctrl_c 6 BARE "$TMP/bare.out" > "$TMP/bare.r"
+r=$(cat "$TMP/bare.r")
+exited_ok "$r" && pass "meetap 前台录音，Ctrl-C 后退出（${r}s）" \
+    || fail "meetap 未前台录音或未正常退出: ${r:-空}；输出: $(tail -c 300 "$TMP/bare.out" | LC_ALL=C tr -d '\033')"
+sleep 2
+no_leftovers && pass "无残留 tap/ffmpeg" || fail "残留进程: $(pgrep -fl "$PREFIX/|$TMP/rec")"
+M4A=$(find "$TMP/rec" -name '*.m4a' -newer "$TMP/bare.marker" | head -1)
+DUR=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$M4A" 2>/dev/null)
+[[ -n "$DUR" ]] && pass "m4a 可读（${DUR}s）" || fail "m4a 不可读: ${M4A:-没有新录音}"
+[[ -n "$M4A" && -s "$(dirname "$M4A")/log/meetap.log" ]] && pass "已启动转录" || fail "未启动转录"
 
 echo ""
 if (( FAIL )); then echo "❌ 有用例失败"; exit 1; else echo "✅ 全部通过"; fi

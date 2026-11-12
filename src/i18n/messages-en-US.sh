@@ -94,6 +94,7 @@ MSG_ERR_TAP_STALL="❌ System-audio capture produced no data after repeated atte
 MSG_START_TAP_UNVERIFIED="i  System audio recording permission not yet verified; run %s setup once to complete the permission check, otherwise you may record silence"
 MSG_ERR_BAD_DURATION="❌ Meeting time limit must be a positive integer (minutes): %s"
 MSG_ERR_UNKNOWN_OPTION="❌ Unknown option: %s"
+MSG_ERR_UNKNOWN_COMMAND="❌ Unknown command: %s"
 
 # ── Recording stop ──
 MSG_WAITING_RECORDING="⏳ Waiting for recording to finish..."
@@ -204,7 +205,8 @@ MSG_ERR_HL_VERIFY_FAILED="❌ Model altered the body (not just added highlights)
 MSG_ERR_HL_LLM_FAILED="❌ Highlight generation failed (LLM produced no content)"
 
 MSG_USAGE_HEADER="MeeTap v%s - macOS meeting recorder + auto-transcription"
-MSG_USAGE_LINE="Usage: meetap {start|stop|status|again|mark|setup|config|version}"
+MSG_USAGE_LINE="Usage: meetap [start|stop|status|again|mark|setup|config|version|help]"
+MSG_USAGE_BARE="  (no args)    Plain meetap is the same as meetap start: begins recording"
 MSG_USAGE_START="  start [-t] [-d MIN] [-m] [-b] [name] Start recording (runs in the foreground, Ctrl-C to stop; -b runs in the background and frees the terminal; -t verbose; -d sets a time limit, auto-stops when reached; -m/--mute-mic leaves the mic off and records computer audio only)"
 MSG_USAGE_STOP="  stop [-t]    Stop recording, restore audio device, auto-transcribe (-t shows verbose file info)"
 MSG_USAGE_STATUS="  status       Show current recording status"
@@ -214,6 +216,7 @@ MSG_USAGE_SETUP="  setup        One-click setup for Zoom + Teams + Tencent Meeti
 MSG_USAGE_CONFIG="  config       Open config in \$EDITOR"
 MSG_USAGE_CONFIG_SHOW="  config show  Show current configuration"
 MSG_USAGE_VERSION="  version      Show version"
+MSG_USAGE_HELP="  help         Show this help (also -h / --help)"
 MSG_USAGE_HINT="First-time users please run: meetap setup"
 
 # ── Version ──

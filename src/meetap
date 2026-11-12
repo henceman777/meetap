@@ -2364,6 +2364,26 @@ setup_apps() {
     _t SETUP_HEADER
 }
 
+show_usage() {
+    _t USAGE_HEADER "$VERSION"
+    echo ""
+    _t USAGE_LINE
+    echo ""
+    _t USAGE_BARE
+    _t USAGE_START
+    _t USAGE_STOP
+    _t USAGE_STATUS
+    _t USAGE_AGAIN
+    _t USAGE_HIGHLIGHT
+    _t USAGE_SETUP
+    _t USAGE_CONFIG
+    _t USAGE_CONFIG_SHOW
+    _t USAGE_VERSION
+    _t USAGE_HELP
+    echo ""
+    _t USAGE_HINT
+}
+
 case "${1:-}" in
     start)
         start_recording "${@:2}"
@@ -2447,21 +2467,18 @@ case "${1:-}" in
     -v|--version|version)
         _t VERSION_LINE "$VERSION${BUILD_ID:+ ($BUILD_ID)}"
         ;;
+    "")
+        # 只敲 meetap ≡ meetap start。只认「完全不带参数」：meetap 周会、拼错的子命令
+        # 都不会落到这里，免得敲错一个字就开录。
+        start_recording
+        ;;
+    help|-h|--help)
+        show_usage
+        ;;
     *)
-        _t USAGE_HEADER "$VERSION"
+        _t ERR_UNKNOWN_COMMAND "$1"
         echo ""
-        _t USAGE_LINE
-        echo ""
-        _t USAGE_START
-        _t USAGE_STOP
-        _t USAGE_STATUS
-        _t USAGE_AGAIN
-        _t USAGE_HIGHLIGHT
-        _t USAGE_SETUP
-        _t USAGE_CONFIG
-        _t USAGE_CONFIG_SHOW
-        _t USAGE_VERSION
-        echo ""
-        _t USAGE_HINT
+        show_usage
+        exit 1
         ;;
 esac
