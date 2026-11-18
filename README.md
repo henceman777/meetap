@@ -170,7 +170,7 @@ meetap config show      # 查看当前所有配置项
 | `email_sender` | 空 | SES 已验证的发件人，设了 email 必填 |
 | `zero_alert_ignore` | `com.amazon.workspaces` | 静音报警时不算"在放声音"的 App（逗号分隔的 bundle ID 或命令行程序名），见下 |
 
-**`zero_alert_ignore` 是干什么的**：录音期间如果有 App 在放声音、录到的却全是零（多半是系统录音授权失效，或系统采集中途出了故障），meetap 会在 30 秒内弹通知，写明是哪个 App 在放。有的 App 一直开着音频输出、其实放的是静音（比如 Amazon WorkSpaces 客户端），会被误当成"在放声音"，每次提前开录都误报，所以要排除掉。**什么时候往里加**：收到这条通知、但当时其实没有任何声音在放，就把通知里写的那个 App 名加进来（多个用逗号隔开）。名单里的 App 只是不再触发报警，会话的 `log/audio-tap.log` 里照样记（`ignored=`）。
+**`zero_alert_ignore` 是干什么的**：录音期间如果有 App 在放声音、录到的却全是零（多半是系统录音授权失效，或系统采集中途出了故障），meetap 会在 30 秒内弹通知，写明是哪个 App 在放。有的 App 一直开着音频输出、其实放的是静音（比如 Amazon WorkSpaces 客户端），会被误当成"在放声音"，每次提前开录都误报，所以要排除掉。**什么时候往里加**：收到这条通知、但当时其实没有任何声音在放，就把通知里那个 App 后面**括号里那一串**加进来——通知写的是"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"，要加的是 `com.google.Chrome.helper`；命令行程序没有括号，直接加程序名。多个用逗号隔开。名单里的 App 只是不再触发报警，会话的 `log/audio-tap.log` 里照样记（`ignored=`）。
 
 重置为默认：`rm ~/.config/meetap/config` 后再跑任意 `meetap` 命令。
 
@@ -234,7 +234,7 @@ $ meetap start -m -d 150
 - **你正常开会**，音频照常从原来的扬声器 / 耳机里播放（Process Tap 不切换输出设备，录音中途切换输出设备也不影响采集）
 - **终端底部**会显示音量电平 + 时长（`-m` 时只跟电脑声音走）
 - 指定了 `-d` 时，到达时长上限会自动停止；否则一直录到你手动 `stop`
-- **有声音在放、却录成静音时当场提醒**：整场录音期间，只要有 App 在放声音、录到的却全是零，30 秒内弹系统通知，写明是哪个 App 在放。开会前提前开录、什么都没在放时不会提醒。每段变零、恢复的墙钟时间都记在会话的 `log/audio-tap.log` 里（`TAP_ZERO_START` / `TAP_ZERO_END`），开着麦克风的场次也记
+- **有声音在放、却录成静音时当场提醒**：整场录音期间，只要有 App 在放声音、录到的却全是零，30 秒内弹系统通知，写明是哪个 App 在放（"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"）。开会前提前开录、什么都没在放时不会提醒。每段变零、恢复的墙钟时间都记在会话的 `log/audio-tap.log` 里（`TAP_ZERO_START` / `TAP_ZERO_END`），开着麦克风的场次也记
 - **Mac 休眠（合盖等）时自动结束本场录音**：只把音频文件收尾，不在休眠前上传转录；唤醒后会弹通知，按提示运行 `meetap again <会话名>` 生成纪要（`meetap status` 也会显示这条待办）。锁屏、显示器休眠不受影响
 
 ### 停止 + 自动生成纪要
@@ -431,7 +431,7 @@ sequenceDiagram
 | 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../log/meetap.log` 查看具体 AWS 报错 |
 | 音频采集有回声 | 戴耳机采集；外放会把扬声器声音二次采入 |
 | 系统通知没弹出 | 系统设置 → 通知 → 允许 "终端" 或 "Script Editor" 发送通知 |
-| 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零。先看通知里写的是哪个 App：它当时其实没出声（一直开着输出流的 App），就把它加进配置 `zero_alert_ignore`；确实在开会，就跑 `meetap setup` 检查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间在会话的 `log/audio-tap.log` 里（`TAP_ZERO_*`） |
+| 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零。先看通知里写的是哪个 App：它当时其实没出声（一直开着输出流的 App），就把通知里括号里那一串（bundle ID）加进配置 `zero_alert_ignore`；确实在开会，就跑 `meetap setup` 检查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间在会话的 `log/audio-tap.log` 里（`TAP_ZERO_*`） |
 | 从 1.x 升级后听不到声音 | 系统输出或会议 App 的扬声器还指着 BlackHole 2ch。跑一次 `meetap setup`，或在 系统设置 › 声音 › 输出、会议 App 的音频设置里改回扬声器 / 耳机 |
 
 ---

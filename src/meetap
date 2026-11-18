@@ -2284,12 +2284,14 @@ start_recording() {
         $MUTE_MIC && mic_args=()
         _jobctl_on
         # --zero-alert-text：有声音在放、tap 交出的却全是零时，audio-tap 弹的通知文案
-        # （{apps} 换成在放声音的 App；整场都查，零段起止记进 tap.log，stop 时随 audio-tap.log
+        # （{apps} 换成在放声音的 App，每个写成「显示名（bundle ID）」，写法和分隔符按当前语言传入；整场都查，零段起止记进 tap.log，stop 时随 audio-tap.log
         # 存进会话）。--zero-alert-ignore：不算「有声音在放」的进程（配置 zero_alert_ignore）
         "$TAP_TOOL" tap-start --output-rate "$TAP_RATE" "${mic_args[@]}" \
             --level-file "$STATE_DIR/tap-level" \
             --zero-alert-text "$(_tn NOTIFY_TAP_ZERO)" \
             --zero-alert-ignore "$CFG_ZERO_ALERT_IGNORE" \
+            --zero-alert-app-format "$(_tn TAP_ZERO_APP_FORMAT)" \
+            --zero-alert-app-sep "$(_tn TAP_ZERO_APP_SEP)" \
             < /dev/null > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
         TAP_PID=$!
         _jobctl_off

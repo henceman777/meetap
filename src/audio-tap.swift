@@ -643,11 +643,24 @@ final class OutputWriter {
     }
 }
 
-// 除本进程外，正在往外放声音的进程：App 用 bundle ID，命令行进程没有 bundle ID 就用
-// 可执行文件名（再没有才记 pid:N）。静音报警和零段日志用它说明「是谁在放」，
-// zero_alert_ignore 名单也按这个名字匹配。
+// 一个正在放声音的进程。
+// id：App 用 bundle ID，命令行进程没有 bundle ID 就用可执行文件名（再没有才记 pid:N），
+//     zero_alert_ignore 名单按它匹配；
+// name：所属主 App 的显示名（Chrome 的 helper 子进程取「Google Chrome」），取不到为 nil。
+struct PlayingApp: Equatable {
+    let id: String
+    let name: String?
+    // 给人看的写法：「显示名 (id)」；没有显示名、或显示名就是 id 时只写 id
+    func display(_ format: String = "{name} ({id})") -> String {
+        guard let n = name, !n.isEmpty, n != id else { return id }
+        return format.replacingOccurrences(of: "{name}", with: n).replacingOccurrences(of: "{id}", with: id)
+    }
+    static func == (a: PlayingApp, b: PlayingApp) -> Bool { a.id == b.id }
+}
+
+// 除本进程外，正在往外放声音的进程。静音报警和零段日志用它说明「是谁在放」。
 @available(macOS 14.4, *)
-func playingProcesses() -> [String] {
+func playingProcesses() -> [PlayingApp] {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyProcessObjectList,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -658,7 +671,7 @@ func playingProcesses() -> [String] {
     var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
     guard AudioObjectGetPropertyData(sysObj, &addr, 0, nil, &size, &ids) == noErr else { return [] }
     let me = getpid()
-    var out: [String] = []
+    var out: [PlayingApp] = []
     for id in ids {
         var pid: pid_t = 0
         var running: UInt32 = 0
@@ -674,23 +687,53 @@ func playingProcesses() -> [String] {
         let st = withUnsafeMutablePointer(to: &bid) {
             AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, $0)
         }
-        let name = (st == noErr ? bid as String? : nil).flatMap { $0.isEmpty ? nil : $0 }
-            ?? executableName(pid) ?? "pid:\(pid)"
-        if !out.contains(name) { out.append(name) }
+        let path = executablePath(pid)
+        let exe = path.map { ($0 as NSString).lastPathComponent }.flatMap { $0.isEmpty ? nil : $0 }
+        let appID = (st == noErr ? bid as String? : nil).flatMap { $0.isEmpty ? nil : $0 } ?? exe ?? "pid:\(pid)"
+        let app = PlayingApp(id: appID, name: path.flatMap(appDisplayName(forExecutable:)))
+        if !out.contains(app) { out.append(app) }
     }
     return out
 }
 
-func executableName(_ pid: pid_t) -> String? {
+func executablePath(_ pid: pid_t) -> String? {
     var buf = [CChar](repeating: 0, count: 4096)
     guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return nil }
-    let name = (String(cString: buf) as NSString).lastPathComponent
-    return name.isEmpty ? nil : name
+    let path = String(cString: buf)
+    return path.isEmpty ? nil : path
 }
 
-// 报警通知文案：meetap 传进来的模板里 {apps} 换成在放声音的 App
-func zeroAlertMessage(_ template: String, _ apps: [String]) -> String {
-    template.replacingOccurrences(of: "{apps}", with: apps.joined(separator: ", "))
+// 可执行文件所属主 App 的显示名：取路径里最外层的 .app（helper 子进程装在主 App 的
+// Contents/Frameworks/… 里面），读它的 CFBundleDisplayName / CFBundleName，读不到就用
+// 文件夹名；不在任何 .app 里（命令行程序）返回 nil。按路径缓存（只在主队列调用）。
+var appNameCache: [String: String?] = [:]
+func appDisplayName(forExecutable path: String) -> String? {
+    if let hit = appNameCache[path] { return hit }
+    let comps = (path as NSString).pathComponents
+    var name: String? = nil
+    if let i = comps.firstIndex(where: { $0.hasSuffix(".app") }) {
+        if let b = Bundle(path: NSString.path(withComponents: Array(comps[0...i]))) {
+            for key in ["CFBundleDisplayName", "CFBundleName"] {
+                if let v = (b.localizedInfoDictionary?[key] ?? b.infoDictionary?[key]) as? String, !v.isEmpty {
+                    name = v
+                    break
+                }
+            }
+        }
+        if name == nil {
+            let base = (comps[i] as NSString).deletingPathExtension
+            name = base.isEmpty ? nil : base
+        }
+    }
+    appNameCache[path] = name
+    return name
+}
+
+// 报警通知文案：meetap 传进来的模板里 {apps} 换成在放声音的 App。每个 App 的写法和
+// 分隔符也由 meetap 按当前语言传入（中文「Google Chrome（com.google.Chrome.helper）、afplay」）
+func zeroAlertMessage(_ template: String, _ apps: [PlayingApp],
+                      format: String = "{name} ({id})", sep: String = ", ") -> String {
+    template.replacingOccurrences(of: "{apps}", with: apps.map { $0.display(format) }.joined(separator: sep))
 }
 
 // MARK: - tap 一路的零段记账与静音报警
@@ -709,25 +752,25 @@ final class ZeroGuard {
     struct Tick {
         let cb: Bool          // 这一秒 tap 有没有回调
         let nonzero: Bool     // 这一秒 tap 有没有交出非零样本
-        let playing: [String] // 这一秒在放声音的进程（只在零秒时才查；不含忽略名单里的）
-        var ignored: [String] = []  // 这一秒在放声音、但在忽略名单里的进程
+        let playing: [PlayingApp]     // 这一秒在放声音的进程（只在零秒时才查；不含忽略名单里的）
+        var ignored: [PlayingApp] = []  // 这一秒在放声音、但在忽略名单里的进程
         let wall: Date        // 这一秒窗口结束的墙钟时刻
         let rel: Double       // 相对开录的秒数（窗口结束）
     }
 
     private let log: (String) -> Void
-    private let alert: ([String]) -> Void
+    private let alert: ([PlayingApp]) -> Void
     private var zeroRun = 0, playingSec = 0, cbSec = 0
     private var startWall = Date(), startRel = 0.0
     private var inSpan = false, alerted = false
-    private var apps: [String] = [], ignoredApps: [String] = []
+    private var apps: [PlayingApp] = [], ignoredApps: [PlayingApp] = []
     private let fmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return f
     }()
 
-    init(log: @escaping (String) -> Void, alert: @escaping ([String]) -> Void) {
+    init(log: @escaping (String) -> Void, alert: @escaping ([PlayingApp]) -> Void) {
         self.log = log; self.alert = alert
     }
 
@@ -758,7 +801,7 @@ final class ZeroGuard {
         }
         if inSpan && !alerted && playingSec >= Self.alertPlayingSec {
             alerted = true
-            log("TAP_ZERO_ALERT \(at(t.wall, t.rel)) playing=\(playingSec)s apps=\(apps.joined(separator: ","))\(ignoredPart)")
+            log("TAP_ZERO_ALERT \(at(t.wall, t.rel)) playing=\(playingSec)s apps=\(Self.list(apps))\(ignoredPart)")
             alert(apps)
         }
     }
@@ -771,14 +814,17 @@ final class ZeroGuard {
 
     private func end(wall: Date, rel: Double, note: String) {
         let dur = max(0, rel - startRel)
-        let appsPart = apps.isEmpty ? "" : " apps=\(apps.joined(separator: ","))"
+        let appsPart = apps.isEmpty ? "" : " apps=\(Self.list(apps))"
         log(String(format: "TAP_ZERO_END %@ dur=%.0fs playing=%ds cb=%ds%@%@%@",
                    at(wall, rel), dur, playingSec, cbSec, appsPart, ignoredPart, note))
     }
 
     private var ignoredPart: String {
-        ignoredApps.isEmpty ? "" : " ignored=\(ignoredApps.joined(separator: ","))"
+        ignoredApps.isEmpty ? "" : " ignored=\(Self.list(ignoredApps))"
     }
+
+    // 日志里的 App 列表：「Google Chrome (com.google.Chrome.helper), afplay」
+    static func list(_ apps: [PlayingApp]) -> String { apps.map { $0.display() }.joined(separator: ", ") }
 }
 
 // 除本进程外，是否有进程正在往外放声音。用来区分「系统本来就没声音」
@@ -1094,7 +1140,8 @@ func notifyZero(_ text: String) {
 }
 
 func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, withMic: Bool,
-                 outputRate: Double, zeroAlertText: String?, zeroAlertIgnore: Set<String>) -> Never {
+                 outputRate: Double, zeroAlertText: String?, zeroAlertIgnore: Set<String>,
+                 zeroAlertAppFormat: String, zeroAlertAppSep: String) -> Never {
     guard #available(macOS 14.4, *) else {
         fputs("Error: Process Tap requires macOS 14.4+\n", stderr)
         exit(1)
@@ -1214,7 +1261,9 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     var tapFirstLogged = false, micFirstLogged = false, micNoDataWarned = false, micStalled = false
     let zeroGuard = ZeroGuard(log: { fputs($0 + "\n", stderr) },
                               alert: { apps in
-                                  if let t = zeroAlertText, !t.isEmpty { notifyZero(zeroAlertMessage(t, apps)) }
+                                  if let t = zeroAlertText, !t.isEmpty {
+                                      notifyZero(zeroAlertMessage(t, apps, format: zeroAlertAppFormat, sep: zeroAlertAppSep))
+                                  }
                               })
     activeZeroGuard = zeroGuard
     let wd = DispatchSource.makeTimerSource(queue: .main)
@@ -1256,8 +1305,8 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
         let nonzero = secPeak > 0
         let procs = nonzero ? [] : playingProcesses()
         zeroGuard.feed(ZeroGuard.Tick(cb: secCallbacks > 0, nonzero: nonzero,
-                                      playing: procs.filter { !zeroAlertIgnore.contains($0) },
-                                      ignored: procs.filter { zeroAlertIgnore.contains($0) },
+                                      playing: procs.filter { !zeroAlertIgnore.contains($0.id) },
+                                      ignored: procs.filter { zeroAlertIgnore.contains($0.id) },
                                       wall: Date(), rel: Double(now - launchNs) / 1e9))
 
         if last > tapStartNs { backoffNs = 3_000_000_000; return }
@@ -1529,6 +1578,9 @@ func runSelftestZeroGuard() -> Never {
     let base = DateFormatter()
     base.dateFormat = "yyyy-MM-dd HH:mm:ss"
     let t0 = base.date(from: "2026-11-18 12:01:07")!
+    let teams = PlayingApp(id: "com.microsoft.teams2", name: "Microsoft Teams")
+    let workspaces = PlayingApp(id: "com.amazon.workspaces", name: "Amazon WorkSpaces")
+    let afplay = PlayingApp(id: "afplay", name: nil)
     // seq: 每个元素是一秒，(cb, nonzero, playing)
     func run(_ seq: [(Bool, Bool, Bool)], finishAt: Int? = nil) -> (lines: [String], alerts: [Int]) {
         var lines: [String] = [], alerts: [Int] = []
@@ -1536,7 +1588,7 @@ func runSelftestZeroGuard() -> Never {
         let g = ZeroGuard(log: { lines.append($0) }, alert: { _ in alerts.append(sec) })
         for (i, s) in seq.enumerated() {
             sec = i + 1
-            g.feed(ZeroGuard.Tick(cb: s.0, nonzero: s.1, playing: s.2 ? ["com.microsoft.teams2"] : [],
+            g.feed(ZeroGuard.Tick(cb: s.0, nonzero: s.1, playing: s.2 ? [teams] : [],
                                   wall: t0.addingTimeInterval(Double(sec)), rel: Double(sec)))
         }
         if let f = finishAt { g.finish(wall: t0.addingTimeInterval(Double(f)), rel: Double(f)) }
@@ -1558,7 +1610,7 @@ func runSelftestZeroGuard() -> Never {
         let r = run(Array(repeating: sound, count: 10) + Array(repeating: broken, count: 40) + [sound])
         check(r.alerts == [30], "有声音在放、tap 全零：零段开始后第 20 秒报警，只报一次（实际 \(r.alerts)）")
         check(r.lines.count == 3 && r.lines[0].hasPrefix("TAP_ZERO_START at 2026-11-18 12:01:17 (+10s) cb=yes")
-              && r.lines[1].hasPrefix("TAP_ZERO_ALERT at 2026-11-18 12:01:37 (+30s) playing=20s apps=com.microsoft.teams2")
+              && r.lines[1].hasPrefix("TAP_ZERO_ALERT at 2026-11-18 12:01:37 (+30s) playing=20s apps=Microsoft Teams (com.microsoft.teams2)")
               && r.lines[2].hasPrefix("TAP_ZERO_END at 2026-11-18 12:01:57 (+50s) dur=40s playing=40s cb=40s"),
               "开始、报警、恢复三行的墙钟时间和计数都对：\(r.lines)")
     }
@@ -1585,28 +1637,59 @@ func runSelftestZeroGuard() -> Never {
         var lines: [String] = [], alerts = 0
         let g = ZeroGuard(log: { lines.append($0) }, alert: { _ in alerts += 1 })
         for sec in 1...40 {
-            g.feed(ZeroGuard.Tick(cb: true, nonzero: false, playing: [], ignored: ["com.amazon.workspaces"],
+            g.feed(ZeroGuard.Tick(cb: true, nonzero: false, playing: [], ignored: [workspaces],
                                   wall: t0.addingTimeInterval(Double(sec)), rel: Double(sec)))
         }
         g.finish(wall: t0.addingTimeInterval(41), rel: 41)
         check(alerts == 0, "只有忽略名单里的 App 在放：不报警")
-        check(lines.last?.contains("playing=0s") == true && lines.last?.contains("ignored=com.amazon.workspaces") == true,
+        check(lines.last?.contains("playing=0s") == true
+              && lines.last?.contains("ignored=Amazon WorkSpaces (com.amazon.workspaces)") == true,
               "忽略名单里的 App 照样记进日志（ignored=）：\(lines.last ?? "")")
     }
     do {  // 名单里的和名单外的同时在放 → 照常报警，apps= 只写名单外的，通知文案带上 App 名
-        var lines: [String] = [], alerted: [[String]] = []
+        var lines: [String] = [], alerted: [[PlayingApp]] = []
         let g = ZeroGuard(log: { lines.append($0) }, alert: { alerted.append($0) })
         for sec in 1...25 {
-            g.feed(ZeroGuard.Tick(cb: true, nonzero: false, playing: ["com.microsoft.teams2", "afplay"],
-                                  ignored: ["com.amazon.workspaces"],
+            g.feed(ZeroGuard.Tick(cb: true, nonzero: false, playing: [teams, afplay],
+                                  ignored: [workspaces],
                                   wall: t0.addingTimeInterval(Double(sec)), rel: Double(sec)))
         }
         let alertLine = lines.first { $0.hasPrefix("TAP_ZERO_ALERT") } ?? ""
-        check(alerted == [["com.microsoft.teams2", "afplay"]]
-              && alertLine.contains("apps=com.microsoft.teams2,afplay ignored=com.amazon.workspaces"),
+        check(alerted.map { $0.map(\.id) } == [["com.microsoft.teams2", "afplay"]]
+              && alertLine.contains("apps=Microsoft Teams (com.microsoft.teams2), afplay ignored=Amazon WorkSpaces (com.amazon.workspaces)"),
               "名单外的 App 在放照常报警，日志里分开写 apps= 和 ignored=：\(alertLine)")
-        let msg = zeroAlertMessage("录音可能漏了：{apps} 在放声音", alerted.first ?? [])
-        check(msg == "录音可能漏了：com.microsoft.teams2, afplay 在放声音", "通知文案里写明是哪个 App：\(msg)")
+        let msg = zeroAlertMessage("录音可能漏了：{apps} 在放声音", alerted.first ?? [], format: "{name}（{id}）", sep: "、")
+        check(msg == "录音可能漏了：Microsoft Teams（com.microsoft.teams2）、afplay 在放声音",
+              "通知里写成「显示名（bundle ID）」，没有显示名的只写程序名：\(msg)")
+        let en = zeroAlertMessage("{apps} is playing", alerted.first ?? [])
+        check(en == "Microsoft Teams (com.microsoft.teams2), afplay is playing", "英文通知用半角括号和逗号：\(en)")
+    }
+    do {  // 显示名：helper 子进程取所属主 App 的名字；取不到不报错（用临时造的 .app 验，不依赖本机装了什么）
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "zero-guard-selftest-\(getpid())"
+        defer { try? fm.removeItem(atPath: root) }
+        func mkApp(_ path: String, _ info: [String: String]?) {
+            try? fm.createDirectory(atPath: path + "/Contents/MacOS", withIntermediateDirectories: true)
+            if let info = info { _ = (info as NSDictionary).write(toFile: path + "/Contents/Info.plist", atomically: true) }
+        }
+        let main = root + "/Fake Chrome.app"
+        mkApp(main, ["CFBundleDisplayName": "Fake Chrome", "CFBundleName": "FakeChromeInternal",
+                     "CFBundleIdentifier": "com.example.fakechrome"])
+        let helper = main + "/Contents/Frameworks/Fake Framework.framework/Versions/1/Helpers/Fake Chrome Helper.app"
+        mkApp(helper, ["CFBundleName": "Fake Chrome Helper", "CFBundleIdentifier": "com.example.fakechrome.helper"])
+        let got = appDisplayName(forExecutable: helper + "/Contents/MacOS/Fake Chrome Helper")
+        check(got == "Fake Chrome", "helper 子进程取到所属主 App 的显示名，优先 CFBundleDisplayName（\(got ?? "nil")）")
+        let noPlist = root + "/NoPlist Tool.app"
+        mkApp(noPlist, nil)
+        check(appDisplayName(forExecutable: noPlist + "/Contents/MacOS/tool") == "NoPlist Tool",
+              "读不到 Info.plist 时用 .app 文件夹名")
+        check(appDisplayName(forExecutable: "/usr/bin/afplay") == nil, "命令行程序不在任何 .app 里：返回 nil，不报错")
+        check(appDisplayName(forExecutable: root + "/Gone.app/Contents/MacOS/gone") == "Gone",
+              ".app 已经不存在（路径里还有）：用文件夹名，不报错")
+        check(PlayingApp(id: "com.example.fakechrome.helper", name: got).display()
+              == "Fake Chrome (com.example.fakechrome.helper)", "日志里写成「显示名 (bundle ID)」")
+        check(PlayingApp(id: "afplay", name: nil).display() == "afplay"
+              && PlayingApp(id: "x", name: "x").display() == "x", "没有显示名、或显示名和 id 一样时只写 id")
     }
     do {  // 到停止录音时还在交零 → 退出时补记结束行
         let r = run(Array(repeating: broken, count: 25), finishAt: 26)
@@ -1639,6 +1722,8 @@ guard let cmd = args.first else {
                                 {apps} 换成在放声音的 App（不给就只记日志、不弹通知）
                                 --zero-alert-ignore: 不算「有声音在放」的进程（逗号分隔的
                                 bundle ID 或可执行文件名），日志里照样记成 ignored=
+                                --zero-alert-app-format / --zero-alert-app-sep: 通知里每个 App
+                                的写法（{name} 显示名、{id} bundle ID 或程序名）和分隔符
       selftest-resample         重采样自检
       selftest-zero-guard       零段记账 / 静音报警判断逻辑自检
 
@@ -1665,6 +1750,7 @@ case "tap-start":
     var outputRate = 48000.0
     var zeroAlertText: String? = nil
     var zeroAlertIgnore = Set<String>()
+    var zeroAlertAppFormat = "{name} ({id})", zeroAlertAppSep = ", "
     var i = 1
     while i < args.count {
         if args[i] == "--output-rate", i + 1 < args.count, let r = Int(args[i + 1]), r > 0 {
@@ -1690,13 +1776,20 @@ case "tap-start":
             zeroAlertIgnore = Set(args[i + 1].split(whereSeparator: { $0 == "," || $0.isWhitespace })
                                     .map(String.init))
             i += 2
+        } else if args[i] == "--zero-alert-app-format", i + 1 < args.count {
+            zeroAlertAppFormat = args[i + 1]
+            i += 2
+        } else if args[i] == "--zero-alert-app-sep", i + 1 < args.count {
+            zeroAlertAppSep = args[i + 1]
+            i += 2
         } else {
-            fputs("Usage: tap-start [--output-rate HZ] [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH] [--zero-alert-text TEXT] [--zero-alert-ignore LIST]\n", stderr)
+            fputs("Usage: tap-start [--output-rate HZ] [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH] [--zero-alert-text TEXT] [--zero-alert-ignore LIST] [--zero-alert-app-format F] [--zero-alert-app-sep S]\n", stderr)
             exit(1)
         }
     }
     runTapStart(duration: duration, levelFile: levelFile, micLevelFile: micLevelFile, withMic: withMic,
-                outputRate: outputRate, zeroAlertText: zeroAlertText, zeroAlertIgnore: zeroAlertIgnore)
+                outputRate: outputRate, zeroAlertText: zeroAlertText, zeroAlertIgnore: zeroAlertIgnore,
+                zeroAlertAppFormat: zeroAlertAppFormat, zeroAlertAppSep: zeroAlertAppSep)
 case "selftest-resample":
     runSelftestResample()
 case "selftest-zero-guard":

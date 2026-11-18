@@ -28,10 +28,12 @@ audio_bitrate = 128k
 audio_persist = true
 # Audio is always captured with Process Tap (macOS 14.4+); there is no capture setting.
 # Silent-recording alert: if an app is playing sound but the capture is all zeros,
-# meetap shows a notification within 30 s naming that app. Apps listed here don't
+# meetap shows a notification within 30 s naming that app as "Name (bundle ID)",
+# e.g. "Google Chrome (com.google.Chrome.helper)". Apps listed here don't
 # count as "playing" (some keep an audio stream open while staying silent, e.g. the
-# Amazon WorkSpaces client). Add an app here if you get the alert while nothing was
-# actually playing. Comma-separated bundle IDs or command-line program names.
+# Amazon WorkSpaces client). If you get the alert while nothing was actually playing,
+# add the part in parentheses (the bundle ID) here; for command-line programs, which
+# have no parentheses, add the program name. Comma-separated.
 zero_alert_ignore = com.amazon.workspaces
 
 # ── Auto-stop ─────────────────────────────────────────────────
