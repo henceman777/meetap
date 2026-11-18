@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>dev.meetap.audio-multi-output</string>
+    <key>CFBundleName</key>
+    <string>meetap-audio-multi-output</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>MeeTap 停止录音后按录音时段读取对应会议的日历信息（标题、组织者、参会人、议程），写进会话的 materials/ 供生成纪要参考。不修改日历。</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>MeeTap 停止录音后按录音时段读取对应会议的日历信息，写进会话的 materials/ 供生成纪要参考。不修改日历。</string>
+</dict>
+</plist>

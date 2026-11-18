@@ -9,9 +9,14 @@ BUILD_ID  := $(if $(GIT_SHA),$(shell git rev-parse --abbrev-ref HEAD)@$(GIT_SHA)
 
 all: $(BUILD)/audio-multi-output $(BUILD)/audio-tap
 
-$(BUILD)/audio-multi-output: src/audio-multi-output.swift
+# audio-multi-output 嵌入 Info.plist（日历用途说明），否则 EventKit 不让读日历
+$(BUILD)/audio-multi-output: src/audio-multi-output.swift src/audio-multi-output-Info.plist
 	mkdir -p $(BUILD)
-	swiftc -O -framework CoreAudio -framework AudioToolbox -framework IOKit $< -o $@
+	swiftc -O -framework CoreAudio -framework AudioToolbox -framework IOKit -framework EventKit \
+		-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+		-Xlinker src/audio-multi-output-Info.plist \
+		$< -o $@
+	codesign --force --sign - $@
 
 # audio-tap 必须嵌入 Info.plist（NSAudioCaptureUsageDescription），
 # 否则 TCC 不弹授权框、静默拒绝，Process Tap 输出全零静音。
@@ -35,6 +40,7 @@ install: all
 	# 内核会在创建 Process Tap 时 SIGKILL 进程（tap-format/tap-start 表现为
 	# exit 137）。install 后必须重新签名，否则安装版录音全静音/被杀。
 	codesign --force --sign - $(PREFIX)/audio-tap
+	codesign --force --sign - $(PREFIX)/audio-multi-output
 	chmod +x $(PREFIX)/meetap
 	mkdir -p $(PREFIX)/i18n
 	cp src/i18n/*.sh $(PREFIX)/i18n/

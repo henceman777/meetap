@@ -24,6 +24,7 @@ cp "$REPO_ROOT/src/i18n/"*.sh "$PREFIX/i18n/"
 cp "$REPO_ROOT/src/lib/ui.sh" "$PREFIX/lib/"
 cp "$REPO_ROOT/build/audio-tap" "$REPO_ROOT/build/audio-multi-output" "$PREFIX/"
 codesign --force --sign - "$PREFIX/audio-tap"   # cp 会破坏 ad-hoc 签名
+codesign --force --sign - "$PREFIX/audio-multi-output"   # 嵌了 Info.plist（日历用途说明），同上
 
 if ! "$PREFIX/audio-tap" tap-supported >/dev/null 2>&1; then
     echo "SKIP: 本机不支持 Process Tap"; exit 0
