@@ -179,6 +179,13 @@ MSG_ERR_TAP_UNSUPPORTED="❌ This Mac's audio-tap can't capture with Process Tap
 MSG_WARN_OLD_CAPTURE_CONFIG="ℹ️  BlackHole is no longer used as of 2.0; recording uses Process Tap anyway. Please delete this line from your config file: audio_capture = blackhole (%s)"
 MSG_SETUP_APPS_NOT_NEEDED="ℹ️  As of 2.0 meeting app speakers don't need configuring: recording uses Process Tap, so keep your meeting apps on the system default speakers or headphones. To check permissions and audio settings, run meetap setup"
 
+# ── Calendar (after recording stops, find the matching meeting) ──
+MSG_CAL_LOG_MATCHED="📅 Calendar: this meeting is \"%s\" (overlaps the recording by %s min); wrote materials/calendar.md"
+MSG_CAL_LOG_NONE="📅 Calendar: no matching meeting in this time range; skipped"
+MSG_CAL_LOG_NOT_AUTHORIZED="📅 Calendar: no read access (%s); skipped. To enable it, run %s setup once in this terminal app"
+MSG_CAL_LOG_TIMEOUT="📅 Calendar: query timed out; skipped"
+MSG_CAL_LOG_ERROR="📅 Calendar: query failed (%s); skipped"
+
 # ── Meeting tags (meta.json) and session info ──
 MSG_ERR_TAG_WITH_START_OPT="❌ Recording options (-t/-d/-b/-m) can't be combined with -g/--untag; nothing was recorded. To record: %s -m; to tag: %s -g weekly"
 MSG_ERR_SESSION_NOT_FOUND="❌ Session '%s' not found (searched under %s)"

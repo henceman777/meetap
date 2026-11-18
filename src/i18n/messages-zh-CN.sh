@@ -180,6 +180,13 @@ MSG_ERR_TAP_UNSUPPORTED="❌ 本机的 audio-tap 不能用 Process Tap 采集（
 MSG_WARN_OLD_CAPTURE_CONFIG="ℹ️  2.0 起已不用 BlackHole，录音照样走 Process Tap。请删掉配置文件里这一行：audio_capture = blackhole（%s）"
 MSG_SETUP_APPS_NOT_NEEDED="ℹ️  2.0 起不需要配置会议 App 的扬声器：录音走 Process Tap，会议 App 用系统默认的扬声器或耳机就行。要检查授权和音频设置，请运行 meetap setup"
 
+# ── 日历（停止录音后按录音时段找对应的会）──
+MSG_CAL_LOG_MATCHED="📅 日历：这场会是「%s」（和录音重叠 %s 分钟），已写 materials/calendar.md"
+MSG_CAL_LOG_NONE="📅 日历：这个时段没有对应的会，跳过"
+MSG_CAL_LOG_NOT_AUTHORIZED="📅 日历：没有读取权限（%s），跳过。要用的话在这个终端 App 里跑一次 %s setup"
+MSG_CAL_LOG_TIMEOUT="📅 日历：查询超时，跳过"
+MSG_CAL_LOG_ERROR="📅 日历：查询出错（%s），跳过"
+
 # ── 会议标签（meta.json）与会话信息 ──
 MSG_ERR_TAG_WITH_START_OPT="❌ 开录选项（-t/-d/-b/-m）不能和 -g/--untag 一起用，没有开录。开录：%s -m；贴标签：%s -g 周会"
 MSG_ERR_SESSION_NOT_FOUND="❌ 找不到会话「%s」（在 %s 下找过）"
