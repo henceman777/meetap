@@ -65,9 +65,11 @@ meta_cal() { python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); pri
 python3 -I - "$FAKE/query.json" "$FAKE" <<'PYEOF'
 import json, sys
 path, fake = sys.argv[1], sys.argv[2]
-notes = """议程：
+notes = """--------------------------------
+议程：
 1. Q4 复盘
 2. 明年规划（请大家准时参加）
+--------------------------------
 
 Join Chime meeting: https://chime.aws/1234567890
 Meeting ID: 1234 56 7890
@@ -80,7 +82,9 @@ Passcode: 123456
 One tap mobile
 +16465588656,,81234567890#,,,,*123456# US
 
-背景材料见共享盘。
+背景材料见共享盘，有问题找 helper.person@example.com。
+Dial
+For better audio quality, dial a local number
 ________________________________________________________________________________
 Microsoft Teams meeting
 Join on your computer, mobile app or room device
@@ -125,9 +129,11 @@ echo '{"schema": 1, "session": "20261118_1201", "tags": ["周会"], "future": {"
 lookup
 [[ $RC -eq 0 && -f "$CAL" ]] && pass "匹配到时写 materials/calendar.md" || fail "没写 calendar.md (rc=$RC): $OUT"
 grep -q '来自系统日历，是会前的安排，实际讨论以录音为准' "$CAL" && pass "开头写明来源、以录音为准" || fail "缺来源说明"
+grep -q '^1. Q4 复盘$' "$CAL" && grep -q -- '^--------------------------------$' "$CAL" \
+    && pass "议程夹在两条 ---- 之间：照样保留（只有下划线分隔线围起来的整段才删）" || fail "议程被分隔线规则删了"
 for want in '- 标题：架构周会' '- 时间：2026-11-18 12:00–13:00（录音 12:01–12:52）' '- 组织者：组织者甲' \
             '- 地点：会议室 A (演示楼 101)' '## 会议说明' 'Q4 复盘' '明年规划（请大家准时参加）' '背景材料见共享盘' \
-            '会议主题：架构评审' '会议时间：2026/11/18 12:00-13:00'; do
+            '会议主题：架构评审' '会议时间：2026/11/18 12:00-13:00' '背景材料见共享盘，有问题找 helper.person。'; do
     grep -qF -- "$want" "$CAL" && pass "calendar.md 有「${want}」" || fail "calendar.md 缺「${want}」"
 done
 [[ "$OUT" == *"这场会是「架构周会」（和录音重叠 51 分钟）"* ]] && pass "日志记一行匹配结果" || fail "日志: $OUT"
@@ -136,7 +142,7 @@ done
 BODY=$(grep -v '^>' "$CAL")
 for bad in 'http' 'chime.aws' 'zoom.us' 'teams.microsoft' 'meeting.tencent' '1234567890' '812 3456 7890' \
            '234 567 890 123' '123-456-789' '123456' 'aB3dE5' '4321' '+1' '+86' 'Passcode' 'Meeting ID' \
-           '密码' '拨号' 'Join' '入会' '____' 'pwd'; do
+           '密码' '拨号' 'Join' '入会' '____' 'pwd' 'Dial' 'dial' 'example.com'; do
     grep -qF -- "$bad" <<< "$BODY" && fail "calendar.md 里还有「${bad}」" || pass "去掉了「${bad}」"
 done
 

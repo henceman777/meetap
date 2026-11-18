@@ -1499,16 +1499,19 @@ BARE_URL_RE = re.compile(r'\b(?:[\w-]+\.)*(?:chime\.aws|zoom\.(?:us|com)|teams\.
                          r'larksuite\.com|dingtalk\.com)(?:/\S*)?', re.I)
 # 有这些词的整行删掉
 STRONG_RE = re.compile(r'(?i)(meeting\s*(id|number|code)|webinar\s*id|会议\s*(号|id|码|密码)|conference\s*id|'
-                       r'access\s*code|pass\s*code|password|\bpwd\b|密码|口令|\bpin\b|dial[- ]?in|拨入|'
+                       r'access\s*code|pass\s*code|password|\bpwd\b|密码|口令|\bpin\b|\bdial\b|dial[- ]?in|拨入|'
                        r'one[- ]tap|tap to join|join by phone|电话入会|拨号|一键入会|local number|international numbers|toll[- ]free)')
 # 「入会」类的词，配上链接或会议平台名才删（免得把「请大家准时参加」这类议程删掉）
 JOIN_RE = re.compile(r'(?i)(\bjoin\b|入会|加入会议|会议链接|meeting link|click here)')
 PLATFORM_RE = re.compile(r'(?i)(chime|zoom|teams|webex|google meet|腾讯会议|voov|飞书|lark|钉钉|meeting|会议|web|computer|mobile|phone|电话)')
 # 像电话号码 / 会议号的数字串：+ 开头的号码、3-4-4 分组的 9 位以上数字、连续 9 位以上数字、,,123# 拨号串
 NUMBER_RE = re.compile(r'(\+\d[\d\s().-]{6,}\d|\b\d{3}[\s-]?\d{3,4}[\s-]?\d{3,4}\b|\b\d{9,}\b|,,\d+#?)')
-# Teams 等：两条长分隔线之间是整段入会信息
-SEP_RE = re.compile(r'^\s*[_\-=~*]{20,}\s*$')
+# Teams 等：两条长下划线分隔线之间是整段入会信息。只认下划线——议程里用 ---- / ==== 分节的，
+# 两条一配对就会把中间的议程整段删掉
+SEP_RE = re.compile(r'^\s*_{20,}\s*$')
 PUNCT = ' \t:：-–—|·•,，;；()（）[]【】<>'
+# 正文里写着的邮箱只留 @ 前面那段（会进纪要和邮件）
+EMAIL_RE = re.compile(r'(?:mailto:)?([\w.+-]+)@[\w-]+(?:\.[\w-]+)+', re.I)
 
 def scrub(text):
     lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -1528,7 +1531,7 @@ def scrub(text):
         rest = BARE_URL_RE.sub("", URL_RE.sub("", l)).rstrip()
         if had_url and not rest.strip(PUNCT):
             continue
-        out.append(rest)
+        out.append(EMAIL_RE.sub(lambda e: e.group(1), rest))
     res = []
     for l in out:                       # 连续空行合并成一行，首尾空行去掉
         if not l.strip():
