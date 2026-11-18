@@ -205,6 +205,21 @@ MSG_ERR_HL_TEMPLATE_MISSING="❌ 高亮模板缺失或损坏：%s"
 MSG_ERR_HL_VERIFY_FAILED="❌ 模型改动了正文（不只是加高亮），已放弃写入，原文件保持不变"
 MSG_ERR_HL_LLM_FAILED="❌ 高亮生成失败（LLM 未产出内容）"
 
+# ── 系统版本门槛与 2.0 升级迁移检查 ──
+MSG_ERR_MACOS_TOO_OLD="❌ 当前 macOS 是 %s，meetap 2.0 起需要 macOS %s 或更新的版本（只用系统自带的 Process Tap 采集）。没有开始录制"
+MSG_MIGRATE_OUTPUT_RESTORED="🔊 系统输出还停在 %s 上（上次录音没恢复好），已切回：%s"
+MSG_MIGRATE_OUTPUT_ON_BH="⚠️  系统输出现在是 %s，你可能听不到声音。2.0 起录音不再需要它；如果不是你有意设的，请在 系统设置 › 声音 › 输出 里改回扬声器或耳机"
+MSG_MIGRATE_OUTPUT_ASK="⚠️  系统输出现在是 %s。2.0 起录音不再需要它，如果不是你有意设的，你可能听不到声音。要切到哪个设备？"
+MSG_MIGRATE_OUTPUT_KEEP="保持不变"
+MSG_MIGRATE_OUTPUT_SWITCHED="🔊 系统输出已切到：%s"
+MSG_MIGRATE_OUTPUT_SWITCH_FAILED="❌ 切到 %s 没成功，请在 系统设置 › 声音 › 输出 里手动选择"
+MSG_MIGRATE_OUTPUT_KEPT="   系统输出保持 %s 不变"
+MSG_MIGRATE_ZOOM_ON_BH="⚠️  Zoom 的扬声器还设成了 %s，开会时你会听不到对方。请打开 Zoom › 设置 › 音频 › 扬声器，改成「与系统相同」"
+MSG_MIGRATE_APPS_BH_HINT="ℹ️  系统里还装着 BlackHole。如果你以前在 Teams 或腾讯会议里把扬声器选成了 BlackHole 2ch，请改回「系统默认」或你的扬声器、耳机：Teams 在 设置 › 设备 › 扬声器；腾讯会议在 设置 › 音频 › 扬声器。2.0 起不再需要 BlackHole，卸不卸由你定（brew uninstall --cask blackhole-2ch）"
+MSG_SETUP_STEP_MIGRATE="▶ 检查音频设置（从 1.x 升级）"
+MSG_SETUP_MIGRATE_SKIP_RECORDING="   正在录音，先不检查系统输出设备"
+MSG_SETUP_MIGRATE_DONE="   检查完毕"
+
 # ── 会议标签（meta.json）与会话信息 ──
 MSG_ERR_TAG_WITH_START_OPT="❌ 开录选项（-t/-d/-b/-m）不能和 -g/--untag 一起用，没有开录。开录：%s -m；贴标签：%s -g 周会"
 MSG_ERR_SESSION_NOT_FOUND="❌ 找不到会话「%s」（在 %s 下找过）"

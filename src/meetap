@@ -2043,7 +2043,92 @@ foreground_wait() {
     fi
 }
 
+# ── 系统版本门槛与 2.0 升级迁移检查（start、setup 共用）──
+MIN_MACOS_MAJOR=14
+MIN_MACOS_MINOR=4
+
+# macOS 低于 14.4 → 报错，返回 1。sw_vers 走 PATH（测试里放假的 sw_vers 伪造版本号）；
+# 读不到版本号时不拦，交给 audio-tap tap-supported 兜底。
+_require_macos() {
+    local v ma mi
+    v=$(sw_vers -productVersion 2>/dev/null)
+    [[ "$v" =~ ^([0-9]+)(\.([0-9]+))? ]] || return 0
+    ma=${BASH_REMATCH[1]}; mi=${BASH_REMATCH[3]:-0}
+    if (( ma > MIN_MACOS_MAJOR || (ma == MIN_MACOS_MAJOR && mi >= MIN_MACOS_MINOR) )); then
+        return 0
+    fi
+    _t ERR_MACOS_TOO_OLD "$v" "$MIN_MACOS_MAJOR.$MIN_MACOS_MINOR"
+    return 1
+}
+
+# 系统输出还停在 BlackHole 上：1.x 崩溃后没恢复，或者是用户有意切过去的（给别的软件用）。
+# 只有 1.x 留下的 original-output.* 状态文件在、原设备也找得到时才自动切回；
+# 否则有终端时让用户选（第一个、也是默认选项是「保持不变」），没终端只提示。
+# 不拦录音：Tap 照样录得到，只是用户自己听不见。
+_migrate_output_device() {
+    [[ -x "$TOOL" ]] || return 0
+    local cur orig_uid orig_name id line dev_uid choice keep i
+    cur=$("$TOOL" default-output-name 2>/dev/null) || return 0
+    if [[ "$cur" != *BlackHole* ]]; then
+        rm -f "$ORIGINAL_UID_FILE" "$ORIGINAL_NAME_FILE"   # 不在 BlackHole 上，旧状态文件已无用
+        return 0
+    fi
+
+    if [[ -f "$ORIGINAL_UID_FILE" ]]; then
+        orig_uid=$(cat "$ORIGINAL_UID_FILE")
+        orig_name=$(cat "$ORIGINAL_NAME_FILE" 2>/dev/null)
+        if id=$("$TOOL" find-uid "$orig_uid" 2>/dev/null) && "$TOOL" set-default "$id" >/dev/null 2>&1; then
+            rm -f "$ORIGINAL_UID_FILE" "$ORIGINAL_NAME_FILE"
+            _t MIGRATE_OUTPUT_RESTORED "$cur" "${orig_name:-$orig_uid}"
+            return 0
+        fi
+    fi
+
+    if [[ ! -t 0 ]]; then
+        _t MIGRATE_OUTPUT_ON_BH "$cur"
+        return 0
+    fi
+    local names=() ids=()
+    while IFS='|' read -r line dev_uid id; do
+        [[ -n "$line" && "$line" != *BlackHole* && "$id" =~ ^[0-9]+$ ]] || continue
+        names+=("$line"); ids+=("$id")
+    done < <("$TOOL" list 2>/dev/null)
+    _t MIGRATE_OUTPUT_ASK "$cur"
+    keep=$(_tn MIGRATE_OUTPUT_KEEP)
+    choice=$(ui_choose "$keep" "${names[@]}")
+    for (( i = 0; i < ${#names[@]}; i++ )); do
+        if [[ "${names[$i]}" == "$choice" ]]; then
+            if "$TOOL" set-default "${ids[$i]}" >/dev/null 2>&1; then
+                _t MIGRATE_OUTPUT_SWITCHED "$choice"
+            else
+                _t MIGRATE_OUTPUT_SWITCH_FAILED "$choice"
+            fi
+            return 0
+        fi
+    done
+    _t MIGRATE_OUTPUT_KEPT "$cur"
+}
+
+# setup：会议 App 的扬声器是不是还指着 BlackHole（只读，不改任何 App 的配置）。
+# Zoom 的设置在 viper.ini 里（设备名的十六进制）读得出来；Teams、腾讯会议读不到配置，
+# 系统里还装着 BlackHole 时提示一句怎么检查。
+_check_meeting_apps() {
+    local ini="$HOME/Library/Application Support/zoom.us/data/viper.ini" k v name zoom_bh=""
+    if [[ -f "$ini" ]]; then
+        for k in AECSPK AECBSSPK; do
+            v=$(grep "^$k=" "$ini" | head -1 | cut -d= -f2)
+            name=$(printf '%s' "$v" | xxd -r -p 2>/dev/null)
+            [[ "$name" == *BlackHole* ]] && zoom_bh="$name"
+        done
+        [[ -n "$zoom_bh" ]] && _t MIGRATE_ZOOM_ON_BH "$zoom_bh"
+    fi
+    if [[ -x "$TOOL" ]] && "$TOOL" list 2>/dev/null | grep -q 'BlackHole'; then
+        _t MIGRATE_APPS_BH_HINT
+    fi
+}
+
 start_recording() {
+    _require_macos || exit 1
     local VERBOSE=false
     local MAX_DURATION_MIN=""   # 会议时长上限（分钟，可选）
     local MUTE_MIC=false        # 只录系统音（录网页直播时屏蔽现场环境声）
@@ -2094,6 +2179,8 @@ start_recording() {
         _t HINT_STOP_FIRST "$0"
         exit 1
     fi
+    # 必须在「已在录制」检查之后：录音进行中不能去动系统输出设备
+    _migrate_output_device
     # 前台模式：有 TTY 且未加 -b。start 不退出、跑波形，Ctrl-C / 关窗口 ≡ meetap stop。
     # trap 必须在拉起任何子进程之前装：子进程在独立进程组里收不到 Ctrl-C，装晚了，
     # 启动阶段的 Ctrl-C 只会杀掉 start 自己，留下孤儿录音。
@@ -2816,9 +2903,23 @@ setup_tap() {
 }
 
 setup_apps() {
+    _require_macos || exit 1
     _t SETUP_HEADER
     _t SETUP_TITLE
     _t SETUP_HEADER
+    echo ""
+
+    # 2.0 升级迁移检查：放在授权自检之前——自检会往默认输出放提示音，
+    # 输出还停在 BlackHole 上的话用户听不见。录音进行中不动输出设备。
+    _t SETUP_STEP_MIGRATE
+    _t SETUP_DIVIDER
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        _t SETUP_MIGRATE_SKIP_RECORDING
+    else
+        _migrate_output_device
+    fi
+    _check_meeting_apps
+    _t SETUP_MIGRATE_DONE
     echo ""
 
     # 判定实际采集路径决定是否需要配置会议 App 扬声器：

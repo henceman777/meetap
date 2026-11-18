@@ -204,6 +204,21 @@ MSG_ERR_HL_TEMPLATE_MISSING="❌ Highlight template missing or invalid: %s"
 MSG_ERR_HL_VERIFY_FAILED="❌ Model altered the body (not just added highlights); write aborted, original file unchanged"
 MSG_ERR_HL_LLM_FAILED="❌ Highlight generation failed (LLM produced no content)"
 
+# ── macOS version gate and 2.0 upgrade checks ──
+MSG_ERR_MACOS_TOO_OLD="❌ This Mac runs macOS %s; meetap 2.0+ needs macOS %s or later (it captures audio only through the built-in Process Tap). Recording not started"
+MSG_MIGRATE_OUTPUT_RESTORED="🔊 System output was still on %s (a previous recording didn't restore it); switched back to: %s"
+MSG_MIGRATE_OUTPUT_ON_BH="⚠️  System output is currently %s, so you may not hear anything. Recording no longer needs it as of 2.0; if you didn't set it on purpose, switch back in System Settings › Sound › Output"
+MSG_MIGRATE_OUTPUT_ASK="⚠️  System output is currently %s. Recording no longer needs it as of 2.0; if you didn't set it on purpose you may not hear anything. Switch to which device?"
+MSG_MIGRATE_OUTPUT_KEEP="Keep as is"
+MSG_MIGRATE_OUTPUT_SWITCHED="🔊 System output switched to: %s"
+MSG_MIGRATE_OUTPUT_SWITCH_FAILED="❌ Couldn't switch to %s; please choose it in System Settings › Sound › Output"
+MSG_MIGRATE_OUTPUT_KEPT="   System output left as %s"
+MSG_MIGRATE_ZOOM_ON_BH="⚠️  Zoom's speaker is still set to %s, so you won't hear others in meetings. Open Zoom › Settings › Audio › Speaker and choose \"Same as System\""
+MSG_MIGRATE_APPS_BH_HINT="ℹ️  BlackHole is still installed. If you once set the speaker in Teams or Tencent Meeting to BlackHole 2ch, change it back to the system default or your speakers/headphones: Teams › Settings › Devices › Speaker; Tencent Meeting › Settings › Audio › Speaker. BlackHole is no longer needed as of 2.0; uninstalling it is up to you (brew uninstall --cask blackhole-2ch)"
+MSG_SETUP_STEP_MIGRATE="▶ Checking audio settings (upgrade from 1.x)"
+MSG_SETUP_MIGRATE_SKIP_RECORDING="   A recording is in progress; skipping the system output check"
+MSG_SETUP_MIGRATE_DONE="   Done"
+
 # ── Meeting tags (meta.json) and session info ──
 MSG_ERR_TAG_WITH_START_OPT="❌ Recording options (-t/-d/-b/-m) can't be combined with -g/--untag; nothing was recorded. To record: %s -m; to tag: %s -g weekly"
 MSG_ERR_SESSION_NOT_FOUND="❌ Session '%s' not found (searched under %s)"
