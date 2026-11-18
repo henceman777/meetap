@@ -26,9 +26,13 @@ recording_dir = ~/Record
 audio_bitrate = 128k
 # Keep local audio file after S3 upload (true=keep, false=delete after upload)
 audio_persist = true
-# Audio capture method: auto | tap | blackhole
-# auto = use Process Tap if supported (macOS 14.4+), else BlackHole
-audio_capture = auto
+# Audio is always captured with Process Tap (macOS 14.4+); there is no capture setting.
+# Silent-recording alert: if an app is playing sound but the capture is all zeros,
+# meetap shows a notification within 30 s naming that app. Apps listed here don't
+# count as "playing" (some keep an audio stream open while staying silent, e.g. the
+# Amazon WorkSpaces client). Add an app here if you get the alert while nothing was
+# actually playing. Comma-separated bundle IDs or command-line program names.
+zero_alert_ignore = com.amazon.workspaces
 
 # ── Auto-stop ─────────────────────────────────────────────────
 # Recording runs until you run `meetap stop`. To auto-stop after a fixed

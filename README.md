@@ -10,7 +10,7 @@
 
 ### 🔧 工作流程
 
-1. **音频捕获** —— 优先使用 macOS **Process Tap**（14.4+）直接、无感地采集系统音频，**免装虚拟声卡、不切换输出设备**；旧系统自动回退 **BlackHole 虚拟声卡**。无缝兼容 Zoom、Teams、飞书、腾讯会议等主流会议应用；
+1. **音频捕获** —— 使用 macOS 自带的 **Process Tap**（14.4+）直接、无感地采集系统音频，**免装虚拟声卡、不切换输出设备、不用配置会议 App**。无缝兼容 Zoom、Teams、飞书、腾讯会议等主流会议应用；
 2. **语音转写** —— 音频采集结束后自动上传至 **AWS Transcribe**，输出带**说话人分离（Speaker Diarization）**的结构化文本；
 3. **智能摘要** —— 通过 **Amazon Bedrock** 调用大语言模型（默认 **Claude Sonnet**，一键切换 Nova、Llama、DeepSeek 等），生成条理清晰的**中文会议纪要**。
 
@@ -29,7 +29,7 @@
 | 特性                 | 说明                                                         |
 | :------------------- | :----------------------------------------------------------- |
 | 🚀 **开箱即用**       | 首次启动自动生成默认配置，零学习成本，即装即用               |
-| 🎧 **免装免切换**     | macOS 14.4+ 走 Process Tap 直接采集，无需安装 BlackHole、无需切换系统输出设备；录制时你照常从原扬声器/耳机听到原声 |
+| 🎧 **免装免切换**     | 走系统自带的 Process Tap 直接采集，无需安装虚拟声卡、无需切换系统输出设备；录制时你照常从原扬声器/耳机听到原声 |
 | 👻 **零侵入音频采集** | 无需以 "Bot 参会者" 身份加入会议，与会者全程无感知，规避合规风险 |
 | ⏱️ **时长自停**       | `meetap start -d <分钟>` 指定会议时长上限，到点自动结束、自动转录 |
 | 📊 **实时波形**       | 终端底部实时点阵波形，融合系统音 + 你的麦克风，一眼确认"确实在录、双向都有声" |
@@ -45,9 +45,9 @@
 
 ## 一、前置条件
 
-1. **macOS 13+（Ventura 或更新）**
-   - **macOS 14.4+** 可启用 Process Tap，免装 BlackHole；此处 14.4+ 指 Sonoma 14.4 及之后的所有版本，涵盖 macOS 15 Sequoia、macOS 26 Tahoe（截至 2026 年 7 月最新为 26.6）；
-   - **macOS 13.x** 或 Tap 授权未生效时，自动回退 BlackHole（需装虚拟声卡，见安装步骤）。
+1. **macOS 14.4+**：指 Sonoma 14.4 及之后的所有版本，涵盖 macOS 15 Sequoia、macOS 26 Tahoe
+   - 2.0 起只用系统自带的 Process Tap 采集，不再支持 macOS 13；还在 13.x 上请继续用 1.x；
+   - Homebrew 只能按大版本限制系统（Sonoma），所以 14.0–14.3 上也装得上，但 `meetap start` / `setup` 会直接提示版本太低、不开录。
 2. **Xcode Command Line Tools**（首次安装会自动提示）
    
    ```bash
@@ -73,8 +73,7 @@ brew tap henceman777/tap
 # 之后这样安装和升级
 brew install meetap
 brew upgrade meetap
-# 自动安装依赖：ffmpeg, switchaudio-osx, blackhole-2ch
-# blackhole-2ch 仅作旧系统回退用；macOS 14.4+ 走 Process Tap 时不会用到它
+# 自动安装依赖：ffmpeg、python
 ```
 
 > 也可以一行搞定（自动 tap + install，但命令较长）：
@@ -85,47 +84,43 @@ brew upgrade meetap
 ### 方式 B：从源码构建
 
 ```bash
-# 1. 装依赖（blackhole-2ch 仅旧系统回退需要，14.4+ 可不装）
-brew install ffmpeg switchaudio-osx awscli
-brew install blackhole-2ch   # 可选：仅 macOS 13.x / Tap 不可用时需要
+# 1. 装依赖
+brew install ffmpeg awscli
 
 # 2. clone & 编译安装
 git clone https://github.com/henceman777/meetap.git
 cd meetap
-make install     # 编译 audio-tap / audio-monitor / audio-multi-output 并装到 ~/bin
-
-# 3. 若使用 BlackHole 回退，让系统识别它（音频会断 2–3 秒）
-sudo killall coreaudiod
+make install     # 编译 audio-tap / audio-multi-output 并装到 ~/bin
 ```
 
 > **关于音频权限**：Process Tap 首次采集会触发 macOS 的"系统音频录制"授权。`make install` 已为 `audio-tap` 嵌入权限描述并重新签名；首次运行 `meetap setup` 会检测并引导你完成授权。
 
 
 
-### 从旧版本升级到 1.5.0（macOS 14.4+ 用户必看）
+### 从 1.x 升级到 2.0（必看）
 
-1.5.0 默认改用 **Process Tap** 采集，它需要一项旧版从未申请过的权限——**"系统音频录制"**（旧版走 BlackHole，不涉及此权限）。若不提前授权，升级后第一次录制可能录到全静音的系统声、开完会才发现。**升级后先跑一次 `meetap setup` 确认授权，再开始正式会议最稳妥。**
+2.0 起只用 macOS 自带的 **Process Tap** 采集，**不再使用 BlackHole**，也不再需要给会议 App 配扬声器；系统要求随之提高到 **macOS 14.4+**。
 
 ```bash
-# 1. 升级到 1.5.0
-brew upgrade meetap                 # Homebrew 安装
-# 或源码安装：cd meetap && git pull && make install
-
-# 2. 确认授权（关键一步，会做一次 2 秒实测）
-meetap setup
-
-# 3. 验证版本
-meetap version                      # 应显示 MeeTap v1.5.0
+brew upgrade meetap        # 或源码安装：cd meetap && git pull && make install
+meetap setup               # 升级后先跑一次
 ```
 
-`meetap setup` 会自动做一次 2 秒实测：
+`meetap setup` 会做两件事：
 
-- **探测通过** → 记下"授权已确认"标记，之后 `meetap start` 直接开录、不再提示；
-- **探测为静音** → `setup` 会自动打开 **系统设置 › 隐私与安全性 › 屏幕与系统录音**，把你的终端 App（Ghostty / Terminal / iTerm 等）加进"仅系统录音"，按提示复测；部分终端（如 Ghostty）不会自动弹授权框，必须手动添加。
+1. **检查从 1.x 留下的音频设置**（只在需要时出声）：
+   - **系统输出还停在 `BlackHole 2ch` 上**（以前录音崩溃后没恢复）：知道原来用的设备、它也还连着，就自动切回并告诉你切到了哪个；不知道的话列出设备让你选，默认「保持不变」——你可能是有意给别的软件用的。`meetap start` 开录前也会做同样的检查，但不会因此不开录。
+   - **Zoom 的扬声器还设成了 BlackHole**：提示你在 Zoom › 设置 › 音频 › 扬声器 里改回「与系统相同」。只提示，不改 Zoom 的配置。
+   - **系统里还装着 BlackHole**：提醒你检查 Teams、腾讯会议的扬声器是不是还选着 BlackHole 2ch（以前的 `setup` 让你这样选过），是的话改回系统默认或你的扬声器、耳机。
+2. **检查系统录音授权**（Process Tap）：做一次 2 秒实测（会播一声提示音）；如果录到静音，就打开 **系统设置 › 隐私与安全性 › 屏幕与系统录音**，引导你把终端 App（Ghostty / Terminal / iTerm 等）加进"仅系统录音"并复测。1.5.0 以前一直走 BlackHole 的用户从没授过这项权限，这一步必须做；部分终端（如 Ghostty）不会自动弹授权框，要手动添加。
 
-> **注意**：`auto` 模式在 macOS 14.4+ 上会直接走 Process Tap，**授权未生效不会自动回退、会录到静音**。所以升级后务必先跑一次 `meetap setup` 完成授权；若尚未跑过，`meetap start` 会提示你先做授权自检（但不会阻断录制）。授权前如需应急录制，可在配置里把 `audio_capture` 改为 `blackhole` 走旧方式（需已安装 BlackHole）。
+另外：
 
-> **macOS 13.x 用户**：无 Process Tap，行为与旧版一致，继续走 BlackHole，升级后无需额外授权操作。
+- **BlackHole 可以卸载**：`brew uninstall --cask blackhole-2ch`。2.0 不再用它，卸不卸由你定——别的软件还在用的话就留着。
+- **配置里的 `audio_capture = blackhole` 可以删掉**：2.0 起这一项不起作用，录音照样走 Process Tap，`start` / `setup` 会提示一句。
+- `meetap setup-zoom` / `setup-teams` / `setup-wemeet` 只会提示"2.0 起不需要配置会议 App 的扬声器"。
+- 授权没生效时没有别的采集方式可以退，会录成静音。所以 2.0 加了**静音报警**：录音期间只要有 App 在放声音、录到的却全是零，30 秒内弹通知（见「日常使用」）。
+- 还在 macOS 13.x 上：2.0 用不了（`start` / `setup` 会报版本太低），请继续用 1.x。
 
 ---
 
@@ -148,8 +143,8 @@ aws configure
 meetap setup
 ```
 
-- **检测并引导 Process Tap 授权**（macOS 14.4+）——`setup` 会做一次 2 秒实测；若为静音，会自动打开 系统设置 › 隐私与安全性 › 屏幕与系统录音，引导你把终端 App 加进"仅系统录音"，按提示复测。这是 Tap 模式下唯一需要的一次性准备。
-- **会议 App 扬声器配置：Tap 模式自动跳过**——`setup` 会根据实际采集路径决定：Tap 授权通过时，直接跳过 Zoom / Teams / 腾讯会议的扬声器配置（Process Tap 采集整个系统混音，与会议 App 的扬声器设置无关）；仅当走 BlackHole 回退（macOS 13.x，或配置为 `blackhole`）时，才会逐个引导把各会议 App 的扬声器指向 BlackHole。
+- **检测并引导 Process Tap 授权**——`setup` 会做一次 2 秒实测；若为静音，会自动打开 系统设置 › 隐私与安全性 › 屏幕与系统录音，引导你把终端 App 加进"仅系统录音"，按提示复测。这是唯一需要的一次性准备。
+- **检查从 1.x 升级留下的音频设置**——系统输出、Zoom / Teams / 腾讯会议的扬声器是不是还指着 BlackHole，详见上文「从 1.x 升级到 2.0」。会议 App 的扬声器不需要任何配置：Process Tap 采集整个系统混音，与会议 App 的扬声器设置无关。
 
 授权完成后，除非更换终端 App 或系统升级导致权限变动，否则不需再跑。
 
@@ -168,12 +163,14 @@ meetap config show      # 查看当前所有配置项
 |---|---|---|
 | `region` | `us-east-1` | AWS 区域（影响 S3 / Transcribe / Bedrock） |
 | `model` | `global.anthropic.claude-sonnet-5` | 纪要生成使用的 Bedrock 模型 ID |
-| `audio_capture` | `auto` | 采集方式：`auto`（14.4+ 用 Tap，否则 BlackHole）/ `tap` / `blackhole` |
 | `transcribe_languages` | `en-US zh-CN ja-JP` | Transcribe 候选语言（按优先级） |
 | `multi_language` | `false` | 同一会议中英混讲时改 `true` |
 | `language` | `zh-CN` | CLI 界面语言（en-US 或 zh-CN）—— **不影响纪要** |
 | `email` | 空 | 纪要收件人，留空则跳过邮件 |
 | `email_sender` | 空 | SES 已验证的发件人，设了 email 必填 |
+| `zero_alert_ignore` | `com.amazon.workspaces` | 静音报警时不算"在放声音"的 App（逗号分隔的 bundle ID 或命令行程序名），见下 |
+
+**`zero_alert_ignore` 是干什么的**：录音期间如果有 App 在放声音、录到的却全是零（多半是系统录音授权失效，或系统采集中途出了故障），meetap 会在 30 秒内弹通知，写明是哪个 App 在放。有的 App 一直开着音频输出、其实放的是静音（比如 Amazon WorkSpaces 客户端），会被误当成"在放声音"，每次提前开录都误报，所以要排除掉。**什么时候往里加**：收到这条通知、但当时其实没有任何声音在放，就把通知里写的那个 App 名加进来（多个用逗号隔开）。名单里的 App 只是不再触发报警，会话的 `log/audio-tap.log` 里照样记（`ignored=`）。
 
 重置为默认：`rm ~/.config/meetap/config` 后再跑任意 `meetap` 命令。
 
@@ -234,10 +231,10 @@ $ meetap start -m -d 150
 
 音频采集期间：
 
-- **你正常开会**，音频照常从原来的扬声器 / 耳机里播放（Process Tap 不切换输出设备；BlackHole 回退时由 audio-monitor 实时转发）
+- **你正常开会**，音频照常从原来的扬声器 / 耳机里播放（Process Tap 不切换输出设备，录音中途切换输出设备也不影响采集）
 - **终端底部**会显示音量电平 + 时长（`-m` 时只跟电脑声音走）
 - 指定了 `-d` 时，到达时长上限会自动停止；否则一直录到你手动 `stop`
-- **走 BlackHole 回退时，不要手动切换系统音频输出**，否则音频采集会无声（Process Tap 模式无此限制）
+- **有声音在放、却录成静音时当场提醒**：整场录音期间，只要有 App 在放声音、录到的却全是零，30 秒内弹系统通知，写明是哪个 App 在放。开会前提前开录、什么都没在放时不会提醒。每段变零、恢复的墙钟时间都记在会话的 `log/audio-tap.log` 里（`TAP_ZERO_START` / `TAP_ZERO_END`），开着麦克风的场次也记
 - **Mac 休眠（合盖等）时自动结束本场录音**：只把音频文件收尾，不在休眠前上传转录；唤醒后会弹通知，按提示运行 `meetap again <会话名>` 生成纪要（`meetap status` 也会显示这条待办）。锁屏、显示器休眠不受影响
 
 ### 停止 + 自动生成纪要
@@ -357,15 +354,13 @@ email_sender = meetap@yourdomain.com
 
 ## 六、实现原理
 
-### 6.1 音频采集：Process Tap 首选，BlackHole 兜底
+### 6.1 音频采集：Process Tap
 
-macOS 不允许 App 抓取其他 App 的音频输出，MeeTap 提供两条采集路径，`auto` 模式按系统能力自动选择：
-
-**首选：Process Tap（macOS 14.4+）**
+macOS 不允许 App 直接抓取其他 App 的音频输出，MeeTap 用系统原生的 Process Tap（macOS 14.4+）采集：
 
 系统原生的 [Core Audio Process Tap](https://developer.apple.com/documentation/coreaudio)（macOS 14.4 引入的 `AudioHardwareCreateProcessTap` + `CATapDescription`）直接在 coreaudiod 的系统混音总线上"接一根监听探针"——在音频送往扬声器 / 耳机的**同一条链路上旁路复制一份**交给采集进程，采集全部系统音频，音频照常从原设备正常播放，用户听感零变化。麦克风在同一进程内混入（借鉴 meetily 的 ring-buffer 混音架构），ffmpeg 只做编码、零设备访问，彻底消除设备抢占与枚举竞态。
 
-相较旧的 BlackHole 虚拟声卡方案，它的优点是：
+相较 1.x 用过的 BlackHole 虚拟声卡方案（2.0 已删除），它的优点是：
 
 - **零安装、零配置**：系统原生能力，无需安装虚拟声卡、无需 `sudo killall coreaudiod`、无需在会议 App 里手动改扬声器；
 - **不改变默认输出设备**：用户仍从原扬声器 / 耳机听原声，不存在"录制期间误切输出就没声"的坑；
@@ -383,20 +378,7 @@ flowchart TB
     FF --> M4A[meeting.m4a]
 ```
 
-**兜底：BlackHole（macOS 13.x / Tap 不可用）**
-
-把 BlackHole 软件声卡设成系统默认输出——它同时是输出和输入，被两个消费者并行订阅：一路由 audio-monitor 还原给用户听（端到端延迟 < 10 ms），一路交给 ffmpeg 采集。会议 App 毫无感知。此模式下录制期间不要手动切换系统输出。
-
-```mermaid
-%%{init: {'flowchart': {'curve': 'basis'}}}%%
-flowchart TB
-    APP["会议 App"] -->|播放| CAD[coreaudiod]
-    CAD -->|默认输出| BH["BlackHole 2ch<br/>（loopback 虚拟声卡）"]
-    BH -->|作为输入读取| MON["audio-monitor<br/>（AUHAL 转发）"]
-    BH -->|同时被读取| FF["ffmpeg<br/>（混入麦克风）"]
-    MON --> SPK[扬声器 / 耳机]
-    FF --> M4A[meeting.m4a]
-```
+**防漏录**：Process Tap 偶尔会"回调照常、交出的数据全是零"（实测录到第 19 分钟才坏）。audio-tap 每秒检查 tap 这一路：连续 3 秒全零记一个零段，恢复时记结束；同一零段里累计 20 秒有别的 App 在放声音，就弹通知。是否"在放声音"按 CoreAudio 的进程输出状态判断，`zero_alert_ignore` 里的 App 不算。
 
 ### 6.2 云端处理：客户端直连 4 个托管服务
 
@@ -449,6 +431,8 @@ sequenceDiagram
 | 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../log/meetap.log` 查看具体 AWS 报错 |
 | 音频采集有回声 | 戴耳机采集；外放会把扬声器声音二次采入 |
 | 系统通知没弹出 | 系统设置 → 通知 → 允许 "终端" 或 "Script Editor" 发送通知 |
+| 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零。先看通知里写的是哪个 App：它当时其实没出声（一直开着输出流的 App），就把它加进配置 `zero_alert_ignore`；确实在开会，就跑 `meetap setup` 检查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间在会话的 `log/audio-tap.log` 里（`TAP_ZERO_*`） |
+| 从 1.x 升级后听不到声音 | 系统输出或会议 App 的扬声器还指着 BlackHole 2ch。跑一次 `meetap setup`，或在 系统设置 › 声音 › 输出、会议 App 的音频设置里改回扬声器 / 耳机 |
 
 ---
 
@@ -545,8 +529,7 @@ src/
 ├── meetap                    # bash 主控脚本
 ├── audio-tap.swift           # Core Audio Process Tap 采集 + 麦克风进程内混音（macOS 14.4+）
 ├── audio-tap-Info.plist      # 嵌入 audio-tap 的音频录制权限描述
-├── audio-multi-output.swift  # CoreAudio 设备管理（SwitchAudioSource 薄封装，BlackHole 回退用）
-├── audio-monitor.swift       # AUHAL AudioUnit 实时音频转发（BlackHole 回退用）
+├── audio-multi-output.swift  # CoreAudio 设备查询 / 切换默认输出（升级迁移用）+ 休眠自动结束（sleep-watch）
 └── i18n/                     # CLI 双语消息表
 ```
 

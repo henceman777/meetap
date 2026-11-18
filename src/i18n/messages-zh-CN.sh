@@ -117,7 +117,7 @@ MSG_SETUP_TAP_GUIDE_2="   2. 在「仅系统录音」中点 + 添加你的终端
 MSG_SETUP_TAP_GUIDE_3="   3. 若系统提示需要重新打开终端 App，请照做后重新运行 meetap setup"
 MSG_SETUP_TAP_PRESS_AFTER_GRANT="   完成授权后按 Enter 复测..."
 MSG_SETUP_TAP_STILL_SILENT="⚠️  复测仍为静音。若刚在系统设置中改过授权，请完全退出并重启终端 App 后再运行 meetap setup"
-MSG_SETUP_TAP_FALLBACK_NOTE="   注意：授权没生效时会录到静音，2.0 起没有别的采集方式可以退。请按上面的步骤授权后重跑 meetap setup"
+MSG_SETUP_TAP_FALLBACK_NOTE="   注意：授权没生效时会录到静音，2.0 起没有别的采集方式可以退。请按上面的步骤授权后重跑 meetap setup；录音时要是有声音在放、录到的却是静音，meetap 会弹通知提醒"
 
 # ── Setup ──
 MSG_SETUP_HEADER="==============================="

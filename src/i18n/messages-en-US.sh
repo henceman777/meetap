@@ -116,7 +116,7 @@ MSG_SETUP_TAP_GUIDE_2="   2. Under 'System Audio Recording Only', click + and ad
 MSG_SETUP_TAP_GUIDE_3="   3. If macOS asks to relaunch the terminal app, do so and re-run meetap setup"
 MSG_SETUP_TAP_PRESS_AFTER_GRANT="   Press Enter after granting to re-test..."
 MSG_SETUP_TAP_STILL_SILENT="WARNING: still silent. If you just changed the permission, fully quit and relaunch your terminal app, then re-run meetap setup"
-MSG_SETUP_TAP_FALLBACK_NOTE="   Note: without the permission recordings will be silent, and as of 2.0 there is no other capture path to fall back to. Grant it as above, then run meetap setup again"
+MSG_SETUP_TAP_FALLBACK_NOTE="   Note: without the permission recordings will be silent, and as of 2.0 there is no other capture path to fall back to. Grant it as above, then run meetap setup again; if sound is playing during a recording but the capture is silent, meetap will show a notification"
 
 # ── Setup ──
 MSG_SETUP_HEADER="==============================="
