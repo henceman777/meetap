@@ -75,85 +75,6 @@ func findByUID(_ uid: String) -> AudioDeviceID? {
     allDeviceIDs().first { deviceUID($0) == uid }
 }
 
-func findBlackHoleUID() -> String? {
-    for id in allDeviceIDs() {
-        if let name = deviceName(id), name.contains("BlackHole"),
-           let uid = deviceUID(id) { return uid }
-    }
-    return nil
-}
-
-func getSampleRate(_ id: AudioDeviceID) -> Float64? {
-    var addr = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyNominalSampleRate,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain)
-    var rate: Float64 = 0
-    var size = UInt32(MemoryLayout<Float64>.size)
-    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &rate) == noErr else { return nil }
-    return rate
-}
-
-func setSampleRate(_ id: AudioDeviceID, _ rate: Float64) -> Bool {
-    var addr = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyNominalSampleRate,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain)
-    var r = rate
-    return AudioObjectSetPropertyData(id, &addr, 0, nil,
-        UInt32(MemoryLayout<Float64>.size), &r) == noErr
-}
-
-// 多输出设备的固定标识
-let kMOUID = "com.meeting-record.multi-output"
-let kMOName = "Meeting Multi-Output"
-
-func createMultiOutput(masterUID: String, secondUID: String, noDrift: Bool = false) -> AudioDeviceID? {
-    // "stck": 1 = multi-output (stacked) mode
-    // "drift": 1 = enable drift correction on secondary device
-    let desc: [String: Any]
-    if noDrift {
-        // 无 master 模式：两个设备平等，都不加 drift correction
-        // 适用于两个设备采样率相同的情况（如 Speaker 48kHz + BlackHole 48kHz）
-        desc = [
-            "name": kMOName, "uid": kMOUID,
-            "private": 0, "stck": 1,
-            "subdevices": [
-                ["uid": masterUID],
-                ["uid": secondUID]
-            ]
-        ]
-    } else {
-        desc = [
-            "name": kMOName, "uid": kMOUID,
-            "private": 0, "stck": 1, "drift": 1,
-            "subdevices": [
-                ["uid": masterUID, "drift": 0],
-                ["uid": secondUID, "drift": 1]
-            ],
-            "master": masterUID
-        ]
-    }
-    var aggID: AudioDeviceID = 0
-    let st = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &aggID)
-    if st == noErr { return aggID }
-    fputs("Error: create aggregate device failed (\(st))\n", stderr)
-    return nil
-}
-
-func destroyDevice(_ id: AudioDeviceID) -> Bool {
-    AudioHardwareDestroyAggregateDevice(id) == noErr
-}
-
-// 清理之前遗留的多输出设备
-func cleanup() {
-    for id in allDeviceIDs() {
-        if deviceUID(id) == kMOUID || deviceName(id) == kMOName {
-            let _ = destroyDevice(id)
-        }
-    }
-}
-
 // MARK: - sleep-watch：系统休眠前结束录音，唤醒后发通知
 
 // IOKit 的消息常量是函数式宏（iokit_common_msg），Swift 导入不了，按定义手算：
@@ -241,14 +162,9 @@ guard let cmd = args.first else {
       list                 列出所有输出设备 (name|uid|id)
       default-output-uid   当前默认输出设备 UID
       default-output-name  当前默认输出设备名称
-      default-output-id    当前默认输出设备 ID
       default-input-name   当前默认输入设备名称
-      blackhole-uid        BlackHole 设备 UID
-      create <m-uid> <s-uid>  创建多输出设备 (master + secondary)
-      destroy <device-id>  销毁聚合设备
       set-default <id>     设置默认输出设备
       find-uid <uid>       通过 UID 查找设备 ID
-      cleanup              清理遗留的 Meeting Multi-Output 设备
       sleep-watch <meetap> <pid-file>  休眠前执行 meetap stop --sleep，唤醒后 _wake-notify
 
     """, stderr)
@@ -268,28 +184,10 @@ case "default-output-name":
     guard let id = defaultDevice(output: true), let name = deviceName(id) else {
         fputs("Error: no default output\n", stderr); exit(1) }
     print(name)
-case "default-output-id":
-    guard let id = defaultDevice(output: true) else {
-        fputs("Error: no default output\n", stderr); exit(1) }
-    print(id)
 case "default-input-name":
     guard let id = defaultDevice(output: false), let name = deviceName(id) else {
         fputs("Error: no default input\n", stderr); exit(1) }
     print(name)
-case "blackhole-uid":
-    guard let uid = findBlackHoleUID() else {
-        fputs("Error: BlackHole not found\n", stderr); exit(1) }
-    print(uid)
-case "create":
-    guard args.count >= 3 else {
-        fputs("Usage: create <master-uid> <secondary-uid> [--no-drift]\n", stderr); exit(1) }
-    let noDrift = args.contains("--no-drift")
-    guard let id = createMultiOutput(masterUID: args[1], secondUID: args[2], noDrift: noDrift) else { exit(1) }
-    print(id)
-case "destroy":
-    guard args.count >= 2, let n = UInt32(args[1]) else {
-        fputs("Usage: destroy <device-id>\n", stderr); exit(1) }
-    if !destroyDevice(n) { fputs("Warning: destroy failed\n", stderr) }
 case "set-default":
     guard args.count >= 2, let n = UInt32(args[1]) else {
         fputs("Usage: set-default <device-id>\n", stderr); exit(1) }
@@ -304,18 +202,6 @@ case "sleep-watch":
     guard args.count >= 3 else {
         fputs("Usage: sleep-watch <meetap-path> <ffmpeg-pid-file> [--simulate-sleep]\n", stderr); exit(1) }
     runSleepWatch(meetap: args[1], pidFile: args[2], simulate: args.contains("--simulate-sleep"))
-case "cleanup":
-    cleanup()
-case "set-sample-rate":
-    guard args.count >= 3, let n = UInt32(args[1]), let r = Float64(args[2]) else {
-        fputs("Usage: set-sample-rate <device-id> <rate>\n", stderr); exit(1) }
-    if !setSampleRate(n, r) { fputs("Error: set sample rate failed\n", stderr); exit(1) }
-case "get-sample-rate":
-    guard args.count >= 2, let n = UInt32(args[1]) else {
-        fputs("Usage: get-sample-rate <device-id>\n", stderr); exit(1) }
-    guard let r = getSampleRate(n) else {
-        fputs("Error: get sample rate failed\n", stderr); exit(1) }
-    print(Int(r))
 default:
     fputs("Unknown command: \(cmd)\n", stderr); exit(1)
 }

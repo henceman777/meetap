@@ -39,7 +39,6 @@ case "\$1" in
     find-uid)            awk -F'|' -v u="\$2" '\$2==u {print \$3; f=1} END {exit !f}' "\$D/devices" ;;
     set-default)         echo "\$2" >> "\$D/set-default.log"
                          awk -F'|' -v i="\$2" '\$3==i {print \$1}' "\$D/devices" > "\$D/default" ;;
-    blackhole-uid)       grep -q BlackHole "\$D/devices" && echo BlackHole2ch_UID || exit 1 ;;
     *)                   exit 1 ;;
 esac
 EOF
@@ -52,7 +51,6 @@ case "$1" in
     *)             exit 1 ;;
 esac
 EOF
-printf '#!/bin/bash\nexit 0\n' > "$APP/audio-monitor"
 printf '#!/bin/bash\necho "$*" >> "%s/osascript.log"\n' "$TMP" > "$FAKE/osascript"
 printf '#!/bin/bash\necho "$*" >> "%s/open.log"\n' "$TMP" > "$FAKE/open"
 printf '#!/bin/bash\nexit 0\n' > "$FAKE/afplay"
@@ -176,6 +174,53 @@ devices "MacBook Pro Speakers|BuiltInSpeakerDevice|91"
 run setup
 [[ "$OUT" != *"Zoom 的扬声器还设成了"* && "$OUT" != *"Teams 或腾讯会议"* ]] \
     && pass "setup：Zoom 跟随系统、没装 BlackHole 时不提示" || fail "setup 不该提示 (rc=$RC): $OUT"
+
+# ── 8. 老配置 audio_capture = blackhole：提示删掉这一行，照样往下走（走 Tap）──
+devices "MacBook Pro Speakers|BuiltInSpeakerDevice|91"
+set_default "MacBook Pro Speakers"
+printf 'recording_dir = %s\nlanguage = zh-CN\naudio_capture = blackhole\n' "$TMP/rec" > "$XDG_CONFIG_HOME/meetap/config"
+run start
+[[ "$OUT" == *"2.0 起已不用 BlackHole"*"audio_capture = blackhole"*"$XDG_CONFIG_HOME/meetap/config"* && "$OUT" == *"$FFMISSING"* ]] \
+    && pass "start：老配置写着 blackhole 时提示删掉这一行，照样往下走" || fail "start 老配置 (rc=$RC): $OUT"
+run setup
+[[ "$OUT" == *"2.0 起已不用 BlackHole"* && "$OUT" == *"系统音频捕获正常"* ]] \
+    && pass "setup：老配置写着 blackhole 时提示，照样做 Tap 授权自检" || fail "setup 老配置 (rc=$RC): $OUT"
+for v in auto tap; do
+    printf 'recording_dir = %s\nlanguage = zh-CN\naudio_capture = %s\n' "$TMP/rec" "$v" > "$XDG_CONFIG_HOME/meetap/config"
+    run start
+    [[ "$OUT" != *"2.0 起已不用 BlackHole"* ]] && pass "老配置写着 $v 时不提示" || fail "audio_capture=$v 不该提示: $OUT"
+done
+printf 'recording_dir = %s\nlanguage = zh-CN\n' "$TMP/rec" > "$XDG_CONFIG_HOME/meetap/config"
+
+# ── 9. setup-zoom / setup-teams / setup-wemeet：只提示，退出码 0，不碰会议 App ──
+printf '[General]\nAECSPK=%s\n' "$(hex 'BlackHole 2ch')" > "$ZOOM_INI"
+cp "$ZOOM_INI" "$TMP/viper.orig"
+rm -f "$TMP/osascript.log" "$TMP/open.log"
+for c in setup-zoom setup-teams setup-wemeet; do
+    run "$c"
+    [[ $RC -eq 0 && "$OUT" == *"2.0 起不需要配置会议 App 的扬声器"* ]] && pass "meetap $c 只提示，退出码 0" || fail "meetap $c (rc=$RC): $OUT"
+done
+cmp -s "$ZOOM_INI" "$TMP/viper.orig" && [[ ! -e "$TMP/osascript.log" && ! -e "$TMP/open.log" ]] \
+    && pass "旧命令没改 Zoom 配置、没退出或打开任何 App" || fail "旧命令动了会议 App"
+
+# ── 10. BlackHole 的分支删干净：src/ 里只剩迁移检查和老配置提示用到的行 ──
+# 允许留下的位置：src/meetap 里「迁移检查」那一节（节标题到 start_recording）、setup_apps、
+# setup-zoom 那一处分发；提示语里迁移检查和老配置提示用的几条
+ALLOWED=$(awk '
+    /^# ── 系统版本门槛与 2.0 升级迁移检查/ {sec=1}
+    /^start_recording\(\) \{/               {sec=0}
+    /^setup_apps\(\) \{/                     {fn=1}
+    fn && /^}/                                {fn=0}
+    /setup-zoom\|setup-teams\|setup-wemeet\)/ {d=2}
+    { if (sec || fn || d > 0) print NR; if (d > 0) d-- }' "$REPO_ROOT/src/meetap")
+LEFT=$(grep -rn -i -E 'blackhole|SwitchAudioSource|audio-monitor' "$REPO_ROOT/src/" | while IFS= read -r hit; do
+    f=${hit%%:*}; rest=${hit#*:}; n=${rest%%:*}
+    if [[ "$f" == "$REPO_ROOT/src/meetap" ]] && grep -qx "$n" <<< "$ALLOWED"; then continue; fi
+    [[ "$f" == "$REPO_ROOT"/src/i18n/messages-*.sh && "${rest#*:}" =~ ^MSG_(MIGRATE_|WARN_OLD_CAPTURE_CONFIG|USAGE_HINT) ]] && continue
+    echo "$hit"
+done)
+[[ -z "$LEFT" ]] && pass "src/ 里没有迁移检查以外的 BlackHole / SwitchAudioSource / audio-monitor" || fail "还有残留: $LEFT"
+[[ ! -e "$REPO_ROOT/src/audio-monitor.swift" ]] && pass "audio-monitor.swift 已删" || fail "audio-monitor.swift 还在"
 
 echo
 [[ $FAIL -eq 0 ]] && echo "ALL PASS" || echo "SOME FAILED"

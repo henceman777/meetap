@@ -3,7 +3,7 @@ import CoreAudio
 import Foundation
 
 // meetap audio-tap — 基于 macOS 14.4+ Core Audio Process Tap 的系统音频旁路捕获
-// 不切换系统输出设备、不需要 BlackHole，用户听到原声。
+// 不切换系统输出设备，用户照常听到原声。
 //
 // 子命令:
 //   tap-supported             检测系统是否支持 Process Tap（≥14.4 输出 "yes" exit 0）
