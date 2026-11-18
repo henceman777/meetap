@@ -84,6 +84,15 @@ var tapLastNs: UInt64 = 0
 var tapFirstNs: UInt64 = 0
 var micFirstNs: UInt64 = 0
 var micLastNs: UInt64 = 0
+// 零段记账用的逐秒统计（meterLock 保护，看门狗每秒取走并清零）：
+// 电平表的 meterPeak 每 0.4s 被清零，不能拿来按秒判断
+var zgPeak: Float = 0
+var zgCallbacks: Int = 0
+// 故障注入（环境变量 MEETAP_TAP_FAULT_ZERO_AFTER=N[ MEETAP_TAP_FAULT_ZERO_FOR=M]）：
+// 从开录第 N 秒起（持续 M 秒，不给就一直）把 tap 回调交来的数据清零、回调照常，
+// 模拟「回调照常、数据全零」的漏录，用来验证零段日志和静音报警。0 = 关。
+var faultZeroFromNs: UInt64 = 0
+var faultZeroUntilNs: UInt64 = .max
 
 // MARK: - 麦克风采集与混音（--with-mic，借鉴 meetily ring-buffer 混音架构）
 // meetily 经验（core_audio.rs / pipeline.rs, MIT）：绝不让外部进程（ffmpeg
@@ -634,6 +643,144 @@ final class OutputWriter {
     }
 }
 
+// 除本进程外，正在往外放声音的进程：App 用 bundle ID，命令行进程没有 bundle ID 就用
+// 可执行文件名（再没有才记 pid:N）。静音报警和零段日志用它说明「是谁在放」，
+// zero_alert_ignore 名单也按这个名字匹配。
+@available(macOS 14.4, *)
+func playingProcesses() -> [String] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    let sysObj = AudioObjectID(kAudioObjectSystemObject)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(sysObj, &addr, 0, nil, &size) == noErr else { return [] }
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(sysObj, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    let me = getpid()
+    var out: [String] = []
+    for id in ids {
+        var pid: pid_t = 0
+        var running: UInt32 = 0
+        var sz = UInt32(MemoryLayout<pid_t>.size)
+        addr.mSelector = kAudioProcessPropertyPID
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &pid) == noErr, pid != me else { continue }
+        sz = UInt32(MemoryLayout<UInt32>.size)
+        addr.mSelector = kAudioProcessPropertyIsRunningOutput
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &running) == noErr, running != 0 else { continue }
+        addr.mSelector = kAudioProcessPropertyBundleID
+        var bid: CFString? = nil
+        sz = UInt32(MemoryLayout<CFString?>.size)
+        let st = withUnsafeMutablePointer(to: &bid) {
+            AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, $0)
+        }
+        let name = (st == noErr ? bid as String? : nil).flatMap { $0.isEmpty ? nil : $0 }
+            ?? executableName(pid) ?? "pid:\(pid)"
+        if !out.contains(name) { out.append(name) }
+    }
+    return out
+}
+
+func executableName(_ pid: pid_t) -> String? {
+    var buf = [CChar](repeating: 0, count: 4096)
+    guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return nil }
+    let name = (String(cString: buf) as NSString).lastPathComponent
+    return name.isEmpty ? nil : name
+}
+
+// 报警通知文案：meetap 传进来的模板里 {apps} 换成在放声音的 App
+func zeroAlertMessage(_ template: String, _ apps: [String]) -> String {
+    template.replacingOccurrences(of: "{apps}", with: apps.joined(separator: ", "))
+}
+
+// MARK: - tap 一路的零段记账与静音报警
+// 每秒喂一个观察：这一秒 tap 有没有回调（cb）、有没有交出非零样本、有没有别的进程在放声音。
+// - 记账：连续零秒达到 spanMinSec 记一个零段开始（时刻取第一个零秒），出现非零样本记结束；
+//   不管有没有声音在放都记，playing= / cb= 写明这段里各有几秒，以后统计得出故障有多常见。
+// - 报警：同一零段里累计 alertPlayingSec 秒「有声音在放」就报一次（开会前提前开录、
+//   什么都没在放时不报）。12:01 那场是「回调照常、数据全零」，录到第 19 分钟才坏。
+// - 忽略名单（zero_alert_ignore）：有的 App 一直开着输出流、放的却是静音（实测 Amazon
+//   WorkSpaces），不排除就会每次提前开录都误报。名单里的进程不算「有声音在放」，日志照记。
+// 不碰音频设备，test/zero-guard-selftest.sh 用合成的逐秒序列验它。
+final class ZeroGuard {
+    static let spanMinSec = 3
+    static let alertPlayingSec = 20
+
+    struct Tick {
+        let cb: Bool          // 这一秒 tap 有没有回调
+        let nonzero: Bool     // 这一秒 tap 有没有交出非零样本
+        let playing: [String] // 这一秒在放声音的进程（只在零秒时才查；不含忽略名单里的）
+        var ignored: [String] = []  // 这一秒在放声音、但在忽略名单里的进程
+        let wall: Date        // 这一秒窗口结束的墙钟时刻
+        let rel: Double       // 相对开录的秒数（窗口结束）
+    }
+
+    private let log: (String) -> Void
+    private let alert: ([String]) -> Void
+    private var zeroRun = 0, playingSec = 0, cbSec = 0
+    private var startWall = Date(), startRel = 0.0
+    private var inSpan = false, alerted = false
+    private var apps: [String] = [], ignoredApps: [String] = []
+    private let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
+    init(log: @escaping (String) -> Void, alert: @escaping ([String]) -> Void) {
+        self.log = log; self.alert = alert
+    }
+
+    private func at(_ wall: Date, _ rel: Double) -> String {
+        String(format: "at %@ (+%.0fs)", fmt.string(from: wall), rel)
+    }
+
+    func feed(_ t: Tick) {
+        guard !t.nonzero else {
+            if inSpan { end(wall: t.wall.addingTimeInterval(-1), rel: t.rel - 1, note: "") }
+            zeroRun = 0; inSpan = false; alerted = false
+            return
+        }
+        if zeroRun == 0 {
+            startWall = t.wall.addingTimeInterval(-1); startRel = t.rel - 1
+            playingSec = 0; cbSec = 0; apps = []; ignoredApps = []
+        }
+        zeroRun += 1
+        if t.cb { cbSec += 1 }
+        if !t.playing.isEmpty {
+            playingSec += 1
+            for a in t.playing where !apps.contains(a) { apps.append(a) }
+        }
+        for a in t.ignored where !ignoredApps.contains(a) { ignoredApps.append(a) }
+        if !inSpan && zeroRun >= Self.spanMinSec {
+            inSpan = true
+            log("TAP_ZERO_START \(at(startWall, startRel)) cb=\(cbSec > 0 ? "yes" : "no")")
+        }
+        if inSpan && !alerted && playingSec >= Self.alertPlayingSec {
+            alerted = true
+            log("TAP_ZERO_ALERT \(at(t.wall, t.rel)) playing=\(playingSec)s apps=\(apps.joined(separator: ","))\(ignoredPart)")
+            alert(apps)
+        }
+    }
+
+    // 进程退出时补记还没结束的零段
+    func finish(wall: Date, rel: Double) {
+        if inSpan { end(wall: wall, rel: rel, note: " (still zero at exit)") }
+        inSpan = false
+    }
+
+    private func end(wall: Date, rel: Double, note: String) {
+        let dur = max(0, rel - startRel)
+        let appsPart = apps.isEmpty ? "" : " apps=\(apps.joined(separator: ","))"
+        log(String(format: "TAP_ZERO_END %@ dur=%.0fs playing=%ds cb=%ds%@%@%@",
+                   at(wall, rel), dur, playingSec, cbSec, appsPart, ignoredPart, note))
+    }
+
+    private var ignoredPart: String {
+        ignoredApps.isEmpty ? "" : " ignored=\(ignoredApps.joined(separator: ","))"
+    }
+}
+
 // 除本进程外，是否有进程正在往外放声音。用来区分「系统本来就没声音」
 // 和「有声音但 tap 回调没触发（卡死）」。设备级的 IsRunningSomewhere 不行：
 // 输入输出同一设备的 USB 耳机，本进程开麦克风就会让它显示 running。
@@ -780,6 +927,9 @@ final class TapCapture {
             let fp = data.assumingMemoryBound(to: Float.self)
             let stride = max(1, Int(buf.mNumberChannels))
             let now = DispatchTime.now().uptimeNanoseconds
+            if faultZeroFromNs != 0 && now >= faultZeroFromNs && now < faultZeroUntilNs {
+                fp.update(repeating: 0, count: n)   // 故障注入：数据清零、回调照常
+            }
             // 电平表：记录本窗口系统音峰值 + 平方和（RMS 用）
             var peak: Float = 0
             var sumsq: Double = 0
@@ -791,6 +941,8 @@ final class TapCapture {
             meterLock.lock()
             if peak > meterPeak { meterPeak = peak }
             meterSumSq += sumsq; meterCount += n
+            if peak > zgPeak { zgPeak = peak }
+            zgCallbacks += 1
             tapLastNs = now
             if tapFirstNs == 0 { tapFirstNs = now }
             meterLock.unlock()
@@ -845,6 +997,8 @@ func cleanupAndExit(_ code: Int32) -> Never {
     }
     activeMic?.cleanup()
     activeWriter?.logSummary()
+    let rel = Double(DispatchTime.now().uptimeNanoseconds &- recLaunchNs) / 1e9
+    activeZeroGuard?.finish(wall: Date(), rel: rel)
     exit(code)
 }
 
@@ -922,9 +1076,25 @@ func runTapFormat() -> Never {
 var activeMic: MicCapture? = nil
 var activeWriter: OutputWriter? = nil
 var tapWatchdog: DispatchSourceTimer? = nil
+var activeZeroGuard: ZeroGuard? = nil
+var recLaunchNs: UInt64 = 0
+
+// 静音报警：弹系统通知（文案由 meetap 按当前语言传进来）。osascript 的输入输出全部丢弃，
+// 不等它结束——通知弹不出来也不能卡住录音。
+func notifyZero(_ text: String) {
+    let esc = text.replacingOccurrences(of: "\\", with: "\\\\")
+                  .replacingOccurrences(of: "\"", with: "\\\"")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-e", "display notification \"\(esc)\" with title \"MeeTap\""]
+    p.standardInput = FileHandle.nullDevice
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try? p.run()
+}
 
 func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, withMic: Bool,
-                 outputRate: Double) -> Never {
+                 outputRate: Double, zeroAlertText: String?, zeroAlertIgnore: Set<String>) -> Never {
     guard #available(macOS 14.4, *) else {
         fputs("Error: Process Tap requires macOS 14.4+\n", stderr)
         exit(1)
@@ -934,6 +1104,19 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     signal(SIGPIPE, SIG_IGN)  // 管道断开由 write 返回 EPIPE 处理，不让信号杀进程
     // 录音时间轴零点：输出从这一刻起按墙钟出帧（设备初始化期间的空档也算在录音时长里）
     let launchNs = DispatchTime.now().uptimeNanoseconds
+    recLaunchNs = launchNs
+
+    // 故障注入开关（只用于验证零段日志和静音报警，见 faultZeroFromNs）
+    let env = ProcessInfo.processInfo.environment
+    if let a = env["MEETAP_TAP_FAULT_ZERO_AFTER"].flatMap(Double.init), a >= 0 {
+        faultZeroFromNs = launchNs + UInt64(a * 1e9) + 1
+        var forPart = ""
+        if let f = env["MEETAP_TAP_FAULT_ZERO_FOR"].flatMap(Double.init), f > 0 {
+            faultZeroUntilNs = faultZeroFromNs + UInt64(f * 1e9)
+            forPart = String(format: " for %.0fs", f)
+        }
+        fputs(String(format: "FAULT_INJECT tap data zeroed from +%.0fs%@\n", a, forPart), stderr)
+    }
 
     // 装配：tap、麦克风各一路（Source），各自重采样到 outputRate 写进自己的 ring；
     // OutputWriter 按墙钟取数混音写 stdout。写线程等 tap 起来才启动：tap 起不来就
@@ -1029,6 +1212,11 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     var backoffNs: UInt64 = 3_000_000_000
     var restarts = 0
     var tapFirstLogged = false, micFirstLogged = false, micNoDataWarned = false, micStalled = false
+    let zeroGuard = ZeroGuard(log: { fputs($0 + "\n", stderr) },
+                              alert: { apps in
+                                  if let t = zeroAlertText, !t.isEmpty { notifyZero(zeroAlertMessage(t, apps)) }
+                              })
+    activeZeroGuard = zeroGuard
     let wd = DispatchSource.makeTimerSource(queue: .main)
     wd.schedule(deadline: .now() + 1, repeating: 1)
     wd.setEventHandler {
@@ -1060,6 +1248,18 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
                 fputs("MIC_RESUMED at \((now - launchNs) / 1_000_000) ms\n", stderr)
             }
         }
+        // 零段记账 / 静音报警：整场每秒都查（不能照抄下面「出过数据就不管」的条件）
+        meterLock.lock()
+        let secPeak = zgPeak, secCallbacks = zgCallbacks
+        zgPeak = 0; zgCallbacks = 0
+        meterLock.unlock()
+        let nonzero = secPeak > 0
+        let procs = nonzero ? [] : playingProcesses()
+        zeroGuard.feed(ZeroGuard.Tick(cb: secCallbacks > 0, nonzero: nonzero,
+                                      playing: procs.filter { !zeroAlertIgnore.contains($0) },
+                                      ignored: procs.filter { zeroAlertIgnore.contains($0) },
+                                      wall: Date(), rel: Double(now - launchNs) / 1e9))
+
         if last > tapStartNs { backoffNs = 3_000_000_000; return }
         guard now - tapStartNs > backoffNs, otherProcessPlaying() else { return }
         restarts += 1
@@ -1318,6 +1518,106 @@ func runSelftestResample() -> Never {
     exit(failures == 0 ? 0 : 1)
 }
 
+// 零段记账 / 静音报警判断逻辑自检（test/zero-guard-selftest.sh 调用，不碰音频设备）。
+// 用合成的逐秒序列驱动 ZeroGuard，核对日志行和报警次数。
+func runSelftestZeroGuard() -> Never {
+    var failures = 0
+    func check(_ ok: Bool, _ msg: String) {
+        print((ok ? "PASS " : "FAIL ") + msg)
+        if !ok { failures += 1 }
+    }
+    let base = DateFormatter()
+    base.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let t0 = base.date(from: "2026-11-18 12:01:07")!
+    // seq: 每个元素是一秒，(cb, nonzero, playing)
+    func run(_ seq: [(Bool, Bool, Bool)], finishAt: Int? = nil) -> (lines: [String], alerts: [Int]) {
+        var lines: [String] = [], alerts: [Int] = []
+        var sec = 0
+        let g = ZeroGuard(log: { lines.append($0) }, alert: { _ in alerts.append(sec) })
+        for (i, s) in seq.enumerated() {
+            sec = i + 1
+            g.feed(ZeroGuard.Tick(cb: s.0, nonzero: s.1, playing: s.2 ? ["com.microsoft.teams2"] : [],
+                                  wall: t0.addingTimeInterval(Double(sec)), rel: Double(sec)))
+        }
+        if let f = finishAt { g.finish(wall: t0.addingTimeInterval(Double(f)), rel: Double(f)) }
+        return (lines, alerts)
+    }
+    let sound = (true, true, true)        // 有声音、tap 正常
+    let idle = (false, false, false)      // 没声音在放、tap 也没回调（开会前提前开录）
+    let broken = (true, false, true)      // 有声音在放、回调照常、数据全零（12:01 那种）
+    let silentCb = (true, false, false)   // 回调照常、数据全零、但没有进程在放
+
+    do {  // 开会前提前开录：30 秒什么都没放，然后有声音 → 记一段，不报警
+        let r = run(Array(repeating: idle, count: 30) + [sound])
+        check(r.alerts.isEmpty, "没有声音在放的零段不报警")
+        check(r.lines.count == 2 && r.lines[0].hasPrefix("TAP_ZERO_START at 2026-11-18 12:01:07 (+0s) cb=no")
+              && r.lines[1].hasPrefix("TAP_ZERO_END at 2026-11-18 12:01:37 (+30s) dur=30s playing=0s cb=0s"),
+              "没有声音在放的零段照样记账，起止时间、playing=0s、cb=0s 都对：\(r.lines)")
+    }
+    do {  // 正常录到第 10 秒，之后有声音在放却全是零 → 第 30 秒报警、只报一次
+        let r = run(Array(repeating: sound, count: 10) + Array(repeating: broken, count: 40) + [sound])
+        check(r.alerts == [30], "有声音在放、tap 全零：零段开始后第 20 秒报警，只报一次（实际 \(r.alerts)）")
+        check(r.lines.count == 3 && r.lines[0].hasPrefix("TAP_ZERO_START at 2026-11-18 12:01:17 (+10s) cb=yes")
+              && r.lines[1].hasPrefix("TAP_ZERO_ALERT at 2026-11-18 12:01:37 (+30s) playing=20s apps=com.microsoft.teams2")
+              && r.lines[2].hasPrefix("TAP_ZERO_END at 2026-11-18 12:01:57 (+50s) dur=40s playing=40s cb=40s"),
+              "开始、报警、恢复三行的墙钟时间和计数都对：\(r.lines)")
+    }
+    do {  // 回调照常、数据全零，但没有进程在放 → 只记账
+        let r = run(Array(repeating: silentCb, count: 60) + [sound])
+        check(r.alerts.isEmpty && r.lines.count == 2 && r.lines[0].hasSuffix("cb=yes"),
+              "回调照常但没人在放：只记账（cb=yes）不报警")
+    }
+    do {  // 短于 3 秒的零不算零段
+        let r = run([sound, broken, broken, sound, broken, sound])
+        check(r.lines.isEmpty && r.alerts.isEmpty, "短于 3 秒的零不记账、不报警")
+    }
+    do {  // 「有声音在放」时有时无：按零段内累计秒数算
+        var seq: [(Bool, Bool, Bool)] = [sound]
+        for _ in 0..<30 { seq.append(broken); seq.append((true, false, false)) }
+        let r = run(seq + [sound])
+        check(r.alerts == [40], "在放 / 没在放交替时，零段里累计 20 秒在放才报警（实际 \(r.alerts)）")
+    }
+    do {  // 恢复后再坏一次 → 再报一次
+        let r = run(Array(repeating: broken, count: 25) + [sound] + Array(repeating: broken, count: 25) + [sound])
+        check(r.alerts == [20, 46], "恢复以后再坏，再报一次（实际 \(r.alerts)）")
+    }
+    do {  // 忽略名单：只有名单里的 App 开着输出流（WorkSpaces 放静音）→ 不报警，日志里记 ignored=
+        var lines: [String] = [], alerts = 0
+        let g = ZeroGuard(log: { lines.append($0) }, alert: { _ in alerts += 1 })
+        for sec in 1...40 {
+            g.feed(ZeroGuard.Tick(cb: true, nonzero: false, playing: [], ignored: ["com.amazon.workspaces"],
+                                  wall: t0.addingTimeInterval(Double(sec)), rel: Double(sec)))
+        }
+        g.finish(wall: t0.addingTimeInterval(41), rel: 41)
+        check(alerts == 0, "只有忽略名单里的 App 在放：不报警")
+        check(lines.last?.contains("playing=0s") == true && lines.last?.contains("ignored=com.amazon.workspaces") == true,
+              "忽略名单里的 App 照样记进日志（ignored=）：\(lines.last ?? "")")
+    }
+    do {  // 名单里的和名单外的同时在放 → 照常报警，apps= 只写名单外的，通知文案带上 App 名
+        var lines: [String] = [], alerted: [[String]] = []
+        let g = ZeroGuard(log: { lines.append($0) }, alert: { alerted.append($0) })
+        for sec in 1...25 {
+            g.feed(ZeroGuard.Tick(cb: true, nonzero: false, playing: ["com.microsoft.teams2", "afplay"],
+                                  ignored: ["com.amazon.workspaces"],
+                                  wall: t0.addingTimeInterval(Double(sec)), rel: Double(sec)))
+        }
+        let alertLine = lines.first { $0.hasPrefix("TAP_ZERO_ALERT") } ?? ""
+        check(alerted == [["com.microsoft.teams2", "afplay"]]
+              && alertLine.contains("apps=com.microsoft.teams2,afplay ignored=com.amazon.workspaces"),
+              "名单外的 App 在放照常报警，日志里分开写 apps= 和 ignored=：\(alertLine)")
+        let msg = zeroAlertMessage("录音可能漏了：{apps} 在放声音", alerted.first ?? [])
+        check(msg == "录音可能漏了：com.microsoft.teams2, afplay 在放声音", "通知文案里写明是哪个 App：\(msg)")
+    }
+    do {  // 到停止录音时还在交零 → 退出时补记结束行
+        let r = run(Array(repeating: broken, count: 25), finishAt: 26)
+        check(r.lines.last?.hasPrefix("TAP_ZERO_END at 2026-11-18 12:01:33 (+26s) dur=26s") == true
+              && r.lines.last?.hasSuffix("(still zero at exit)") == true,
+              "停止时还没恢复：退出时补记结束行：\(r.lines.last ?? "")")
+    }
+    print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
+    exit(failures == 0 ? 0 : 1)
+}
+
 // MARK: - Main
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -1335,7 +1635,16 @@ guard let cmd = args.first else {
                                 --with-mic: 混入默认输入设备（麦克风）
                                 --level-file: 每 0.4s 写当前电平(dBFS)到文件，
                                 供波形显示读取（SIGINT/SIGTERM 停止并清理）
+                                --zero-alert-text: 有声音在放、tap 却全是零时弹的通知文案，
+                                {apps} 换成在放声音的 App（不给就只记日志、不弹通知）
+                                --zero-alert-ignore: 不算「有声音在放」的进程（逗号分隔的
+                                bundle ID 或可执行文件名），日志里照样记成 ignored=
       selftest-resample         重采样自检
+      selftest-zero-guard       零段记账 / 静音报警判断逻辑自检
+
+    环境变量（只用于验证）：
+      MEETAP_TAP_FAULT_ZERO_AFTER=N  从开录第 N 秒起把 tap 交来的数据清零（回调照常）
+      MEETAP_TAP_FAULT_ZERO_FOR=M    配合上一条：只清零 M 秒
 
     """, stderr)
     exit(1)
@@ -1354,6 +1663,8 @@ case "tap-start":
     var micLevelFile: String? = nil
     var withMic = false
     var outputRate = 48000.0
+    var zeroAlertText: String? = nil
+    var zeroAlertIgnore = Set<String>()
     var i = 1
     while i < args.count {
         if args[i] == "--output-rate", i + 1 < args.count, let r = Int(args[i + 1]), r > 0 {
@@ -1371,15 +1682,25 @@ case "tap-start":
         } else if args[i] == "--with-mic" {
             withMic = true
             i += 1
+        } else if args[i] == "--zero-alert-text", i + 1 < args.count {
+            zeroAlertText = args[i + 1]
+            i += 2
+        } else if args[i] == "--zero-alert-ignore", i + 1 < args.count {
+            // 逗号或空白分隔的 bundle ID / 可执行文件名
+            zeroAlertIgnore = Set(args[i + 1].split(whereSeparator: { $0 == "," || $0.isWhitespace })
+                                    .map(String.init))
+            i += 2
         } else {
-            fputs("Usage: tap-start [--output-rate HZ] [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH]\n", stderr)
+            fputs("Usage: tap-start [--output-rate HZ] [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH] [--zero-alert-text TEXT] [--zero-alert-ignore LIST]\n", stderr)
             exit(1)
         }
     }
     runTapStart(duration: duration, levelFile: levelFile, micLevelFile: micLevelFile, withMic: withMic,
-                outputRate: outputRate)
+                outputRate: outputRate, zeroAlertText: zeroAlertText, zeroAlertIgnore: zeroAlertIgnore)
 case "selftest-resample":
     runSelftestResample()
+case "selftest-zero-guard":
+    runSelftestZeroGuard()
 default:
     fputs("Unknown command: \(cmd)\n", stderr)
     exit(1)

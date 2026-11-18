@@ -18,7 +18,9 @@ CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
 CFG_VISUALIZER="dot"
 CFG_AUDIO_PERSIST=true
-CFG_AUDIO_CAPTURE="auto"
+CFG_AUDIO_CAPTURE="auto"   # 2.0 起只用 Process Tap；留着这一项只为认出老配置并提示删掉
+# 静音报警不算「有声音在放」的进程：这些 App 一直开着输出流、放的却是静音（实测 WorkSpaces）
+CFG_ZERO_ALERT_IGNORE="com.amazon.workspaces"
 CFG_EMAIL=""
 CFG_EMAIL_SENDER=""
 
@@ -79,6 +81,7 @@ load_config() {
             visualizer)            CFG_VISUALIZER="$val" ;;
             audio_persist)         CFG_AUDIO_PERSIST="$val" ;;
             audio_capture)         CFG_AUDIO_CAPTURE="$val" ;;
+            zero_alert_ignore)     CFG_ZERO_ALERT_IGNORE="$val" ;;
             email)                 CFG_EMAIL="$val" ;;
             email_sender)          CFG_EMAIL_SENDER="$val" ;;
         esac
@@ -2280,8 +2283,13 @@ start_recording() {
         local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level")
         $MUTE_MIC && mic_args=()
         _jobctl_on
+        # --zero-alert-text：有声音在放、tap 交出的却全是零时，audio-tap 弹的通知文案
+        # （{apps} 换成在放声音的 App；整场都查，零段起止记进 tap.log，stop 时随 audio-tap.log
+        # 存进会话）。--zero-alert-ignore：不算「有声音在放」的进程（配置 zero_alert_ignore）
         "$TAP_TOOL" tap-start --output-rate "$TAP_RATE" "${mic_args[@]}" \
             --level-file "$STATE_DIR/tap-level" \
+            --zero-alert-text "$(_tn NOTIFY_TAP_ZERO)" \
+            --zero-alert-ignore "$CFG_ZERO_ALERT_IGNORE" \
             < /dev/null > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
         TAP_PID=$!
         _jobctl_off
@@ -2355,6 +2363,8 @@ start_recording() {
 
         echo ""
         _t RECORDING_STARTED
+        # 故障注入开关开着：醒目提示，免得忘了关、把正式会议录成静音
+        [[ -n "${MEETAP_TAP_FAULT_ZERO_AFTER:-}" ]] && _t WARN_FAULT_INJECT "$MEETAP_TAP_FAULT_ZERO_AFTER"
         $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
         _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
         $MUTE_MIC && _t FIELD_MIC_MUTED
@@ -2739,6 +2749,7 @@ case "${1:-}" in
                     "  audio_persist         = $CFG_AUDIO_PERSIST" \
                     "  multi_language        = $CFG_MULTI_LANGUAGE" \
                     "  visualizer            = $CFG_VISUALIZER" \
+                    "  zero_alert_ignore     = ${CFG_ZERO_ALERT_IGNORE:-<none>}" \
                     "  email                 = ${CFG_EMAIL:-<not set>}" \
                     "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
                 echo ""
