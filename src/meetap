@@ -1253,6 +1253,19 @@ summarize_transcript() {
     fi
 }
 
+# 会话文件夹名：20YYMMDD_HHMM，后面可接 _会议名（start 生成的格式）
+SESSION_NAME_RE='^20[0-9]{6}_[0-9]{4}(_.*)?$'
+
+# recording_dir 第一层最新一场（按目录名排序，命名以时间戳开头天然有序）。
+# 只认会话名：用户手工按月聚合的 2026-10 这类文件夹也以 20 开头，不能算进候选。
+_latest_session_dir() {
+    local d latest=""
+    while IFS= read -r d; do
+        [[ "${d##*/}" =~ $SESSION_NAME_RE ]] && latest="$d"
+    done < <(find "$RECORDING_DIR" -mindepth 1 -maxdepth 1 -type d -name "20*" | sort)
+    printf '%s' "$latest"
+}
+
 # 找会话目录（again、mark 共用）。
 # resolve_session [目标]：目标为空 → recording_dir 第一层最新一场；
 # 目标是已存在的目录（绝对路径或相对当前目录）→ 用它；否则在 recording_dir 下按名字找。
@@ -1261,8 +1274,7 @@ summarize_transcript() {
 resolve_session() {
     local target="${1:-}" dir
     if [[ -z "$target" ]]; then
-        # 最近一次会议（按目录名排序，命名以时间戳开头天然有序）
-        dir=$(find "$RECORDING_DIR" -maxdepth 1 -type d -name "20*" | sort | tail -1)
+        dir=$(_latest_session_dir)
         [[ -n "$dir" ]] || return 2
     elif [[ -d "$target" ]]; then
         dir="$(cd -- "$target" && pwd)" || return 1

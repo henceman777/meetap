@@ -69,6 +69,22 @@ run again "$TMP/手工整理 的会议"
 run mark "$TMP/手工整理 的会议"
 [[ "$OUT" == *"没有找到纪要"*"手工整理 的会议"* ]] && pass "mark：非标准名字的目录写路径照旧能用" || fail "mark 非标准目录: $OUT"
 
+# 6. 取最新一场只认会话名：手工聚合的月份文件夹不算。
+#    2027-01 按名字排在 20261231_0900 后面，旧写法（-name "20*"）会把它当成最新一场
+mkdir -p "$REC/20261231_0900" "$REC/2027-01"
+run again
+[[ "$OUT" == *"重新执行会议任务: 20261231_0900"* ]] && pass "again：月份文件夹不会被当成最新一场" || fail "again 选中了月份文件夹: $OUT"
+run mark
+[[ "$OUT" == *"没有找到纪要"*"20261231_0900"* ]] && pass "mark：月份文件夹不会被当成最新一场" || fail "mark 选中了月份文件夹: $OUT"
+
+# 7. 第一层只有月份文件夹 → 算「一场会都没有」
+EMPTY_REC="$TMP/rec-only-months"
+mkdir -p "$EMPTY_REC/2026-10/20261008_1046"
+printf 'recording_dir = %s\nlanguage = zh-CN\n' "$EMPTY_REC" > "$XDG_CONFIG_HOME/meetap/config"
+run again
+[[ "$OUT" == *"下没有任何会议目录"* && $RC -ne 0 ]] && pass "again：只有月份文件夹时算没有会话" || fail "again 只有月份文件夹 (rc=$RC): $OUT"
+printf 'recording_dir = %s\nlanguage = zh-CN\n' "$REC" > "$XDG_CONFIG_HOME/meetap/config"
+
 kill -0 "$FAKE_FFMPEG" 2>/dev/null && pass "假录音进程未受影响" || fail "假录音进程被停了"
 
 echo
