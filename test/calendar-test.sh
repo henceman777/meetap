@@ -240,6 +240,76 @@ PROMPT=$(
 [[ "$PROMPT" == *"<会议资料>"*"### 资料: calendar.md"*"日历里的这场会"*"以录音为准"*"</会议资料>"* ]] \
     && pass "build_prompt 把 calendar.md 放进 <会议资料>" || fail "提示词里没有 calendar.md"
 
+# ── 12. meetap <文件夹>：多显示一行日历标题 ──
+lookup
+OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 </dev/null 2>&1)
+[[ "$OUT" == *"  日历：架构周会（12:00–13:00）"* ]] && pass "meetap <文件夹> 显示日历标题和时段" || fail "信息页: $OUT"
+S3="$TMP/rec/20261118_0900"; mkdir -p "$S3"
+OUT=$(cd "$TMP" && "$MEETAP" 20261118_0900 </dev/null 2>&1)
+[[ "$OUT" != *"日历："* ]] && pass "没有日历信息的会不显示日历那一行" || fail "不该显示日历: $OUT"
+
+# ── 13. 列标签时把日历标题当建议，只提示、不自动贴 ──
+OUT=$(cd "$TMP" && "$MEETAP" -g </dev/null 2>&1)
+[[ "$OUT" == *"日历标题：架构周会，要贴的话：meetap -g 架构周会"* ]] \
+    && pass "meetap -g：提示日历标题和要贴的话怎么写" || fail "默认目标的建议: $OUT"
+OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 -g </dev/null 2>&1)
+[[ "$OUT" == *"日历标题：架构周会，要贴的话：meetap 20261118_1201 -g 架构周会"* ]] \
+    && pass "meetap <文件夹> -g：建议的命令里带上文件夹" || fail "指定文件夹的建议: $OUT"
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["tags"] == ["周会"]' "$S/meta.json" \
+    && pass "只提示，没有自动贴标签" || fail "被自动贴了标签: $(cat "$S/meta.json")"
+(cd "$TMP" && "$MEETAP" 20261118_1201 -g 架构周会 </dev/null >/dev/null 2>&1)
+OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 -g </dev/null 2>&1)
+[[ "$OUT" != *"日历标题："* ]] && pass "日历标题已经是标签了就不再提示" || fail "还在提示: $OUT"
+python3 -I - "$S/meta.json" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1])); d["calendar"]["title"] = "Weekly Sync"; d["tags"] = ["周会"]
+json.dump(d, open(sys.argv[1], "w"), ensure_ascii=False)
+PYEOF
+OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 -g </dev/null 2>&1)
+[[ "$OUT" == *"要贴的话：meetap 20261118_1201 -g 'Weekly Sync'"* ]] && pass "标题带空格时，建议的命令加了引号，照抄能用" || fail "带空格的建议: $OUT"
+
+# ── 14. setup 的日历授权一步：只有这里会请求授权；拒绝、跳过都算通过 ──
+printf '#!/bin/bash\ncase "$1" in tap-supported) echo yes ;; tap-start) printf xxxx ;; *) exit 1 ;; esac\n' > "$APP/audio-tap"
+mkdir -p "$TMP/fakebin" "$TMP/home"
+for c in afplay osascript open; do printf '#!/bin/bash\necho "%s $*" >> "%s/sys.log"\n' "$c" "$TMP" > "$TMP/fakebin/$c"; done
+chmod +x "$APP/audio-tap" "$TMP/fakebin/"*
+setup_run() {   # setup_run <授权状态> <请求后的状态> <tty|notty> [TERM_PROGRAM]
+    echo "$1" > "$FAKE/status"; echo "$2" > "$FAKE/status-after"; rm -f "$FAKE/calls.log"
+    if [[ "$3" == tty ]]; then
+        OUT=$({ sleep 1; sleep 3; } | HOME="$TMP/home" TERM_PROGRAM="${4:-}" PATH="$TMP/fakebin:$PATH" script -q /dev/null "$MEETAP" setup 2>&1); RC=$?
+    else
+        OUT=$(cd "$TMP" && HOME="$TMP/home" TERM_PROGRAM="${4:-}" PATH="$TMP/fakebin:$PATH" "$MEETAP" setup </dev/null 2>&1); RC=$?
+    fi
+    REQ=$(grep -c '^calendar-request' "$FAKE/calls.log" 2>/dev/null)
+}
+setup_run fullAccess fullAccess notty
+[[ $RC -eq 0 && "$OUT" == *"【3/3】日历授权（可选）"* && "$OUT" == *"日历已授权，能读到 3 个日历"* && "$REQ" == 0 ]] \
+    && pass "已授权：显示能读到几个日历，不请求" || fail "已授权 (rc=$RC req=$REQ): $OUT"
+setup_run notDetermined fullAccess notty
+[[ $RC -eq 0 && "$OUT" == *"需要在终端里交互运行 meetap setup"* && "$REQ" == 0 ]] \
+    && pass "还没授权、没有终端：不请求，跳过" || fail "没终端 (rc=$RC req=$REQ): $OUT"
+setup_run notDetermined fullAccess tty
+[[ "$OUT" == *"马上会弹出授权框"* && "$OUT" == *"日历已授权，能读到 3 个日历"* && "$REQ" == 1 ]] \
+    && pass "还没授权、有终端：先说明用途，再请求一次" || fail "有终端请求 (req=$REQ): $OUT"
+setup_run notDetermined denied tty ghostty
+[[ "$OUT" == *"没有授权读日历"*"给 Ghostty 打开「完全访问」"*"重新打开 Ghostty"* && "$REQ" == 1 ]] \
+    && pass "用户拒绝：算通过，提示以后去哪儿打开（写出终端 App 名）" || fail "拒绝 (req=$REQ): $OUT"
+setup_run writeOnly writeOnly tty ghostty
+[[ "$OUT" == *"只有「写入」权限"*"系统设置 › 隐私与安全性 › 日历"*"把 Ghostty 改成「完全访问」"*"重新打开 Ghostty 才生效"* && "$REQ" == 1 ]] \
+    && pass "只有写入权限：请求一次升级；还不行就写明去哪儿改、改完要重开终端" || fail "只写 (req=$REQ): $OUT"
+setup_run writeOnly writeOnly notty Apple_Terminal
+[[ "$OUT" == *"把 终端 改成「完全访问」"* && "$REQ" == 0 ]] \
+    && pass "只有写入权限、没有终端：不请求，照样写明去哪儿改（苹果「终端」）" || fail "只写没终端 (req=$REQ): $OUT"
+setup_run denied denied notty
+[[ $RC -eq 0 && "$OUT" == *"没有授权读日历"* && "$REQ" == 0 ]] && pass "已拒绝：不再请求，退出码 0" || fail "已拒绝 (rc=$RC req=$REQ): $OUT"
+use_cfg "calendar = off"
+setup_run fullAccess fullAccess notty
+[[ "$OUT" == *"calendar = off，不读日历"* ]] && ! grep -q '^calendar-' "$FAKE/calls.log" 2>/dev/null \
+    && pass "calendar = off：setup 也不碰日历（没有任何 calendar- 调用）" || fail "off 时 setup: $(cat "$FAKE/calls.log")"
+use_cfg
+[[ ! -e "$TMP/sys.log" ]] || ! grep -qv '^afplay' "$TMP/sys.log" \
+    && pass "setup 没有打开系统设置、没有调用 osascript" || fail "setup 调用了: $(cat "$TMP/sys.log")"
+
 # ── 11. 中英两份提示语 key 一致 ──
 diff <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-zh-CN.sh" | sort) \
      <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-en-US.sh" | sort) >/dev/null \

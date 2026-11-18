@@ -2090,6 +2090,21 @@ _tag_update() {
     return 0
 }
 
+# 日历标题当标签建议（_read_tags 之后调用）：标题还不是这场的标签、也能当标签用时才提示
+_suggest_calendar_tag() {
+    local dir="$1" explicit="$2" title="$SESSION_CAL_TITLE" low t cmd
+    [[ -n "$title" ]] || return 0
+    _check_tag "$title" >/dev/null 2>&1 || return 0
+    title="$TAG_VALUE"
+    low=$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')
+    for t in "${SESSION_TAGS[@]}"; do
+        [[ "$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')" == "$low" ]] && return 0
+    done
+    cmd="$(basename "$0")"
+    [[ "$explicit" == true ]] && cmd+=" $(_shell_word "$(_session_ref "$dir")")"
+    _t TAGLIST_CAL_SUGGEST "$title" "$cmd -g $(_shell_word "$title")"
+}
+
 # 列出这场的标签，以及用过的全部标签和各自的场数
 _tag_list() {
     local dir="$1" explicit="$2" recording="$3" prefix="" cur n t
@@ -2099,6 +2114,7 @@ _tag_list() {
         if [[ "$recording" == true ]]; then prefix=$(_tn TARGET_RECORDING); else prefix=$(_tn TARGET_LATEST); fi
     fi
     _t TAGLIST_SESSION "$prefix" "$(_session_brief "$dir" "$recording")" "$cur"
+    _suggest_calendar_tag "$dir" "$explicit"
     while IFS=$'\t' read -r n t; do
         [[ "$n" =~ ^[0-9]+$ ]] || continue
         nums+=("$n"); names+=("$t")
@@ -2114,11 +2130,22 @@ _tag_list() {
 }
 
 # meetap <会话>：显示这场会的信息，不开录
-_session_info() {
-    local dir="$1" recording="$2" b="${1##*/}" rel title tags rd
+# 会话的写法：在 recording_dir 下就写相对路径（20261118_1201、2026-10/20261008_1046），否则写全路径
+_session_ref() {
+    local rd
     rd="$(cd -- "$RECORDING_DIR" 2>/dev/null && pwd)"
-    rel="$dir"
-    [[ -n "$rd" && "$dir" == "$rd/"* ]] && rel="${dir#"$rd/"}"
+    if [[ -n "$rd" && "$1" == "$rd/"* ]]; then printf '%s' "${1#"$rd/"}"; else printf '%s' "$1"; fi
+}
+
+# 日历时段的短写法：12:00–13:00（取 ISO 时间里的时分）
+_cal_span() {
+    [[ -n "$1" && -n "$2" ]] || return 0
+    printf '%s–%s' "${1:11:5}" "${2:11:5}"
+}
+
+_session_info() {
+    local dir="$1" recording="$2" b="${1##*/}" rel title tags
+    rel=$(_session_ref "$dir")
     title=$(_notes_title "$dir")
     if _read_tags "$dir"; then tags=$(_join_tags "${SESSION_TAGS[@]}"); else tags=$(_tn META_UNREADABLE); fi
     _t INFO_HEADER "$rel"
@@ -2130,6 +2157,7 @@ _session_info() {
     fi
     if [[ -n "$title" ]]; then _t INFO_NOTES "$title"; else _t INFO_NO_NOTES; fi
     _t INFO_TAGS "$tags"
+    [[ -n "$SESSION_CAL_TITLE" ]] && _t INFO_CALENDAR "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")"
     if [[ "$recording" == true ]]; then _t INFO_STATE_RECORDING; else _t INFO_STATE_ENDED; fi
 }
 
@@ -2907,6 +2935,55 @@ setup_tap() {
     return 1
 }
 
+# 当前终端 App 的名字（权限是授给它的）：TERM_PROGRAM 认得出的写名字，认不出写「你的终端 App」
+_terminal_app_name() {
+    case "${TERM_PROGRAM:-}" in
+        Apple_Terminal) _tn TERMINAL_APPLE ;;
+        ghostty)        printf 'Ghostty' ;;
+        iTerm.app)      printf 'iTerm' ;;
+        WarpTerminal)   printf 'Warp' ;;
+        vscode)         printf 'Visual Studio Code' ;;
+        "")             _tn TERMINAL_UNKNOWN ;;
+        *)              printf '%s' "$TERM_PROGRAM" ;;
+    esac
+}
+
+# setup：日历授权（可选）。整个 meetap 只有这里会请求日历授权（会弹授权框）；
+# 开录、停止、休眠自动停止、后台录音都只在已经授权时读。拒绝、跳过都算通过。
+setup_calendar() {
+    local st term
+    if [[ "$CFG_CALENDAR" != "on" ]]; then
+        _t SETUP_CAL_OFF
+        return 0
+    fi
+    if [[ ! -x "$TOOL" ]]; then
+        _t SETUP_CAL_UNAVAILABLE "$TOOL"
+        return 0
+    fi
+    term=$(_terminal_app_name)
+    st=$("$TOOL" calendar-status 2>/dev/null)
+    if [[ "$st" == notDetermined || "$st" == writeOnly ]]; then
+        if [[ -t 0 ]]; then
+            if [[ "$st" == writeOnly ]]; then _t SETUP_CAL_UPGRADE_ASK; else _t SETUP_CAL_ASK; fi
+            st=$("$TOOL" calendar-request 2>/dev/null)
+        elif [[ "$st" == notDetermined ]]; then
+            _t SETUP_CAL_NO_TTY
+            return 0
+        fi
+    fi
+    case "$st" in
+        fullAccess)
+            local n
+            n=$("$TOOL" calendar-count 2>/dev/null)
+            if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then _t SETUP_CAL_OK "$n"; else _t SETUP_CAL_NO_CALENDARS; fi
+            ;;
+        writeOnly)          _t SETUP_CAL_WRITE_ONLY "$term" "$term" ;;
+        denied|restricted)  _t SETUP_CAL_DENIED "$term" "$term" ;;
+        *)                  _t SETUP_CAL_UNKNOWN "${st:-?}" ;;
+    esac
+    return 0
+}
+
 setup_apps() {
     _require_macos || exit 1
     _t SETUP_HEADER
@@ -2931,6 +3008,11 @@ setup_apps() {
     _t SETUP_STEP_TAP
     _t SETUP_DIVIDER
     setup_tap
+    echo ""
+
+    _t SETUP_STEP_CALENDAR
+    _t SETUP_DIVIDER
+    setup_calendar
     echo ""
 
     _t SETUP_HEADER
