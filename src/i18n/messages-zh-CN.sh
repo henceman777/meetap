@@ -267,12 +267,12 @@ MSG_USAGE_TAG_SESSION="  <文件夹> -g 标签        给指定的那场贴标�
 MSG_USAGE_TAG_LIST="  [<文件夹>] -g           列出这场（不写就是最新一场）的标签，以及用过的全部标签和场数"
 MSG_USAGE_UNTAG="  [<文件夹>] --untag 标签 撤掉一个标签"
 MSG_USAGE_INFO="  <文件夹>                显示这场会的时间、时长、纪要标题和标签，不开录"
-MSG_USAGE_SETUP="  setup        首次使用跑一次：检查系统录音授权（Process Tap），从 1.x 升级的话顺带检查音频设置"
+MSG_USAGE_SETUP="  setup        首次使用跑一次：检查系统录音授权（Process Tap）、可选的日历授权，从 1.x 升级的话顺带检查音频设置；在几个终端里开录就在每个终端里各跑一次"
 MSG_USAGE_CONFIG="  config       打开编辑器修改配置（\$EDITOR）"
 MSG_USAGE_CONFIG_SHOW="  config show  显示当前配置"
 MSG_USAGE_VERSION="  version      显示版本号"
 MSG_USAGE_HELP="  help         显示本帮助（也可用 -h / --help）"
-MSG_USAGE_HINT="首次使用请先运行 meetap setup：检查系统录音授权；从 1.x 升级的话，顺带检查系统输出和会议 App 是否还指着 BlackHole"
+MSG_USAGE_HINT="首次使用请先运行 meetap setup：检查系统录音授权和日历授权（可选）；从 1.x 升级的话，顺带检查系统输出和会议 App 是否还指着 BlackHole。权限按终端 App 给，换终端要再跑一次"
 
 # ── 版本 ──
 MSG_VERSION_LINE="MeeTap v%s"

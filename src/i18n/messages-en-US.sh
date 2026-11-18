@@ -266,12 +266,12 @@ MSG_USAGE_TAG_SESSION="  <folder> -g tag         Tag a specific session (folder 
 MSG_USAGE_TAG_LIST="  [<folder>] -g           List this session's tags (latest if omitted) and all tags in use with counts"
 MSG_USAGE_UNTAG="  [<folder>] --untag tag  Remove a tag"
 MSG_USAGE_INFO="  <folder>                Show the session's time, duration, notes title and tags; does not record"
-MSG_USAGE_SETUP="  setup        Run once first: checks the system audio recording permission (Process Tap); after upgrading from 1.x it also checks your audio settings"
+MSG_USAGE_SETUP="  setup        Run once first: checks the system audio recording permission (Process Tap) and optional calendar access; after upgrading from 1.x it also checks your audio settings. Run it once in each terminal app you record from"
 MSG_USAGE_CONFIG="  config       Open config in \$EDITOR"
 MSG_USAGE_CONFIG_SHOW="  config show  Show current configuration"
 MSG_USAGE_VERSION="  version      Show version"
 MSG_USAGE_HELP="  help         Show this help (also -h / --help)"
-MSG_USAGE_HINT="First-time users please run meetap setup: it checks the system audio recording permission; after upgrading from 1.x it also checks whether system output or meeting apps still point at BlackHole"
+MSG_USAGE_HINT="First-time users please run meetap setup: it checks the system audio recording permission and optional calendar access; after upgrading from 1.x it also checks whether system output or meeting apps still point at BlackHole. Permissions are per terminal app, so run it again in a new terminal"
 
 # ── Version ──
 MSG_VERSION_LINE="MeeTap v%s"

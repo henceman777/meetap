@@ -57,6 +57,9 @@
    - Anthropic Claude Sonnet
    - Amazon Nova Pro
    - Meta Llama、Mistral、DeepSeek 等任意支持 Converse API 的模型
+4. **（可选）系统日历里有你的会议**：想让纪要用上日历里的会议名、组织者、参会人和议程，就在 **系统设置 › 互联网账户** 里加上公司账户（比如 Microsoft Exchange）并勾选「日历」。刚加的账户要等十几分钟才同步完。没有也不影响录音，只是纪要里没有日历信息。
+
+> **权限是按终端 App 给的**：系统录音和日历这两项权限，macOS 都是授给你运行 meetap 的**那个终端 App**（Ghostty、终端、iTerm 等），不是授给 meetap 本身。所以在几个终端里开录，就要**在每个终端里各跑一次 `meetap setup`**；在系统设置里改了权限，可能要**退出并重新打开那个终端 App** 才生效。
 
 ---
 
@@ -106,13 +109,14 @@ brew upgrade meetap        # 或源码安装：cd meetap && git pull && make ins
 meetap setup               # 升级后先跑一次
 ```
 
-`meetap setup` 会做两件事：
+`meetap setup` 会做三件事（在几个终端里开录，就在每个终端里各跑一次）：
 
 1. **检查从 1.x 留下的音频设置**（只在需要时出声）：
    - **系统输出还停在 `BlackHole 2ch` 上**（以前录音崩溃后没恢复）：知道原来用的设备、它也还连着，就自动切回并告诉你切到了哪个；不知道的话列出设备让你选，默认「保持不变」——你可能是有意给别的软件用的。`meetap start` 开录前也会做同样的检查，但不会因此不开录。
    - **Zoom 的扬声器还设成了 BlackHole**：提示你在 Zoom › 设置 › 音频 › 扬声器 里改回「与系统相同」。只提示，不改 Zoom 的配置。
    - **系统里还装着 BlackHole**：提醒你检查 Teams、腾讯会议的扬声器是不是还选着 BlackHole 2ch（以前的 `setup` 让你这样选过），是的话改回系统默认或你的扬声器、耳机。
 2. **检查系统录音授权**（Process Tap）：做一次 2 秒实测（会播一声提示音）；如果录到静音，就打开 **系统设置 › 隐私与安全性 › 屏幕与系统录音**，引导你把终端 App（Ghostty / Terminal / iTerm 等）加进"仅系统录音"并复测。1.5.0 以前一直走 BlackHole 的用户从没授过这项权限，这一步必须做；部分终端（如 Ghostty）不会自动弹授权框，要手动添加。
+3. **日历授权（可选）**：见下文「日历里的会议信息」。拒绝也不影响录音。
 
 另外：
 
@@ -137,7 +141,7 @@ aws configure
 
 确保你的 AWS 账号具备以下权限（完整清单见附录）：`s3:PutObject/GetObject/DeleteObject`、`transcribe:*TranscriptionJob`、`bedrock:InvokeModelWithResponseStream`、（可选 SES 发邮件）`ses:SendRawEmail`。
 
-### 2. 音频录制授权（仅首次）
+### 2. 录音和日历授权（每个终端各一次）
 
 ```bash
 meetap setup
@@ -145,8 +149,9 @@ meetap setup
 
 - **检测并引导 Process Tap 授权**——`setup` 会做一次 2 秒实测；若为静音，会自动打开 系统设置 › 隐私与安全性 › 屏幕与系统录音，引导你把终端 App 加进"仅系统录音"，按提示复测。这是唯一需要的一次性准备。
 - **检查从 1.x 升级留下的音频设置**——系统输出、Zoom / Teams / 腾讯会议的扬声器是不是还指着 BlackHole，详见上文「从 1.x 升级到 2.0」。会议 App 的扬声器不需要任何配置：Process Tap 采集整个系统混音，与会议 App 的扬声器设置无关。
+- **日历授权（可选）**——还没授权时，说明用途后请求一次（会弹授权框），拒绝也算通过。整个 meetap 只有 `setup` 会请求日历授权，开录、停止、休眠自动停止、后台录音都不会弹框，只在已经授权时读。如果只有「写入」权限（读不到会议），`setup` 会写明去 **系统设置 › 隐私与安全性 › 日历** 把当前终端 App 改成「完全访问」，改完可能要重开终端。
 
-授权完成后，除非更换终端 App 或系统升级导致权限变动，否则不需再跑。
+权限是授给终端 App 的：**换了终端 App、或在另一个终端里开录，就在那个终端里再跑一次 `meetap setup`**；在系统设置里改了权限后，可能要退出并重新打开那个终端 App 才生效。
 
 ### 3. （可选）修改默认配置
 
@@ -169,6 +174,7 @@ meetap config show      # 查看当前所有配置项
 | `email` | 空 | 纪要收件人，留空则跳过邮件 |
 | `email_sender` | 空 | SES 已验证的发件人，设了 email 必填 |
 | `zero_alert_ignore` | `com.amazon.workspaces` | 静音报警时不算"在放声音"的 App（逗号分隔的 bundle ID 或命令行程序名），见下 |
+| `calendar` | `on` | 停止录音后读系统日历补充会议信息（`on` / `off`），`off` 时完全不碰日历，见「日历里的会议信息」 |
 
 **`zero_alert_ignore` 是干什么的**：录音期间如果有 App 在放声音、录到的却全是零（多半是系统录音授权失效，或系统采集中途出了故障），meetap 会在 30 秒内弹通知，写明是哪个 App 在放。有的 App 一直开着音频输出、其实放的是静音（比如 Amazon WorkSpaces 客户端），会被误当成"在放声音"，每次提前开录都误报，所以要排除掉。**什么时候往里加**：收到这条通知、但当时其实没有任何声音在放，就把通知里那个 App 后面**括号里那一串**加进来——通知写的是"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"，要加的是 `com.google.Chrome.helper`；命令行程序没有括号，直接加程序名。多个用逗号隔开。名单里的 App 只是不再触发报警，会话的 `log/audio-tap.log` 里照样记（`ignored=`）。
 
@@ -243,12 +249,23 @@ $ meetap start -m -d 150
 $ meetap stop
 
 ⏳ 等待录制完成...
-🔊 音频输出已恢复: MacBook Pro Speakers
 ✅ 音频采样成功
 📝 后台转录已启动（完成后会收到通知）
 ```
 
 `stop` 命令会立刻返回，转录和纪要生成在后台跑（30s~几分钟，看会议长度）。完成后 macOS 右上角会弹通知。
+
+### 📅 日历里的会议信息（可选）
+
+授权过日历（见「一次性配置」）以后，每次停止录音，meetap 会按**这场录音的实际起止时间**去系统日历里找对应的会，把会议信息写进会话的 `materials/calendar.md`，生成纪要时和别的资料一起读进去，人名、议题更准。
+
+- **怎么找**：和录音时间有重叠的会里，重叠最长的就是这场会（提前开录、会议拖堂都没关系）；重叠不到 5 分钟的不算（录音不到 10 分钟时按录音时长的一半）。全天事件、已取消的、你已拒绝的不算。同一时段别的会只记标题，不写进 `calendar.md`。
+- **写什么**：标题、起止时间、组织者、参会人、地点、会议说明。开头写明"来自系统日历，是会前的安排，实际讨论以录音为准"——议程不等于会上真讲了什么。
+- **不写什么**：会议链接、会议号、密码、拨入电话这类入会信息会删掉，不进纪要和邮件；参会人超过 30 位时只列组织者和前 20 位，并写明总人数；文件里不出现邮箱。
+- **当标签建议**：日历标题存进 `meta.json`。`meetap <文件夹>` 会显示"日历：标题（12:00–13:00）"；`meetap -g` 列标签时，标题还不是这场的标签就提示"要贴的话：meetap -g 标题"——只提示，标签照旧由你自己贴。
+- **查不到不出声**：没授权、日历没同步、没找到对应的会、查询超时（上限 10 秒），都直接跳过，不影响转录和纪要，只在会话的 `log/meetap.log` 里记一行 📅。
+- **补查**：休眠自动结束的那场，唤醒后跑 `meetap again` 时会补查；`meetap again` 遇到还没有 `calendar.md` 的老会议也会补查。已经有 `calendar.md`（查过、或你自己放的）就不再查、不覆盖；想重查就先删掉它。
+- **不想用**：配置里写 `calendar = off`，完全不碰日历。
 
 ### 断点续跑 / 重新生成纪要
 
@@ -315,8 +332,8 @@ meetap 20261118_1201                   # 显示这场会的时间、时长、纪
 ├── meeting-notes.md       ← 结构化纪要（主要看这个）
 ├── meeting-notes.html     ← 排版后的 HTML 版
 ├── meeting-notes.pdf      ← 用于邮件附件的 PDF（若配了邮件）
-├── materials/             ← （可选）放参考资料，重新生成时注入
-├── meta.json              ← （贴过标签才有）会议标签等元信息
+├── materials/             ← （可选）放参考资料，重新生成时注入；calendar.md 是从日历查到的这场会
+├── meta.json              ← （贴过标签或查到日历才有）会议标签、日历标题等元信息
 └── log/
     ├── transcript.txt     ← 带说话人标签的转录
     ├── speaker-stats.txt  ← 每人发言时长占比
@@ -432,6 +449,7 @@ sequenceDiagram
 | 音频采集有回声 | 戴耳机采集；外放会把扬声器声音二次采入 |
 | 系统通知没弹出 | 系统设置 → 通知 → 允许 "终端" 或 "Script Editor" 发送通知 |
 | 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零。先看通知里写的是哪个 App：它当时其实没出声（一直开着输出流的 App），就把通知里括号里那一串（bundle ID）加进配置 `zero_alert_ignore`；确实在开会，就跑 `meetap setup` 检查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间在会话的 `log/audio-tap.log` 里（`TAP_ZERO_*`） |
+| `materials/` 里没有 `calendar.md` / 纪要里没用上日历 | 看会话的 `log/meetap.log` 里那一行 📅：写着"没有读取权限"，就在你开录的那个终端里跑一次 `meetap setup`（只有「写入」权限要在 系统设置 › 隐私与安全性 › 日历 改成「完全访问」，改完可能要重开终端）；写着"没有对应的会"，检查 系统设置 › 互联网账户 里的日历是否已同步，或这场录音和日历里的会是否重叠不到 5 分钟；配置里 `calendar = off` 时不会查 |
 | 从 1.x 升级后听不到声音 | 系统输出或会议 App 的扬声器还指着 BlackHole 2ch。跑一次 `meetap setup`，或在 系统设置 › 声音 › 输出、会议 App 的音频设置里改回扬声器 / 耳机 |
 
 ---
@@ -529,7 +547,8 @@ src/
 ├── meetap                    # bash 主控脚本
 ├── audio-tap.swift           # Core Audio Process Tap 采集 + 麦克风进程内混音（macOS 14.4+）
 ├── audio-tap-Info.plist      # 嵌入 audio-tap 的音频录制权限描述
-├── audio-multi-output.swift  # CoreAudio 设备查询 / 切换默认输出（升级迁移用）+ 休眠自动结束（sleep-watch）
+├── audio-multi-output.swift  # CoreAudio 设备查询 / 切换默认输出（升级迁移用）+ 休眠自动结束（sleep-watch）+ 日历查询（EventKit）
+├── audio-multi-output-Info.plist  # 嵌入 audio-multi-output 的日历用途说明
 └── i18n/                     # CLI 双语消息表
 ```
 

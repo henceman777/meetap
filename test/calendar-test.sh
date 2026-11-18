@@ -310,6 +310,34 @@ use_cfg
 [[ ! -e "$TMP/sys.log" ]] || ! grep -qv '^afplay' "$TMP/sys.log" \
     && pass "setup 没有打开系统设置、没有调用 osascript" || fail "setup 调用了: $(cat "$TMP/sys.log")"
 
+# ── 15. 挂接点：转录开始前查（stop 的后台流程和 again 从转录重跑走的是同一个 transcribe_recording）──
+#        用 again 来测，不碰 stop 里的全局 pkill；假 aws 只让它走到凭证检查，不上传
+if command -v ffmpeg >/dev/null; then
+    for c in aws; do printf '#!/bin/bash\necho "%s $*" >> "%s/aws.log"\nexit 1\n' "$c" "$TMP" > "$TMP/fakebin/$c"; done
+    chmod +x "$TMP/fakebin/aws"
+    S4="$TMP/rec/20261118_1500"; mkdir -p "$S4/materials"
+    ffmpeg -v quiet -f lavfi -i "sine=frequency=1000:duration=65" -c:a aac "$S4/meeting_20261118_150005.m4a" </dev/null
+    rm -f "$FAKE/calls.log" "$TMP/aws.log"
+    OUT=$(cd "$TMP" && HOME="$TMP/home" PATH="$TMP/fakebin:$PATH" "$MEETAP" again "$S4" </dev/null 2>&1)
+    s4=$(date -j -f "%Y%m%d_%H%M%S" 20261118_150005 +%s)
+    grep -q -- "calendar-query --start $s4 --end $((s4 + 65)) " "$FAKE/calls.log" && [[ -f "$S4/materials/calendar.md" ]] \
+        && grep -q '这场会是「架构周会」' "$S4/log/meetap.log" \
+        && pass "转录开始前查日历：按音频算时段、写 calendar.md、日志里记一行" || fail "转录前没查日历: $(cat "$FAKE/calls.log" 2>/dev/null)"
+    [[ "$(cat "$TMP/aws.log" 2>/dev/null)" == "aws sts get-caller-identity"* && $(grep -c . "$TMP/aws.log") -eq 1 ]] \
+        && pass "这条测试没有上传任何东西（假 aws 只被问了凭证）" || fail "aws 调用: $(cat "$TMP/aws.log" 2>/dev/null)"
+    # again 只重跑纪要（已有转录）：也会补查；没有 venv，生成纪要那步不碰 AWS
+    S5="$TMP/rec/20261118_1600"; mkdir -p "$S5/materials" "$S5/log"
+    cp "$S4/meeting_20261118_150005.m4a" "$S5/meeting_20261118_160005.m4a"
+    echo "spk_0: 你好" > "$S5/log/transcript.txt"
+    rm -f "$FAKE/calls.log" "$TMP/aws.log"
+    OUT=$(cd "$TMP" && HOME="$TMP/home" PATH="$TMP/fakebin:$PATH" "$MEETAP" again "$S5" </dev/null 2>&1)
+    [[ -f "$S5/materials/calendar.md" && "$OUT" == *"这场会是「架构周会」"* && ! -e "$TMP/aws.log" ]] \
+        && pass "again 只重跑纪要时也补查日历（老会议、休眠结束的会）" || fail "again 纪要路径没补查: $OUT"
+    grep -q 'calendar-request' "$FAKE/calls.log" && fail "转录 / again 流程请求了授权" || pass "转录 / again 流程从不请求授权"
+else
+    echo "SKIP: 没装 ffmpeg，跳过挂接点的用例"
+fi
+
 # ── 11. 中英两份提示语 key 一致 ──
 diff <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-zh-CN.sh" | sort) \
      <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-en-US.sh" | sort) >/dev/null \
