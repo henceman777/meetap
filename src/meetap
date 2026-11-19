@@ -2399,9 +2399,23 @@ _warn_old_capture_config() {
     return 0
 }
 
+# BlackHole 的驱动文件还在不在（.driver 装在 HAL 插件目录里）。brew 卸载后驱动文件没了，
+# 但 coreaudiod 没重启的话设备列表里还挂着 BlackHole 2ch——只看设备列表会误以为还装着。
+# MEETAP_HAL_PLUGIN_DIRS 只给测试用（冒号分隔），用来模拟两种情况，不碰系统目录。
+_blackhole_driver_installed() {
+    local dirs="${MEETAP_HAL_PLUGIN_DIRS:-/Library/Audio/Plug-Ins/HAL:$HOME/Library/Audio/Plug-Ins/HAL}" d f
+    local IFS=:
+    for d in $dirs; do
+        for f in "$d"/BlackHole*.driver; do
+            [[ -e "$f" ]] && return 0
+        done
+    done
+    return 1
+}
+
 # setup：会议 App 的扬声器是不是还指着 BlackHole（只读，不改任何 App 的配置）。
 # Zoom 的设置在 viper.ini 里（设备名的十六进制）读得出来；Teams、腾讯会议读不到配置，
-# 系统里还装着 BlackHole 时提示一句怎么检查。
+# 设备列表里还有 BlackHole 时提示一句怎么检查——驱动还在、和驱动已删但设备还挂着，说法不同。
 _check_meeting_apps() {
     local ini="$HOME/Library/Application Support/zoom.us/data/viper.ini" k v name zoom_bh=""
     if [[ -f "$ini" ]]; then
@@ -2413,7 +2427,11 @@ _check_meeting_apps() {
         [[ -n "$zoom_bh" ]] && _t MIGRATE_ZOOM_ON_BH "$zoom_bh"
     fi
     if [[ -x "$TOOL" ]] && "$TOOL" list 2>/dev/null | grep -q 'BlackHole'; then
-        _t MIGRATE_APPS_BH_HINT
+        if _blackhole_driver_installed; then
+            _t MIGRATE_APPS_BH_HINT
+        else
+            _t MIGRATE_BH_UNINSTALLED_HINT
+        fi
     fi
 }
 

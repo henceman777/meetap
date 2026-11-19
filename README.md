@@ -120,7 +120,7 @@ meetap setup               # 升级后先跑一次
 
 另外：
 
-- **BlackHole 可以卸载**：`brew uninstall --cask blackhole-2ch`。2.0 不再用它，卸不卸由你定——别的软件还在用的话就留着。
+- **BlackHole 可以卸载**：`brew uninstall --cask blackhole-2ch`。2.0 不再用它，卸不卸由你定——别的软件还在用的话就留着。卸载后驱动文件就删了，但设备列表里可能还挂着 `BlackHole 2ch`，要重启电脑（或 `sudo killall coreaudiod`）才会消失；在那之前别把它选成输出设备，`meetap setup` 也会这样提示。
 - **配置里的 `audio_capture = blackhole` 可以删掉**：2.0 起这一项不起作用，录音照样走 Process Tap，`start` / `setup` 会提示一句。
 - `meetap setup-zoom` / `setup-teams` / `setup-wemeet` 只会提示"2.0 起不需要配置会议 App 的扬声器"。
 - 授权没生效时没有别的采集方式可以退，会录成静音。所以 2.0 加了**静音报警**：录音期间只要有 App 在放声音、录到的却全是零，30 秒内弹通知（见「日常使用」）。

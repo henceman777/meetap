@@ -60,6 +60,9 @@ chmod +x "$APP"/meetap "$APP"/audio-* "$FAKE"/*
 
 export PATH="$FAKE:/usr/bin:/bin"
 export HOME="$TMP/home"
+# BlackHole 驱动目录：指到临时目录，不看系统的 /Library/Audio/Plug-Ins/HAL
+HAL="$TMP/hal"; mkdir -p "$HAL/BlackHole2ch.driver"
+export MEETAP_HAL_PLUGIN_DIRS="$HAL"
 export MEETAP_STATE_DIR="$TMP/state"
 export XDG_CONFIG_HOME="$TMP/xdg"
 mkdir -p "$MEETAP_STATE_DIR" "$XDG_CONFIG_HOME/meetap"
@@ -174,6 +177,22 @@ devices "MacBook Pro Speakers|BuiltInSpeakerDevice|91"
 run setup
 [[ "$OUT" != *"Zoom 的扬声器还设成了"* && "$OUT" != *"Teams 或腾讯会议"* ]] \
     && pass "setup：Zoom 跟随系统、没装 BlackHole 时不提示" || fail "setup 不该提示 (rc=$RC): $OUT"
+
+# ── 7b. BlackHole 驱动已删、设备还挂在列表里（brew 卸载后没重启 coreaudiod）──
+devices "MacBook Pro Speakers|BuiltInSpeakerDevice|91" "BlackHole 2ch|BlackHole2ch_UID|93"
+printf '[General]\nAECSPK=%s\n' "$(hex 'Same as System')" > "$ZOOM_INI"
+run setup
+[[ "$OUT" == *"系统里还装着 BlackHole"* && "$OUT" != *"BlackHole 已卸载"* ]] \
+    && pass "驱动还在：照旧提示「系统里还装着 BlackHole」" || fail "驱动还在 (rc=$RC): $OUT"
+rm -rf "$HAL/BlackHole2ch.driver"
+run setup
+[[ "$OUT" == *"BlackHole 已卸载"*"重启电脑（或 sudo killall coreaudiod）后才会从设备列表里消失"*"别把它选成输出设备"* \
+   && "$OUT" == *"Teams 或腾讯会议"* && "$OUT" != *"系统里还装着 BlackHole"* ]] \
+    && pass "驱动已删、设备还挂着：提示已卸载、重启后消失、先别选它，Teams/腾讯会议那句照留" || fail "驱动已删 (rc=$RC): $OUT"
+devices "MacBook Pro Speakers|BuiltInSpeakerDevice|91"
+run setup
+[[ "$OUT" != *"BlackHole"* ]] && pass "驱动已删、设备也不在了：不提示" || fail "不该提示: $OUT"
+mkdir -p "$HAL/BlackHole2ch.driver"
 
 # ── 8. 老配置 audio_capture = blackhole：提示删掉这一行，照样往下走（走 Tap）──
 devices "MacBook Pro Speakers|BuiltInSpeakerDevice|91"

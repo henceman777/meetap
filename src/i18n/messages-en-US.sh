@@ -172,6 +172,7 @@ MSG_MIGRATE_OUTPUT_SWITCH_FAILED="❌ Couldn't switch to %s; please choose it in
 MSG_MIGRATE_OUTPUT_KEPT="   System output left as %s"
 MSG_MIGRATE_ZOOM_ON_BH="⚠️  Zoom's speaker is still set to %s, so you won't hear others in meetings. Open Zoom › Settings › Audio › Speaker and choose \"Same as System\""
 MSG_MIGRATE_APPS_BH_HINT="ℹ️  BlackHole is still installed. If you once set the speaker in Teams or Tencent Meeting to BlackHole 2ch, change it back to the system default or your speakers/headphones: Teams › Settings › Devices › Speaker; Tencent Meeting › Settings › Audio › Speaker. BlackHole is no longer needed as of 2.0; uninstalling it is up to you (brew uninstall --cask blackhole-2ch)"
+MSG_MIGRATE_BH_UNINSTALLED_HINT="ℹ️  BlackHole has been uninstalled, but BlackHole 2ch is still in the device list: it disappears only after a restart (or sudo killall coreaudiod); until then, don't pick it as an output device. If you once set the speaker in Teams or Tencent Meeting to BlackHole 2ch, change it back to the system default or your speakers/headphones: Teams › Settings › Devices › Speaker; Tencent Meeting › Settings › Audio › Speaker"
 MSG_SETUP_STEP_MIGRATE="[1/3] Check audio settings (upgrade from 1.x)"
 MSG_SETUP_MIGRATE_SKIP_RECORDING="   A recording is in progress; skipping the system output check"
 MSG_SETUP_MIGRATE_DONE="   Done"

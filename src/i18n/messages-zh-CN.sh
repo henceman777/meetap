@@ -173,6 +173,7 @@ MSG_MIGRATE_OUTPUT_SWITCH_FAILED="❌ 切到 %s 没成功，请在 系统设置 
 MSG_MIGRATE_OUTPUT_KEPT="   系统输出保持 %s 不变"
 MSG_MIGRATE_ZOOM_ON_BH="⚠️  Zoom 的扬声器还设成了 %s，开会时你会听不到对方。请打开 Zoom › 设置 › 音频 › 扬声器，改成「与系统相同」"
 MSG_MIGRATE_APPS_BH_HINT="ℹ️  系统里还装着 BlackHole。如果你以前在 Teams 或腾讯会议里把扬声器选成了 BlackHole 2ch，请改回「系统默认」或你的扬声器、耳机：Teams 在 设置 › 设备 › 扬声器；腾讯会议在 设置 › 音频 › 扬声器。2.0 起不再需要 BlackHole，卸不卸由你定（brew uninstall --cask blackhole-2ch）"
+MSG_MIGRATE_BH_UNINSTALLED_HINT="ℹ️  BlackHole 已卸载，但设备列表里还挂着 BlackHole 2ch：重启电脑（或 sudo killall coreaudiod）后才会从设备列表里消失；在那之前别把它选成输出设备。如果你以前在 Teams 或腾讯会议里把扬声器选成了 BlackHole 2ch，请改回「系统默认」或你的扬声器、耳机：Teams 在 设置 › 设备 › 扬声器；腾讯会议在 设置 › 音频 › 扬声器"
 MSG_SETUP_STEP_MIGRATE="【1/3】检查音频设置（从 1.x 升级）"
 MSG_SETUP_MIGRATE_SKIP_RECORDING="   正在录音，先不检查系统输出设备"
 MSG_SETUP_MIGRATE_DONE="   检查完毕"
