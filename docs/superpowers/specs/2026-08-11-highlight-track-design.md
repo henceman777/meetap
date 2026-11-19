@@ -1,5 +1,7 @@
 # MeeTap Highlight Track 设计（纪要要点高亮）
 
+> 注：这个命令后来改名为 `meetap mark`。下文写的 `meetap highlight` 就是现在的 `meetap mark`（函数名 `highlight_notes`、模板 `highlight.md` 没改名）。
+
 > 状态：已确认，待实现
 > 日期：2026-08-11
 > 所属：CLI v1.5 线新轨道（轨道7）

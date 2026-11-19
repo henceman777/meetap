@@ -36,7 +36,10 @@ pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAIL=1; }
 run() { OUT=$(cd "$TMP" && "$MEETAP" "$@" </dev/null 2>&1); RC=$?; }
 # 读出 meta.json 里的标签，一行一个
-tags_of() { "$PY" -I -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1], encoding="utf-8"))["tags"]))' "$1/meta.json"; }
+# meta.json 在哪：新位置 .meetap/ 优先，没有再看根目录的老文件
+mp() { if [[ -f "$1/.meetap/meta.json" || ! -f "$1/meta.json" ]]; then echo "$1/.meetap/meta.json"; else echo "$1/meta.json"; fi; }
+has_meta() { [[ -e "$1/.meetap/meta.json" || -e "$1/meta.json" ]]; }
+tags_of() { "$PY" -I -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1], encoding="utf-8"))["tags"]))' "$(mp "$1")"; }
 NOW="$(date +%Y%m%d_%H%M)"
 TODAY="$(date +%Y-%m-%d)"
 
@@ -51,7 +54,7 @@ expected="$(printf '%s\n' "${TRICKY[@]}" '前后空格')"
 [[ $RC -eq 0 && "$(tags_of "$S1")" == "$expected" ]] \
     && pass "中文、空格、引号、反斜杠、\$、%、emoji 的标签读出来一字不差（首尾空白去掉）" \
     || fail "标签读写不一致 (rc=$RC): $(tags_of "$S1" 2>&1) / $OUT"
-"$PY" -m json.tool "$S1/meta.json" >/dev/null && pass "meta.json 通过 python3 -m json.tool" || fail "meta.json 不是合法 JSON"
+"$PY" -m json.tool "$S1/.meetap/meta.json" >/dev/null && pass "meta.json 通过 python3 -m json.tool" || fail "meta.json 不是合法 JSON"
 [[ "$OUT" == *"已给 03-01 09:00"*"贴上："*'客户"B"'* ]] || [[ "$OUT" == *"已给 2026-03-01 09:00"* ]] \
     && pass "回显里看得出是哪一场" || fail "回显不对: $OUT"
 
@@ -67,6 +70,7 @@ run 20260301_0900 --untag 不存在的标签
     && pass "撤一个本来没有的标签：提示一句，退出码 0" || fail "撤不存在的标签 (rc=$RC): $OUT"
 
 # 原子写：目录里不留临时文件
+[[ -f "$S1/.meetap/meta.json" && ! -e "$S1/meta.json" ]] && pass "meta.json 写在 .meetap/ 里，根目录没有" || fail "meta.json 位置不对: $(ls -A "$S1")"
 [[ -z "$(find "$S1" -name '.meta.*')" ]] && pass "写完不留临时文件" || fail "有残留临时文件: $(ls -a "$S1")"
 
 # ── 2. 不认识的字段原样保留 ──
@@ -81,13 +85,14 @@ cat > "$S2/meta.json" <<'EOF'
   "future_field": 42
 }
 EOF
-cal_of() { "$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(json.dumps([d.get("calendar"), d.get("future_field")], ensure_ascii=False, sort_keys=True))' "$S2/meta.json"; }
+cal_of() { "$PY" -I -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(json.dumps([d.get("calendar"), d.get("future_field")], ensure_ascii=False, sort_keys=True))' "$(mp "$S2")"; }
 before="$(cal_of)"
 run 20260302_0900 -g 周会
 run 20260302_0900 --untag 周会
 run 20260302_0900 -g 客户A
 [[ "$(cal_of)" == "$before" && "$(tags_of "$S2")" == "客户A" ]] \
-    && pass "贴、撤标签之后 calendar 等不认识的字段还在、值不变" || fail "不认识的字段变了: $(cat "$S2/meta.json")"
+    && pass "贴、撤标签之后 calendar 等不认识的字段还在、值不变" || fail "不认识的字段变了: $(cat "$(mp "$S2")")"
+[[ -f "$S2/.meetap/meta.json" && ! -e "$S2/meta.json" ]] && pass "根目录的老 meta.json：写一次就挪进 .meetap/，不留两份" || fail "老文件没挪: $(ls -A "$S2")"
 
 # ── 3. meta.json 坏了：不覆盖 ──
 S3="$REC/20260303_0900"
@@ -104,7 +109,7 @@ rm -f "$S3/meta.json"
 # ── 4. 相近标签提示、全部标签统计（含月份文件夹） ──
 mkdir -p "$REC/2026-10/20261008_1046" "$REC/2026-10/20261009_1000" "$REC/其他/20261010_1000" "$REC/2026-10/深一层/20261011_1000"
 run 2026-10/20261008_1046 -g 团队周会
-[[ $RC -eq 0 && -f "$REC/2026-10/20261008_1046/meta.json" ]] && pass "月份文件夹里的老会议写路径能贴" || fail "月份文件夹路径 (rc=$RC): $OUT"
+[[ $RC -eq 0 && -f "$REC/2026-10/20261008_1046/.meetap/meta.json" ]] && pass "月份文件夹里的老会议写路径能贴" || fail "月份文件夹路径 (rc=$RC): $OUT"
 run 2026-10/20261009_1000 -g 团队周会
 for d in "$REC/其他/20261010_1000" "$REC/2026-10/深一层/20261011_1000"; do
     printf '{"schema": 1, "tags": ["不该计入"]}\n' > "$d/meta.json"
@@ -144,10 +149,10 @@ OLD="$TMP/rec-old"
 mkdir -p "$OLD/20250101_0900"
 use_rec "$OLD"
 run -g '周会 A'
-[[ $RC -ne 0 && ! -e "$OLD/20250101_0900/meta.json" && "$OUT" == *"meetap 20250101_0900 -g '周会 A'"* ]] \
+[[ $RC -ne 0 ]] && ! has_meta "$OLD/20250101_0900" && [[ "$OUT" == *"meetap 20250101_0900 -g '周会 A'"* ]] \
     && pass "没终端：拒绝、不写文件、提示写明文件夹（带空格的标签加引号）" || fail "没终端的护栏 (rc=$RC): $OUT"
 run --untag 周会
-[[ $RC -ne 0 && ! -e "$OLD/20250101_0900/meta.json" ]] && pass "--untag 不写文件夹时也过护栏" || fail "--untag 护栏 (rc=$RC): $OUT"
+[[ $RC -ne 0 ]] && ! has_meta "$OLD/20250101_0900" && pass "--untag 不写文件夹时也过护栏" || fail "--untag 护栏 (rc=$RC): $OUT"
 run -g
 [[ $RC -eq 0 ]] && pass "只列标签（只读）不过护栏" || fail "列标签被护栏拦了 (rc=$RC): $OUT"
 
@@ -162,12 +167,12 @@ pty_run() {
     RC=$?
 }
 pty_run n
-[[ ! -e "$OLD/20250101_0900/meta.json" && "$OUT" == *"确定改它的标签吗"*"[y/N]: n"* && "$OUT" == *"已取消"* ]] \
+! has_meta "$OLD/20250101_0900" && [[ "$OUT" == *"确定改它的标签吗"*"[y/N]: n"* && "$OUT" == *"已取消"* ]] \
     && pass "有终端：先问，答 n 不写文件" || fail "有终端答 n (rc=$RC): $OUT"
 pty_run y
 [[ "$OUT" == *"[y/N]: y"* && "$(tags_of "$OLD/20250101_0900" 2>/dev/null)" == "周会" ]] \
     && pass "有终端：答 y 才写" || fail "有终端答 y (rc=$RC): $OUT"
-rm -f "$OLD/20250101_0900/meta.json"
+rm -f "$OLD/20250101_0900/meta.json" "$OLD/20250101_0900/.meetap/meta.json"
 run 20250101_0900 -g 周会
 [[ $RC -eq 0 && "$(tags_of "$OLD/20250101_0900")" == "周会" ]] && pass "写明文件夹时不问，直接写" || fail "写明文件夹 (rc=$RC): $OUT"
 use_rec "$REC"

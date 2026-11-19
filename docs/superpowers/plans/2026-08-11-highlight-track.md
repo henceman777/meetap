@@ -1,5 +1,7 @@
 # Highlight Track 实现计划（纪要要点高亮）
 
+> 注：这个命令后来改名为 `meetap mark`。下文写的 `meetap highlight` 就是现在的 `meetap mark`（函数名 `highlight_notes`、模板 `highlight.md` 没改名）。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 新增 `meetap highlight [dir]` 命令，用 LLM 给已生成的会议纪要 markdown 补一层 `<mark>` 要点高亮，且保证不改动正文一个字。

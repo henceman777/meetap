@@ -1,231 +1,220 @@
 # MeeTap
 
-> 🎙️ **MeeTap** · 一键启用，无感采集，智能纪要 —— 让 Mac 上的每一段音频自动变成结构化笔记。
+在 Mac 上录下会议，或者任何电脑里在放的声音；停止以后自动转成带说话人的文字，再写成一份中文纪要，可以顺手发到邮箱。音频和纪要只在你自己的 AWS 账号里流转。
 
-**MeeTap** 是一款面向 **macOS** 的本地化智能音频转纪要工具，将"音频采集 → 转写 → 摘要"全流程自动化，让会议与学习内容一键沉淀为结构化笔记。
+> **从 1.x 升级？** 先看[从 1.x 升级到 2.0](#upgrade)：不再需要 BlackHole，要重新授权一次。
 
-------
+## 上手：装好 → 授权 → 录一场 → 找到纪要
 
-
-
-### 🔧 工作流程
-
-1. **音频捕获** —— 使用 macOS 自带的 **Process Tap**（14.4+）直接、无感地采集系统音频，**免装虚拟声卡、不切换输出设备、不用配置会议 App**。无缝兼容 Zoom、Teams、飞书、腾讯会议等主流会议应用；
-2. **语音转写** —— 音频采集结束后自动上传至 **AWS Transcribe**，输出带**说话人分离（Speaker Diarization）**的结构化文本；
-3. **智能摘要** —— 通过 **Amazon Bedrock** 调用大语言模型（默认 **Claude Sonnet**，一键切换 Nova、Llama、DeepSeek 等），生成条理清晰的**中文会议纪要**。
-
-------
-
-
-
-### 🎯 适用场景
-
-除在线会议外，亦可用于 **YouTube 视频、播客、线上课程、访谈录音**等任意 Mac 播放的音视频内容归档，覆盖**会议记录、学习笔记、资料整理、访谈转写**等多样化需求。
-
-------
-
-### ✨ 核心特性
-
-| 特性                 | 说明                                                         |
-| :------------------- | :----------------------------------------------------------- |
-| 🚀 **开箱即用**       | 首次启动自动生成默认配置，零学习成本，即装即用               |
-| 🎧 **免装免切换**     | 走系统自带的 Process Tap 直接采集，无需安装虚拟声卡、无需切换系统输出设备；录制时你照常从原扬声器/耳机听到原声 |
-| 👻 **零侵入音频采集** | 无需以 "Bot 参会者" 身份加入会议，与会者全程无感知，规避合规风险 |
-| ⏱️ **时长自停**       | `meetap start -d <分钟>` 指定会议时长上限，到点自动结束、自动转录 |
-| 📊 **实时波形**       | 终端底部实时点阵波形，融合系统音 + 你的麦克风，一眼确认"确实在录、双向都有声" |
-| ✍️ **智能纪要**       | Claude Sonnet 5 生成，自动按主题命名文件；可补资料、提要求 `again` 重写 |
-| 📧 **专业邮件**       | 纪要自动渲染为 HTML 邮件（兼容 Outlook）+ PDF 附件，一键发给收件人 |
-| 💰 **按量计费**       | 无订阅、无最低消费，一场会约几毛钱                          |
-| 🔐 **数据主权**       | 所有音频与纪要仅在你**自己的 AWS 账号**内流转，不经第三方云服务；任务结束自动清理，隐私可控 |
-| 🌐 **双语 CLI**       | 终端输出支持 `zh-CN` / `en-US` 切换（仅影响界面语言，**纪要内容始终为中文**） |
-
----
-
-
-
-## 一、前置条件
-
-1. **macOS 14.4+**：指 Sonoma 14.4 及之后的所有版本，涵盖 macOS 15 Sequoia、macOS 26 Tahoe
-   - 2.0 起只用系统自带的 Process Tap 采集，不再支持 macOS 13；还在 13.x 上请继续用 1.x；
-   - Homebrew 只能按大版本限制系统（Sonoma），所以 14.0–14.3 上也装得上，但 `meetap start` / `setup` 会直接提示版本太低、不开录。
-2. **Xcode Command Line Tools**（首次安装会自动提示）
-   
-   ```bash
-   xcode-select --install
-   ```
-3. **AWS 账号**，并已在 [Bedrock 控制台](https://console.aws.amazon.com/bedrock/) 的 **Model access** 开通以下任一模型（MeeTap 默认用 Claude Sonnet）：
-   - Anthropic Claude Sonnet
-   - Amazon Nova Pro
-   - Meta Llama、Mistral、DeepSeek 等任意支持 Converse API 的模型
-4. **（可选）系统日历里有你的会议**：想让纪要用上日历里的会议名、组织者、参会人和议程，就在 **系统设置 › 互联网账户** 里加上公司账户（比如 Microsoft Exchange）并勾选「日历」。刚加的账户要等十几分钟才同步完。没有也不影响录音，只是纪要里没有日历信息。
-
-> **权限是按终端 App 给的**：系统录音和日历这两项权限，macOS 都是授给你运行 meetap 的**那个终端 App**（Ghostty、终端、iTerm 等），不是授给 meetap 本身。所以在几个终端里开录，就要**在每个终端里各跑一次 `meetap setup`**；在系统设置里改了权限，可能要**退出并重新打开那个终端 App** 才生效。
-
----
-
-
-
-## 二、安装（任选一种）
-
-### 方式 A：Homebrew Tap（推荐）
+前提：macOS 14.4 以上；一个 AWS 账号，在 Bedrock 里开通了 Claude Sonnet 等模型（[怎么准备](#aws)）。
 
 ```bash
-# 一次性 tap（只需做一次）
-brew tap henceman777/tap
+# 1. 装好（自动装上 ffmpeg、python），再填 AWS 的 Access Key 和区域
+brew install henceman777/tap/meetap
+aws configure
 
-# 之后这样安装和升级
+# 2. 授权：系统录音（必须）、日历（可选）。在哪个终端 App 里开录，就在哪个里面跑一次
+meetap setup
+
+# 3. 开会前敲一下就开始录；会开完按 Ctrl-C，后台自动转录、写纪要，写完弹通知
+meetap
+
+# 4. 打开最新那个会话文件夹，纪要是 2026-11-19_1430_<主题>.md
+open ~/Record
+```
+
+每一步会看到什么，见[录一场线上会议](#s-online)。
+
+## 按场景找
+
+| 我想…… | 看这张卡 |
+|---|---|
+| 录 Zoom、Teams、飞书、腾讯会议、Chime 上的会 | [录一场线上会议](#s-online) |
+| 录会议室里的会、面对面聊 | [线下会议、面对面聊](#s-offline) |
+| 录网课、直播、视频、播客，只要电脑的声音 | [只录电脑的声音](#s-mute) |
+| 会议有固定时长，到点自动停 | [到点自动停](#s-duration) |
+| 录音时还要用这个终端，或者在脚本里调用 | [在后台录](#s-background) |
+| 纪要不满意：补资料、提要求、重写 | [重写纪要](#s-again) |
+| 合盖休眠、断网、凭证过期以后，接着出纪要 | [中断以后接着出纪要](#s-resume) |
+| 让纪要用上日历里的会名、人名、议程 | [用上日历](#s-calendar) |
+| 标出纪要里的重点 | [标重点](#s-mark) |
+| 给会贴标签，以后按标签找回来 | [贴标签、找回以前的会](#s-tag) |
+| 纪要自动发到邮箱 | [自动发邮件](#s-email) |
+| 会话文件夹太乱、太占地方 | [整理老会话](#s-tidy) |
+| 终端里的提示换成英文 | [英文界面](#s-english) |
+| 命令、配置项一览 | [速查](#cheatsheet) |
+| 出问题了 | [故障排查](#troubleshooting) |
+
+---
+
+## 安装和准备
+
+### 系统要求
+
+- **macOS 14.4 以上**：Sonoma 14.4 及之后的版本，包括 macOS 15 Sequoia、macOS 26 Tahoe。2.0 起只用系统自带的 Process Tap 录音，不再支持 macOS 13，还在 13.x 上请继续用 1.x。Homebrew 只能按大版本限制系统，所以 14.0–14.3 上也装得上，但 `meetap start`、`meetap setup` 会直接提示版本太低、不开录。
+- **Xcode Command Line Tools**：首次安装会自动提示，也可以先跑 `xcode-select --install`。
+
+### 安装（任选一种）
+
+**Homebrew（推荐）**：
+
+```bash
+brew install henceman777/tap/meetap   # 一行：自动 tap 再安装，顺带装上 ffmpeg、python
+
+# 或者分两步：先 tap 一次，以后用短名字安装、升级
+brew tap henceman777/tap
 brew install meetap
 brew upgrade meetap
-# 自动安装依赖：ffmpeg、python
 ```
 
-> 也可以一行搞定（自动 tap + install，但命令较长）：
-> ```bash
-> brew install henceman777/tap/meetap
-> ```
-
-### 方式 B：从源码构建
+**从源码装**：
 
 ```bash
-# 1. 装依赖
 brew install ffmpeg awscli
-
-# 2. clone & 编译安装
 git clone https://github.com/henceman777/meetap.git
 cd meetap
-make install     # 编译 audio-tap / audio-multi-output 并装到 ~/bin
+make install     # 编译 audio-tap、audio-multi-output，装到 ~/bin，并嵌入权限说明、重新签名
 ```
 
-> **关于音频权限**：Process Tap 首次采集会触发 macOS 的"系统音频录制"授权。`make install` 已为 `audio-tap` 嵌入权限描述并重新签名；首次运行 `meetap setup` 会检测并引导你完成授权。
+开发、测试见 [docs/development.md](docs/development.md)。
 
+<a id="aws"></a>
 
+### 准备 AWS 账号
 
-### 从 1.x 升级到 2.0（必看）
+1. 在 [Bedrock 控制台](https://console.aws.amazon.com/bedrock/) 的 **Model access** 开通一个模型。默认用 Anthropic Claude Sonnet；也可以用 Amazon Nova Pro，或者 Meta Llama、Mistral、DeepSeek 等支持 Converse API 的模型（配置项 `model`）。
+2. 配好 AWS 命令行：
 
-2.0 起只用 macOS 自带的 **Process Tap** 采集，**不再使用 BlackHole**，也不再需要给会议 App 配扬声器；系统要求随之提高到 **macOS 14.4+**。
+   ```bash
+   aws configure    # 填 Access Key、Secret 和区域（us-east-1 或别的开通了 Bedrock 的区域）
+   ```
 
-```bash
-brew upgrade meetap        # 或源码安装：cd meetap && git pull && make install
-meetap setup               # 升级后先跑一次
-```
+   用 `AWS_PROFILE` 指定 profile 也行。
+3. 账号要有这些权限：`s3:PutObject/GetObject/DeleteObject`、`transcribe:*TranscriptionJob`、`bedrock:InvokeModelWithResponseStream`；要发邮件再加 `ses:SendRawEmail`。默认模型 `global.anthropic.claude-sonnet-5` 是跨区域的推理配置文件，Bedrock 权限要按推理配置文件、本区域的基础模型、不分区域的基础模型三段写。想收紧权限，照 [docs/iam.md](docs/iam.md) 的最小策略配。
 
-`meetap setup` 会做三件事（在几个终端里开录，就在每个终端里各跑一次）：
+费用按量计费，没有订阅、没有最低消费，一场会大约几毛钱（Transcribe 转录 + Bedrock 生成纪要）。
 
-1. **检查从 1.x 留下的音频设置**（只在需要时出声）：
-   - **系统输出还停在 `BlackHole 2ch` 上**（以前录音崩溃后没恢复）：知道原来用的设备、它也还连着，就自动切回并告诉你切到了哪个；不知道的话列出设备让你选，默认「保持不变」——你可能是有意给别的软件用的。`meetap start` 开录前也会做同样的检查，但不会因此不开录。
-   - **Zoom 的扬声器还设成了 BlackHole**：提示你在 Zoom › 设置 › 音频 › 扬声器 里改回「与系统相同」。只提示，不改 Zoom 的配置。
-   - **系统里还装着 BlackHole**：提醒你检查 Teams、腾讯会议的扬声器是不是还选着 BlackHole 2ch（以前的 `setup` 让你这样选过），是的话改回系统默认或你的扬声器、耳机。
-2. **检查系统录音授权**（Process Tap）：做一次 2 秒实测（会播一声提示音）；如果录到静音，就打开 **系统设置 › 隐私与安全性 › 屏幕与系统录音**，引导你把终端 App（Ghostty / Terminal / iTerm 等）加进"仅系统录音"并复测。1.5.0 以前一直走 BlackHole 的用户从没授过这项权限，这一步必须做；部分终端（如 Ghostty）不会自动弹授权框，要手动添加。
-3. **日历授权（可选）**：见下文「日历里的会议信息」。拒绝也不影响录音。
-
-另外：
-
-- **BlackHole 可以卸载**：`brew uninstall --cask blackhole-2ch`。2.0 不再用它，卸不卸由你定——别的软件还在用的话就留着。卸载后驱动文件就删了，但设备列表里可能还挂着 `BlackHole 2ch`，要重启电脑（或 `sudo killall coreaudiod`）才会消失；在那之前别把它选成输出设备，`meetap setup` 也会这样提示。
-- **配置里的 `audio_capture = blackhole` 可以删掉**：2.0 起这一项不起作用，录音照样走 Process Tap，`start` / `setup` 会提示一句。
-- `meetap setup-zoom` / `setup-teams` / `setup-wemeet` 只会提示"2.0 起不需要配置会议 App 的扬声器"。
-- 授权没生效时没有别的采集方式可以退，会录成静音。所以 2.0 加了**静音报警**：录音期间只要有 App 在放声音、录到的却全是零，30 秒内弹通知（见「日常使用」）。
-- 还在 macOS 13.x 上：2.0 用不了（`start` / `setup` 会报版本太低），请继续用 1.x。
-
----
-
-
-
-## 三、一次性配置
-
-### 1. 配置 AWS CLI
-
-```bash
-aws configure
-# 输入 Access Key / Secret / region（us-east-1 或其他开通了 Bedrock 的区域）
-```
-
-确保你的 AWS 账号具备以下权限（完整清单见附录）：`s3:PutObject/GetObject/DeleteObject`、`transcribe:*TranscriptionJob`、`bedrock:InvokeModelWithResponseStream`、（可选 SES 发邮件）`ses:SendRawEmail`。
-
-### 2. 录音和日历授权（每个终端各一次）
+### 授权：meetap setup
 
 ```bash
 meetap setup
 ```
 
-- **检测并引导 Process Tap 授权**——`setup` 会做一次 2 秒实测；若为静音，会自动打开 系统设置 › 隐私与安全性 › 屏幕与系统录音，引导你把终端 App 加进"仅系统录音"，按提示复测。这是唯一需要的一次性准备。
-- **检查从 1.x 升级留下的音频设置**——系统输出、Zoom / Teams / 腾讯会议的扬声器是不是还指着 BlackHole，详见上文「从 1.x 升级到 2.0」。会议 App 的扬声器不需要任何配置：Process Tap 采集整个系统混音，与会议 App 的扬声器设置无关。
-- **日历授权（可选）**——还没授权时，说明用途后请求一次（会弹授权框），拒绝也算通过。整个 meetap 只有 `setup` 会请求日历授权，开录、停止、休眠自动停止、后台录音都不会弹框，只在已经授权时读。如果只有「写入」权限（读不到会议），`setup` 会写明去 **系统设置 › 隐私与安全性 › 日历** 把当前终端 App 改成「完全访问」，改完可能要重开终端。
+它分三步，哪一步不需要就不出声：
 
-权限是授给终端 App 的：**换了终端 App、或在另一个终端里开录，就在那个终端里再跑一次 `meetap setup`**；在系统设置里改了权限后，可能要退出并重新打开那个终端 App 才生效。
+1. **检查从 1.x 留下的音频设置**：系统输出、会议 App 的扬声器是不是还指着 BlackHole，见[从 1.x 升级到 2.0](#upgrade)。会议 App 本身不用做任何设置：Process Tap 录的是整台电脑的声音，和会议 App 选哪个扬声器无关。
+2. **检查系统录音授权**（Process Tap）：实测 2 秒，会播一声提示音。录到的是静音，就打开 **系统设置 › 隐私与安全性 › 屏幕与系统录音**，引导你把终端 App（Ghostty、终端、iTerm 等）加进"仅系统录音"，再按提示复测。有的终端（比如 Ghostty）不会自动弹授权框，要手动加。这是录音唯一必须的准备。
+3. **日历授权（可选）**：还没授权时，说明用途后请求一次（会弹授权框），拒绝也算通过，只是纪要里没有日历信息。详见[用上日历](#s-calendar)。
 
-### 3. （可选）修改默认配置
+> **权限是按终端 App 给的**：系统录音和日历这两项权限，macOS 都是授给你运行 meetap 的**那个终端 App**，不是授给 meetap 本身。所以在几个终端里开录，就要**在每个终端里各跑一次 `meetap setup`**；在系统设置里改了权限，可能要**退出并重新打开那个终端 App** 才生效。
 
-首次运行 `meetap` 任何命令时，会自动在 `~/.config/meetap/config` 生成一份默认配置。要改的话：
+<a id="upgrade"></a>
+
+## 从 1.x 升级到 2.0
+
+2.0 起只用 macOS 自带的 **Process Tap** 录音，**不再使用 BlackHole**，也不用再给会议 App 配扬声器；系统要求随之提高到 **macOS 14.4+**。
 
 ```bash
-meetap config           # 在 $EDITOR 里打开配置文件
-meetap config show      # 查看当前所有配置项
+brew upgrade meetap        # 源码安装的话：cd meetap && git pull && make install
+meetap setup               # 升级后先跑一次；在几个终端里开录，就在每个终端里各跑一次
 ```
 
-关键配置项说明：
+`meetap setup` 会检查这些从 1.x 留下来的东西：
 
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `region` | `us-east-1` | AWS 区域（影响 S3 / Transcribe / Bedrock） |
-| `model` | `global.anthropic.claude-sonnet-5` | 纪要生成使用的 Bedrock 模型 ID |
-| `transcribe_languages` | `en-US zh-CN ja-JP` | Transcribe 候选语言（按优先级） |
-| `multi_language` | `false` | 同一会议中英混讲时改 `true` |
-| `language` | `zh-CN` | CLI 界面语言（en-US 或 zh-CN）—— **不影响纪要** |
-| `email` | 空 | 纪要收件人，留空则跳过邮件 |
-| `email_sender` | 空 | SES 已验证的发件人，设了 email 必填 |
-| `zero_alert_ignore` | `com.amazon.workspaces` | 静音报警时不算"在放声音"的 App（逗号分隔的 bundle ID 或命令行程序名），见下 |
-| `calendar` | `on` | 停止录音后读系统日历补充会议信息（`on` / `off`），`off` 时完全不碰日历，见「日历里的会议信息」 |
+- **系统输出还停在 `BlackHole 2ch` 上**（以前录音崩溃后没恢复）：知道原来用的设备、它也还连着，就自动切回并告诉你切到了哪个；不知道的话列出设备让你选，默认「保持不变」——你可能是有意给别的软件用的。`meetap start` 开录前也会做同样的检查，但不会因此不开录。
+- **Zoom 的扬声器还设成了 BlackHole**：提示你在 Zoom › 设置 › 音频 › 扬声器 里改回「与系统相同」。只提示，不改 Zoom 的配置。
+- **系统里还装着 BlackHole**：提醒你检查 Teams、腾讯会议的扬声器是不是还选着 BlackHole 2ch（以前的 `setup` 让你这样选过），是的话改回系统默认或你的扬声器、耳机。
+- **系统录音授权**：1.5.0 以前一直走 BlackHole 的用户从没授过这项权限，这一步必须做。
 
-**`zero_alert_ignore` 是干什么的**：录音期间如果有 App 在放声音、录到的却全是零（多半是系统录音授权失效，或系统采集中途出了故障），meetap 会在 30 秒内弹通知，写明是哪个 App 在放。有的 App 一直开着音频输出、其实放的是静音（比如 Amazon WorkSpaces 客户端），会被误当成"在放声音"，每次提前开录都误报，所以要排除掉。**什么时候往里加**：收到这条通知、但当时其实没有任何声音在放，就把通知里那个 App 后面**括号里那一串**加进来——通知写的是"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"，要加的是 `com.google.Chrome.helper`；命令行程序没有括号，直接加程序名。多个用逗号隔开。名单里的 App 只是不再触发报警，会话的 `log/audio-tap.log` 里照样记（`ignored=`）。
+另外：
 
-重置为默认：`rm ~/.config/meetap/config` 后再跑任意 `meetap` 命令。
+- **BlackHole 可以卸载**：`brew uninstall --cask blackhole-2ch`。卸不卸由你定——别的软件还在用的话就留着。卸载后驱动文件就删了，但设备列表里可能还挂着 `BlackHole 2ch`，要重启电脑（或 `sudo killall coreaudiod`）才会消失；在那之前别把它选成输出设备，`meetap setup` 也会这样提示。
+- **配置里的 `audio_capture = blackhole` 可以删掉**：2.0 起这一项不起作用，录音照样走 Process Tap，`start`、`setup` 会提示一句。
+- `meetap setup-zoom`、`setup-teams`、`setup-wemeet` 只会提示"2.0 起不需要配置会议 App 的扬声器"。
+- 授权没生效时没有别的录音方式可以退，会录成静音。所以 2.0 加了**静音报警**：录音期间只要有 App 在放声音、录到的却全是零，30 秒内弹通知（见[故障排查](#troubleshooting)）。
+- **会话文件夹变了**：诊断文件、标签挪进隐藏的 `.meetap/`，`log/` 里只留 `transcript.txt` 和 `meetap.log`，转录完就删掉用不上的 `transcribe-raw.json`。老会话照样读得到；想整理成新样子，跑 [`meetap tidy`](#s-tidy)。
+- **日历是新功能**：想用的话在 `setup` 第 3 步授权，见[用上日历](#s-calendar)。
 
 ---
 
+## 场景卡
 
+<a id="s-online"></a>
 
-## 四、日常使用
+### 录一场线上会议（Zoom、Teams、飞书、腾讯会议、Chime）
 
-整个工作流只有两行命令：
+**什么时候用**：任何在这台 Mac 上开的线上会。meetap 录的是整台电脑的声音加上你的麦克风，不用以"机器人参会者"的身份进会，会上的人看不到它；会议 App 也不用做任何设置。
+
+**怎么用**：
 
 ```bash
-meetap         # 开会前或开会过程中随时可以敲（等同 meetap start）；终端底部显示波形
-               # 会议结束按 Ctrl-C（等同 meetap stop）：自动转录 + 生成纪要
+meetap              # 开会前或会上随时敲，等同 meetap start
+meetap start 周会    # 想给这场起个名：名字接在文件夹名后面，比如 20261119_1430_周会
+# 会开完：在这个终端按 Ctrl-C（等同 meetap stop）
 ```
 
-只敲 `meetap`、不带任何参数，就等同 `meetap start`。开录选项也可以直接跟在 `meetap` 后面：`meetap -m -d 60` 等同 `meetap start -m -d 60`（只认 `-t`、`-d`、`-b`、`-m` 和它们的长写法）。要给会议起名仍写 `meetap start 周会`；`meetap 周会` 这类写法会报「未知命令」，不会开录，免得敲错字误开录音。查看所有命令用 `meetap help`。
+**你会看到什么**：
 
-`meetap start` 默认在前台运行、占用当前终端。想继续用这个终端，加 `-b` 在后台运行，结束时再敲 `meetap stop`。前台模式下录音期间关闭终端窗口，也会像 `stop` 一样正常收尾（`-b` 模式关窗口不会收尾，录音继续）。
-
-> **注意**：从 v1.7 起 `meetap start` 默认前台运行并阻塞终端。在脚本、alias、shell 函数、快捷指令里调用 `meetap start` 并希望立即返回的（如 `meetap start x && open zoommtg://...`），请改用 `meetap start -b`。
-
-### 开始音频采集
-
-```bash
-$ meetap start
-
+```
 🎙️  录制已开始
    播放: MacBook Pro Speakers (Process Tap)
    停止录制: Ctrl-C（或在其他终端运行 /Users/you/bin/meetap stop）
    自动停止: 关闭（手动 stop 结束）
 ```
 
-想让会议到点自动结束，加 `-d` 指定分钟数：
+终端底部一直显示音量电平和时长。按 Ctrl-C 以后：
 
-```bash
-$ meetap start -d 60
-
-🎙️  录制已开始
-   播放: MacBook Pro Speakers (Process Tap)
-   停止录制: Ctrl-C（或在其他终端运行 /Users/you/bin/meetap stop）
-   自动停止: 60 分钟后（约 15:30）
+```
+⏳ 等待录制完成...
+✅ 音频采样成功
+📝 后台转录已启动（完成后会收到通知）
 ```
 
-录网页直播、线上分享这类只需要电脑声音的场景，现场环境声会干扰转录，加 `-m` 只录系统音：
+转录、写纪要在后台跑，30 秒到几分钟（看会议长度），写完右上角弹通知。纪要在 `~/Record/<YYYYMMDD_HHMM>/` 里，文件名按纪要的主题起，比如 `2026-11-19_1430_季度规划评审.md`，旁边还有一份排好版的 `.html`（[文件夹里都有什么](#files)）。
+
+**注意**：
+
+- 照常从原来的扬声器、耳机听声音；录音中途换输出设备也不影响。
+- 开着外放会有回声：扬声器的声音又被麦克风录进去一遍。戴耳机最好。
+- 只敲 `meetap` 就开录；开录选项可以直接跟在后面，比如 `meetap -m -d 60`（只认 `-t`、`-d`、`-b`、`-m` 和它们的长写法）。`meetap 周会` 会报"未知命令"、不开录，免得敲错字误开录音；起名要写 `meetap start 周会`。
+- 前台录音时直接关掉终端窗口，也会像 `stop` 一样正常收尾。
+- 加 `-t`（`meetap start -t`、`meetap stop -t`）会多显示文件路径、大小、时长。
+- 整段录音都是静音（多半是系统录音没授权）时不上传转录，音频留在本地，并弹通知；先跑 `meetap setup`。
+- 纪要始终是中文；转录稿保持会上说的语言。
+
+<a id="s-offline"></a>
+
+### 线下会议、面对面聊（靠麦克风）
+
+**什么时候用**：会议室里开会、面对面聊、做访谈、电话开外放——声音只从麦克风进来。
+
+**怎么用**：和线上会议一样敲 `meetap`，会开完按 Ctrl-C。把 Mac 放在大家中间；别加 `-m`，加了就不开麦克风了。
+
+**你会看到什么**：和[线上会议](#s-online)一样。转录稿里按说话人分开，写成 `spk_0`、`spk_1`……，纪要里会尽量对上人名（有[日历](#s-calendar)或 `materials/` 里的资料时更准）。
+
+**注意**：
+
+- 菜单栏亮橙点是麦克风在用，正常。
+- 用 AirPods 之类的蓝牙耳机当麦克风时，系统会把它切到通话音质，耳机里放的声音会变差；只要电脑声音的场合用 [`-m`](#s-mute)。
+- 中英混着讲，把配置 `multi_language` 改成 `true`；会议常用的语言写在 `transcribe_languages`（按优先级，默认 `en-US zh-CN ja-JP`）。
+- 说话人最多分 `max_speakers` 个（2–10，默认 10）。
+
+<a id="s-mute"></a>
+
+### 录网课、直播、视频，只要电脑的声音（-m）
+
+**什么时候用**：网课、直播、YouTube、播客、线上分享——只要电脑里在放的声音，现场的环境声会干扰转录。
+
+**怎么用**：
 
 ```bash
-$ meetap start -m -d 150
+meetap -m                 # 不开麦克风
+meetap start -m -d 150    # 再加个时长上限，150 分钟后自动停
+```
 
+**你会看到什么**：
+
+```
 🎙️  录制已开始
    播放: MacBook Pro Speakers (Process Tap)
    麦克风: 已静音（只录系统音）
@@ -233,326 +222,437 @@ $ meetap start -m -d 150
    自动停止: 150 分钟后（约 17:00）
 ```
 
-加了这个选项，麦克风全程不打开，菜单栏不会亮橙点，AirPods 也不会被切到通话音质。选项写在会议名前后都行；`-m`、`--mute-mic`、`--mute-microphone` 三种写法等价。如果整段录音都是静音（比如没授权系统音频录制），`stop` 之后不会上传转录，音频会留在本地，并弹通知提醒你。
+**注意**：
 
-音频采集期间：
+- 麦克风全程不打开：菜单栏不亮橙点，AirPods 不会被切到通话音质。你自己说的话也录不进去。
+- `-m`、`--mute-mic`、`--mute-microphone` 三种写法一样；写在会议名前后都行。
+- 终端底部的电平这时只跟电脑的声音走。
 
-- **你正常开会**，音频照常从原来的扬声器 / 耳机里播放（Process Tap 不切换输出设备，录音中途切换输出设备也不影响采集）
-- **终端底部**会显示音量电平 + 时长（`-m` 时只跟电脑声音走）
-- 指定了 `-d` 时，到达时长上限会自动停止；否则一直录到你手动 `stop`
-- **有声音在放、却录成静音时当场提醒**：整场录音期间，只要有 App 在放声音、录到的却全是零，30 秒内弹系统通知，写明是哪个 App 在放（"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"）。开会前提前开录、什么都没在放时不会提醒。每段变零、恢复的墙钟时间都记在会话的 `log/audio-tap.log` 里（`TAP_ZERO_START` / `TAP_ZERO_END`），开着麦克风的场次也记
-- **Mac 休眠（合盖等）时自动结束本场录音**：只把音频文件收尾，不在休眠前上传转录；唤醒后会弹通知，按提示运行 `meetap again <会话名>` 生成纪要（`meetap status` 也会显示这条待办）。锁屏、显示器休眠不受影响
+<a id="s-duration"></a>
 
-### 停止 + 自动生成纪要
+### 会议有固定时长，到点自动停（-d）
 
-```bash
-$ meetap stop
+**什么时候用**：会议时间定好了，怕会后忘了停，录一晚上。
 
-⏳ 等待录制完成...
-✅ 音频采样成功
-📝 后台转录已启动（完成后会收到通知）
-```
-
-`stop` 命令会立刻返回，转录和纪要生成在后台跑（30s~几分钟，看会议长度）。完成后 macOS 右上角会弹通知。
-
-### 📅 日历里的会议信息（可选）
-
-授权过日历（见「一次性配置」）以后，每次停止录音，meetap 会按**这场录音的实际起止时间**去系统日历里找对应的会，把会议信息写进会话的 `materials/calendar.md`，生成纪要时和别的资料一起读进去，人名、议题更准。
-
-- **怎么找**：和录音时间有重叠的会里，重叠最长的就是这场会（提前开录、会议拖堂都没关系）；重叠不到 5 分钟的不算（录音不到 10 分钟时按录音时长的一半）。全天事件、已取消的、你已拒绝的不算。同一时段别的会只记标题，不写进 `calendar.md`。
-- **写什么**：标题、起止时间、组织者、参会人、地点、会议说明。开头写明"来自系统日历，是会前的安排，实际讨论以录音为准"——议程不等于会上真讲了什么。
-- **不写什么**：会议链接、会议号、密码、拨入电话这类入会信息会删掉，不进纪要和邮件；参会人超过 30 位时只列组织者和前 20 位，并写明总人数；文件里不出现邮箱。
-- **当标签建议**：日历标题存进 `meta.json`。`meetap <文件夹>` 会显示"日历：标题（12:00–13:00）"；`meetap -g` 列标签时，标题还不是这场的标签就提示"要贴的话：meetap -g 标题"——只提示，标签照旧由你自己贴。
-- **查不到不出声**：没授权、日历没同步、没找到对应的会、查询超时（上限 10 秒），都直接跳过，不影响转录和纪要，只在会话的 `log/meetap.log` 里记一行 📅。
-- **补查**：休眠自动结束的那场，唤醒后跑 `meetap again` 时会补查；`meetap again` 遇到还没有 `calendar.md` 的老会议也会补查。已经有 `calendar.md`（查过、或你自己放的）就不再查、不覆盖；想重查就先删掉它。
-- **不想用**：配置里写 `calendar = off`，完全不碰日历。
-
-### 断点续跑 / 重新生成纪要
-
-`meetap again` 主要用于**从失败处续跑**：上传、转录或纪要生成任一步中断或失败时，直接续跑到完成，**音频无需重录**。它会自动判断从哪一步接续：
-
-- 已转录成功、仅纪要未生成 → 只重跑纪要生成这一步；
-- 转录也未成功 → 从上传 + 转录开始把整条链路重跑一遍；
-- 旧纪要自动归档到 `archive/`（加时间戳），不会覆盖丢失。
+**怎么用**：
 
 ```bash
-meetap again                              # 续跑 / 重新生成最近一次会议
-meetap again 20260731_1430_季度评审        # 指定某次会议
-meetap again '' '请用要点列表重写，突出决策项与负责人'   # 附带补充要求，直接传给 LLM
+meetap -d 60              # 60 分钟后自动停
+meetap start -d 90 评审    # 起名、限时一起写
 ```
 
-顺带也能用它**改善纪要质量**：把参考资料（议程 / PPT 导出 / 背景文档，支持 md/txt/pdf/docx/html）放进该会议目录的 `materials/` 子目录，`meetap again` 会自动读取喂给模型，辅助修正人名、术语；或用第二个参数附带补充要求直接传给 LLM。
+**你会看到什么**：开录时多一行 `   自动停止: 60 分钟后（约 15:30）`；到点自动停止，接着照常转录、写纪要。`meetap status` 会显示 `自动停止: 已设时长上限`。
 
-### 🖍 纪要要点高亮（可选）
+**注意**：
 
-纪要生成后，想让重点更醒目：
+- 没写 `-d` 就一直录到你停。
+- 中间安静一阵不会自动停：按静音自动停的功能已经去掉了，会议停顿不该结束录音。
+- 提前开完了照样可以 Ctrl-C 或 `meetap stop`。
 
-    meetap mark            # 给最新会话的纪要加要点高亮
-    meetap mark <目录名>    # 指定某次会议
+<a id="s-background"></a>
 
-会用 LLM 给纪要里的关键数字、核心结论、案例结果套上 `<mark>` 标记（在 VS Code / Typora / GitHub / 浏览器里显示为黄色底色）。
+### 录音时还要用这个终端（-b、stop）
 
-- **只加标记、不改正文**：写回前会逐字比对，一旦发现模型改动了正文，直接放弃、原文件保持不变。
-- **可反复运行**：重跑会先清掉上次的高亮再重标，不会层层嵌套。
-- 高亮**只写进 markdown 源文件**，不影响邮件与 PDF。
+**什么时候用**：开着录音还想在这个终端里干别的；或者在脚本、alias、shell 函数、快捷指令里调用，要求马上返回（比如 `meetap start -b && open zoommtg://...`）。
 
-### 🏷 给会议贴标签
+**怎么用**：
 
-给会议贴上「系列名」标签（比如「周会」），以后就能按标签把同一系列的会议找出来，做跨会议的分析和总结。标签跟开录分开：录音中、停止时、会后任何时候都可以贴。
+```bash
+meetap -b         # 在后台录，马上把终端还给你
+meetap status     # 看看是不是在录
+meetap stop       # 结束（哪个终端里都行）
+```
+
+**你会看到什么**：开录信息的"停止录制"一行变成 `   停止录制: /Users/you/bin/meetap stop`。没在录时 `meetap status` 显示：
+
+```
+⏹️  未在录制
+```
+
+**注意**：
+
+- 从 v1.7 起 `meetap start` 默认在前台运行、占着终端；脚本里调用、希望立刻返回的，要加 `-b`。
+- `-b` 时关掉终端窗口不会收尾，录音继续，要记得 `meetap stop`。
+
+<a id="s-again"></a>
+
+### 纪要不满意：补资料、提要求、重写（again、materials/）
+
+**什么时候用**：纪要里人名、术语写错了；会后拿到了议程、PPT；想换个写法，比如突出决策和负责人。
+
+**怎么用**：
+
+```bash
+cp 议程.pdf ~/Record/20261119_1430/materials/          # 资料放进这场会的 materials/
+meetap again                                           # 重写最近一场
+meetap again 20261119_1430                             # 指定哪一场：文件夹名，或者 2026-10/20261008_1046 这样的路径
+meetap again '' '请用要点列表重写，突出决策项与负责人'      # 附带要求；第一个参数留空就是最近一场
+```
+
+**你会看到什么**（照代码写）：
+
+```
+🔁 重新执行会议任务: 20261119_1430
+   本次补充要求: 请用要点列表重写，突出决策项与负责人
+   已归档旧文件: 2026-11-19_1430_季度规划评审.md → archive/
+   检测到转录文本，从「纪要生成」阶段重跑（吸收 materials/ 新资料与 extra-requirements.md）
+```
+
+然后照常生成新的纪要；配了邮件的话也会再发一封。
+
+**注意**：
+
+- 资料支持 md、txt、pdf、docx、html；pdf 要装 `pdftotext`（`brew install poppler`）。资料只是帮模型认人名、术语、补背景，会上讲了什么以录音为准。
+- 补充要求存进会话文件夹里的 `extra-requirements.md`，以后不带要求再跑 `again` 也照样用；不想要了就删掉它，也可以直接编辑它。
+- 旧纪要（md、html）挪进 `archive/`，文件名前加时间，不会被覆盖。
+- 已经有转录稿时只重写纪要，不重新上传、不重新转录；会重新认一次日历（见[用上日历](#s-calendar)）。
+
+<a id="s-resume"></a>
+
+### 合盖休眠、断网、转录中断以后，接着出纪要（again、status）
+
+**什么时候用**：录到一半合盖休眠了；转录、写纪要时网断了、AWS 凭证过期了；或者哪一步失败了。
+
+**怎么用**：
+
+- **凭证过期、网络断一下**：什么都不用做。刷新凭证、等网络恢复，它自己接着跑完。
+- **合盖休眠**：录音会自动结束，唤醒后弹通知，照通知里写的跑 `meetap again <会话>`。
+- **别的失败，或者等太久放弃了**：
+
+```bash
+meetap status                  # 休眠留下的待办会显示在这里
+meetap again 20261119_1430     # 从断的地方接着跑，音频不用重录
+```
+
+**你会看到什么**：
+
+- 休眠结束录音时，通知写 `录音已因休眠结束。运行 meetap again 20261119_1430 生成纪要`；`meetap status` 里多一行 `   上次录音因休眠结束，待生成纪要: meetap again 20261119_1430`。
+- 凭证过期时弹一次通知（下面的时间是示意）：`上传录音失败：AWS 凭证可能过期了。刷新凭证以后会自动接着跑`；会话的 `log/meetap.log` 里是：
+
+  ```
+  [14:02:10] ⚠️ 上传录音失败：AWS 凭证取不到或者已经过期。刷新凭证以后会自动接着跑，这一步最多等 15 分钟
+  [14:02:10]    上传录音第 1 次失败，10 秒后重试
+  [14:02:20]    上传录音第 2 次失败，20 秒后重试
+  [14:02:40] ✅ 上传录音恢复了，接着跑
+  ```
+
+- 15 分钟还不行就放弃，再弹一次通知：`上传录音一直没成功，已放弃。恢复以后用 meetap again 20261119_1430 重跑`。
+
+**注意**：
+
+- `again` 自己判断从哪一步接：已经有转录稿，只重写纪要；没有转录稿、但上一次的转录任务已经在 AWS 上转完（或者还在转），直接取结果，不重新上传、不重新转录；都没有，就从上传开始。
+- 查凭证、上传、查转录进度、下载结果、认日历、生成纪要、发邮件，每一步都这样等：间隔从 10 秒起逐次拉长（最长 2 分钟），每一步各自最多等 15 分钟。通知只弹两次：断掉时第一次失败弹一次（分得出是凭证问题就直说），放弃时再弹一次。
+- 不是凭证、也不是网络的报错（比如权限不够），试 3 次就停，不空等；原因看 `log/meetap.log`。
+- `log/meetap.log` 接着往后写，每次开头一行 `===== 2026-11-19 14:23:05 · meetap again 20261119_1430 =====`，上一次为什么失败还看得到。
+- 录音边录边落盘，每 10 秒写一次；进程被强杀或者断电，最多丢最后 10 秒，剩下的照样能 `again`。
+- 只有系统休眠才结束录音；锁屏、显示器休眠不影响。休眠前不上传，免得上传被打断。
+
+<a id="s-calendar"></a>
+
+### 让日历帮纪要认人名和议题（日历授权）
+
+**什么时候用**：系统日历里有这场会，想让纪要用上会名、组织者、参会人和议程，人名、议题写得更准。
+
+**怎么用**：
+
+1. 在 **系统设置 › 互联网账户** 里加上公司账户（比如 Microsoft Exchange），勾选「日历」。刚加的账户要等十几分钟才同步完。
+2. 在你开录的那个终端里跑 `meetap setup`，第 3 步授权日历，要「完全访问」。
+3. 之后照常录，什么都不用多做。
+
+**你会看到什么**：
+
+- 纪要写完的通知里带一句，比如 `会议纪要已生成: 2026-11-19_1430_季度规划评审.md。日历：按时间认出 季度规划评审`；录到的明显不是日历上那场会时是 `日历：同时段 1 场，内容对不上，没用`；时段里没有会就不带。
+- 会话的 `log/meetap.log` 里记一行，比如 `📅 日历：这场会是「季度规划评审」（时间最接近，内容也对得上：讨论的是季度规划），已写 materials/calendar.md`。
+- **纪要里不写怎么认的**：纪要会转给别人，写进去会把日历里别的会、客户名带出去。
+- 会话的 `materials/calendar.md`：标题、时间、怎么认出来的、组织者、参会人、地点、会议说明。开头写明"来自系统日历，是会前的安排，实际讨论以录音为准"。
+- `meetap <文件夹>` 多一行 `  日历：季度规划评审（12:00–13:00，按时间认出）`；转录还没完时是 `  日历：候选 2 场，转录完按内容认`。
+
+**注意**：
+
+- **怎么认的**：停止录音时，按这场录音的实际起止时间收下同时段的会——重叠不到 5 分钟的不算（录音不到 10 分钟时，重叠要超过录音的一半）；全天事件、已取消的、你已拒绝的不算；剩下的按起止时间和录音的贴近程度排（重叠时长 ÷ 录音和会合起来的总时长），最多收 5 场。转录完、写纪要之前再认：**时间优先**，起止时间最接近的那场交给模型（和写纪要同一个后端、同一个模型）核对内容。只有一场时先看标题：标题对得上就用它，不管会议说明写的是什么（自己建的日程，比如 `youtube-watching`，说明常常是从别的会复制来的）；标题和说明都明显对不上（比如标题是周会、录到的是新闻时评），才不用日历。几场起止时间完全一样时，按内容选最对得上的那场。模型 30 秒没回、出错、回的看不懂时：时间最接近的只有一场就照时间定，几场一样就不用日历；都不耽误写纪要。
+- **交给模型什么**：转录稿开头约 4000 字加结尾约 1000 字、`materials/` 里的文件名、候选会议的标题、起止时间、组织者、前 20 位参会人、会议说明的前 500 字。入会链接、会议号、密码、拨入电话都去掉了，发到的是你自己账号里的 Bedrock（`ai_backend = claude-code` 时走 `claude` 命令行）。不想多这一次调用，配置写 `calendar = off`，整个不碰日历。
+- **不写什么**：入会信息不进纪要和邮件；参会人超过 30 位时只列组织者和前 20 位，并写明总人数；文件里不出现邮箱。
+- **只有 `meetap setup` 会请求日历授权**：开录、停止、休眠自动停止、后台录音都不弹框，只在已经授权时读。查不到——没授权、日历没同步、时段里没有会、查询超时（10 秒）——都直接跳过，只在 `log/meetap.log` 里记一行 📅。
+- **重查**：`meetap again` 会重新收、重新认，覆盖 `calendar.md`——前提是这份文件是 meetap 自己写的、没被改过。你改过的、自己放进去的原样留着，日志里提示一句；想重查就先删掉它。休眠自动结束的那场，唤醒后 `again` 时补上。
+- **只有「写入」权限读不到会**：`setup` 会写明去 **系统设置 › 隐私与安全性 › 日历** 把当前终端 App 改成「完全访问」，改完可能要重开终端。换了终端 App，要在新终端里再跑一次 `setup`。
+- 认出来的那场的标题会当成[标签](#s-tag)建议。
+
+<a id="s-mark"></a>
+
+### 标出纪要里的重点（mark）
+
+**什么时候用**：纪要写好了，想让关键数字、核心结论、案例结果更醒目。
+
+**怎么用**：
+
+```bash
+meetap mark                  # 给最新一场的纪要加高亮
+meetap mark 20261119_1430    # 指定哪一场
+```
+
+**你会看到什么**（照代码写）：
+
+```
+🖍  高亮目标：2026-11-19_1430_季度规划评审.md
+   正在标注要点...
+✅ 已高亮：2026-11-19_1430_季度规划评审.md
+```
+
+纪要里的重点套上 `<mark>`，在 VS Code、Typora、GitHub、浏览器里显示成黄色底色。
+
+**注意**：
+
+- 只加标记、不改正文：写回前逐字比对，模型动了正文就放弃，原文件不变。
+- 可以反复跑：重跑先清掉上次的高亮再重标，不会层层嵌套。没找到可标的就提示"文件未改动"。
+- 高亮只写进 md 文件，不影响已经发出的邮件。
+
+<a id="s-tag"></a>
+
+### 贴标签，找回以前的会（-g、--untag、meetap <文件夹>）
+
+**什么时候用**：同一系列的会（周会、某个客户）想归到一起，以后按标签找出来，做跨会议的回顾；或者想看看某场会录了多久、纪要叫什么。
+
+**怎么用**：
 
 ```bash
 meetap -g 周会                         # 贴给正在录的那场；没在录就贴给最新一场
-meetap -g 周会 -g 客户A                 # 一次贴多个
+meetap -g 周会 -g 客户A                 # 一次贴多个（-g 也可以写成 --tag）
 meetap 20261118_1201 -g 周会            # 贴给指定的那场（写文件夹名）
-meetap 2026-10/20261008_1046 -g 周会    # 已挪进月份文件夹的老会议，写路径
-meetap 20261118_1201 --untag 客户A      # 撤掉一个标签（不写文件夹时默认目标同 -g）
+meetap 2026-10/20261008_1046 -g 周会    # 已经挪进月份文件夹的老会议，写路径
+meetap 20261118_1201 --untag 客户A      # 撤掉一个标签（不写文件夹时，默认目标和 -g 一样）
 meetap -g                              # 列出最新一场的标签，以及用过的全部标签和场数
-meetap 20261118_1201                   # 显示这场会的时间、时长、纪要标题和标签（不开录）
+meetap 20261118_1201                   # 显示这场会的时间、时长、纪要、标签、日历（不开录）
 ```
 
-每次贴完都会回显一行，看得出贴给了哪一场：
+**你会看到什么**（临时目录里实跑，会话是编的）：
 
 ```
-已给 11-18 12:01（73 分钟 · 纪要：季度规划评审）贴上：周会
-现有标签：周会
+$ meetap 20261118_1201
+20261118_1201
+  开始：2026-11-18 12:01
+  时长：73 分钟
+  纪要：季度规划评审
+  标签：周会
+  日历：季度规划评审（12:00–13:00，按时间认出）
+  状态：已结束
+
+$ meetap 20261118_1201 -g 客户A
+已给 11-18 12:01（73 分钟 · 纪要：季度规划评审）贴上：客户A
+现有标签：周会、客户A
+
+$ meetap -g
+最新一场 11-18 12:01（73 分钟 · 纪要：季度规划评审）的标签：周会、客户A
+日历标题：季度规划评审，要贴的话：meetap -g 季度规划评审
+用过的全部标签（2 个，含月份文件夹里的会话）：
+  客户A（2 场）
+  周会（1 场）
 ```
 
-- **防贴错**：没写文件夹、当前没在录、最新一场又开始于 12 小时以前时，会先问一句再写；没有终端时（脚本、菜单栏 app 调用）直接拒绝，提示你写明文件夹。
-- **大小写不敏感**：`Weekly` 和 `weekly` 算同一个标签，存的时候保留你第一次的写法。新标签和已有标签相近时（一个包含另一个），会提示一句「已有相近的标签：团队周会（8 场）」，但照样贴上。
-- **统计范围**：「用过的全部标签」扫 `recording_dir` 第一层，加上名字是 `20YY-MM` 的月份文件夹里的会话，所以按月把老会议挪进月份文件夹不会丢掉标签统计。
+**注意**：
+
+- 录音中、停止时、会后任何时候都能贴。
+- **防贴错**：没写文件夹、当前没在录、最新一场又开始于 12 小时以前时，会先问一句再写；没有终端时（脚本、菜单栏 App 调用）直接拒绝，提示你写明文件夹。
+- **大小写不敏感**：`Weekly` 和 `weekly` 算同一个标签，存的时候保留你第一次的写法。新标签和已有标签相近时（一个包含另一个），提示一句"已有相近的标签：团队周会（8 场）"，照样贴上。
+- **统计范围**："用过的全部标签"扫 `recording_dir` 第一层，加上名字是 `20YY-MM` 的月份文件夹里的会话，所以按月把老会议挪进月份文件夹不会丢掉标签统计。
+- 日历标题只当建议，只提示、不自动贴。
 - 开录选项不能和 `-g` 混用（`meetap -m -g 周会` 会报错、不开录）；`meetap start 周会` 里的名字只进文件夹名，不会自动变成标签。
-- 标签存在会话目录最外层的 `meta.json`，不放进 `materials/`（那里的东西会喂给模型）。
+- 标签存在会话的隐藏文件夹 `.meetap/meta.json` 里，不放进 `materials/`（那里的东西会交给模型）。以前的版本放在会话根目录，照样读得到；改一次标签就挪进 `.meetap/`，`meetap tidy` 也会挪。
 
-### 查看结果
+<a id="s-email"></a>
 
-产物默认在 `~/Record/<YYYYMMDD_HHMM>/`：
+### 纪要自动发到邮箱
 
-```
-~/Record/20260731_1430/
-├── meeting-notes.md       ← 结构化纪要（主要看这个）
-├── meeting-notes.html     ← 排版后的 HTML 版
-├── meeting-notes.pdf      ← 用于邮件附件的 PDF（若配了邮件）
-├── materials/             ← （可选）放参考资料，重新生成时注入；calendar.md 是从日历查到的这场会
-├── meta.json              ← （贴过标签或查到日历才有）会议标签、日历标题等元信息
-└── log/
-    ├── transcript.txt     ← 带说话人标签的转录
-    ├── speaker-stats.txt  ← 每人发言时长占比
-    ├── transcribe-raw.json ← Transcribe 原始 JSON
-    └── meetap.log         ← 每一步时间戳（调试用）
-```
+**什么时候用**：每场会的纪要想自动发给自己或固定几个人。
 
-### 其他常用命令
+**怎么用**：
+
+1. 在 [SES 控制台](https://console.aws.amazon.com/ses/) 验证发件地址（AWS 防滥用的要求，绕不过去）。
+2. `meetap config` 打开配置，填上：
+
+   ```ini
+   email = alice@example.com, bob@example.com
+   email_sender = meetap@example.com
+   ```
+
+**你会看到什么**：每次写完纪要，`log/meetap.log` 里记一行 `✅ Email sent to: alice@example.com, bob@example.com`；邮件正文就是排好版的纪要（会话文件夹里那份 `.html`），标题是 `[MeeTap] <纪要标题>`。
+
+**注意**：
+
+- 邮件版去掉了纪要里的"目录"一节；表格样式写成内联，Outlook 这类会剥掉样式表的邮件客户端里也能正常显示。
+- 填了 `email` 没填 `email_sender`：只生成 HTML，不发，日志里提示。两项都空着就整个跳过。
+- SES 新账户默认在 sandbox 里，只能发给已验证的地址；要发给别人，先申请生产访问。权限配法见 [docs/iam.md](docs/iam.md)。
+- 发信时网断了、凭证过期了，同样会等着重试（见[中断以后接着出纪要](#s-resume)）。
+
+<a id="s-tidy"></a>
+
+### 会话文件夹太乱、太占地方（tidy）
+
+**什么时候用**：以前录的会，`log/` 里还留着 `transcribe-raw.json`（平均 700 多 KB 一个）和诊断文件，看着乱、占地方。
+
+**怎么用**：
 
 ```bash
-meetap status       # 查看当前是否在音频采集
-meetap <文件夹>     # 显示某场会的时间、时长、纪要标题和标签
-meetap config       # 编辑配置
-meetap config show  # 查看当前配置值
-meetap version      # 显示版本号
-meetap help         # 显示所有命令（也可用 -h / --help）
+meetap tidy                            # 只列清单：每场会要删什么、挪什么，能腾出多少；不改任何文件
+meetap tidy --yes                      # 看过清单、确认后执行
+meetap tidy --yes --include-no-audio   # 连已经没有音频的会话的 transcribe-raw.json 也删
 ```
+
+**你会看到什么**（临时目录里实跑，会话是编的）：
+
+```
+下面是 meetap tidy 会做的事（/Users/you/Record；只是清单，还没动任何文件）：
+
+【有音频】删掉 transcribe-raw.json（以后要逐词时间，可以从音频重新转录）：
+  20261105_0930：transcribe-raw.json（793 KB），诊断文件 1 个挪进 .meetap/，meta.json 挪进 .meetap/
+
+【没有音频】transcribe-raw.json 是逐词时间唯一的来源，默认留着（加 --include-no-audio 才删）：
+  2026-10/20261008_1046：transcribe-raw.json（717 KB），诊断文件 1 个挪进 .meetap/
+
+有音频的会话：1 场，删掉 transcribe-raw.json 能腾出 793 KB
+没有音频的会话：1 场，transcribe-raw.json 合计 717 KB，默认不删（加 --include-no-audio 才删）
+挪进 .meetap/ 的诊断文件：2 个
+挪进 .meetap/ 的 meta.json：1 个
+
+确认没问题后执行：meetap tidy --yes
+```
+
+**注意**：
+
+- **还有音频的会话**：删掉 `transcribe-raw.json`；以后要逐词时间，可以从音频重新转录。
+- **已经没有音频的会话**：`transcribe-raw.json` 是逐词时间唯一的来源，删了就找不回来，所以默认不删，只在清单里列出场数和合计大小；确定不要了再加 `--include-no-audio`。
+- **没有转录稿的**：`transcribe-raw.json` 留着。
+- `audio-tap.log`、`speaker-stats.txt` 和根目录的 `meta.json` 挪进隐藏的 `.meetap/`；`meetap.log` 留在 `log/`，以前被挪进 `.meetap/` 的挪回 `log/`。目标位置已有同名文件的不挪，在清单里列出来。
+- 音频、纪要、`materials/`、`archive/`、转录稿一概不动。扫的是 `recording_dir`（默认 `~/Record`）下的所有会话，含月份文件夹、更深的子文件夹和老版本的文件布局。
+- 新录的会不用整理：转录完就是整理好的样子。
+
+<a id="s-english"></a>
+
+### 界面切成英文
+
+**什么时候用**：习惯看英文提示，或者把终端输出贴给不读中文的同事。
+
+**怎么用**：`meetap config` 打开配置，把 `language` 改成 `en-US`。
+
+**你会看到什么**（照代码写）：
+
+```
+🎙️  Recording started
+   Playback: MacBook Pro Speakers (Process Tap)
+   Stop recording: Ctrl-C (or run /Users/you/bin/meetap stop in another terminal)
+   Auto-stop: off (stop manually)
+```
+
+**注意**：只影响终端输出、通知和帮助。纪要始终是中文，`materials/calendar.md` 也是中文；转录稿保持会上说的语言。
 
 ---
 
-## 五、（可选）自动发送邮件
+<a id="cheatsheet"></a>
 
-想让纪要自动发给固定几个人？在配置里填上收件人和 SES 发件人：
+## 速查
 
-```ini
-email = alice@example.com, bob@example.com
-email_sender = meetap@yourdomain.com
-```
+### 命令
 
-前提是 `email_sender` 已经在 [SES 控制台](https://console.aws.amazon.com/ses/) 完成发件人验证（AWS 反滥用要求，无法绕过）。下次会议结束，MeeTap 会自动把 Markdown 渲染成 PDF，通过 SES 发送。
-
-不需要邮件？空着这两项就行，整条链路会自动跳过。
-
----
-
-## 六、实现原理
-
-### 6.1 音频采集：Process Tap
-
-macOS 不允许 App 直接抓取其他 App 的音频输出，MeeTap 用系统原生的 Process Tap（macOS 14.4+）采集：
-
-系统原生的 [Core Audio Process Tap](https://developer.apple.com/documentation/coreaudio)（macOS 14.4 引入的 `AudioHardwareCreateProcessTap` + `CATapDescription`）直接在 coreaudiod 的系统混音总线上"接一根监听探针"——在音频送往扬声器 / 耳机的**同一条链路上旁路复制一份**交给采集进程，采集全部系统音频，音频照常从原设备正常播放，用户听感零变化。麦克风在同一进程内混入（借鉴 meetily 的 ring-buffer 混音架构），ffmpeg 只做编码、零设备访问，彻底消除设备抢占与枚举竞态。
-
-相较 1.x 用过的 BlackHole 虚拟声卡方案（2.0 已删除），它的优点是：
-
-- **零安装、零配置**：系统原生能力，无需安装虚拟声卡、无需 `sudo killall coreaudiod`、无需在会议 App 里手动改扬声器；
-- **不改变默认输出设备**：用户仍从原扬声器 / 耳机听原声，不存在"录制期间误切输出就没声"的坑；
-- **进程内混麦、零设备竞争**：麦克风在 audio-tap 进程内混入，ffmpeg 只负责编码、不碰任何音频设备，从根上消除设备抢占与枚举竞态；
-- **拿到真实采样率**：直接读 tap 的实际格式（`kAudioTapPropertyFormat`），不依赖设备标称率，避免时长错拉与音调失真。
-
-```mermaid
-%%{init: {'flowchart': {'curve': 'basis'}}}%%
-flowchart TB
-    APP["会议 App<br/>（Zoom / Teams / 飞书）"] -->|播放| CAD[coreaudiod]
-    CAD -->|正常输出| SPK[扬声器 / 耳机]
-    CAD -->|Process Tap 监听探针| TAP["audio-tap<br/>（进程内混入麦克风）"]
-    MIC[麦克风] -->|ring buffer| TAP
-    TAP -->|单路 PCM| FF["ffmpeg（仅编码）"]
-    FF --> M4A[meeting.m4a]
-```
-
-**防漏录**：Process Tap 偶尔会"回调照常、交出的数据全是零"（实测录到第 19 分钟才坏）。audio-tap 每秒检查 tap 这一路：连续 3 秒全零记一个零段，恢复时记结束；同一零段里累计 20 秒有别的 App 在放声音，就弹通知。是否"在放声音"按 CoreAudio 的进程输出状态判断，`zero_alert_ignore` 里的 App 不算。
-
-### 6.2 云端处理：客户端直连 4 个托管服务
-
-音频采集到本地后，meetap CLI 作为唯一控制面，在一次 `meetap stop` 的命令生命周期内：上传、转录、生成纪要、（可选）发邮件、清理——**没有 Lambda、没有常驻基础设施，账户里不留临时资源**。
-
-
-
-**架构组成**（谁在哪、谁管什么）：
-
-![image-20260731205319177](image/architecture_diagram.png)
-
-没有 VPC、没有集群、没有"我家的服务器"——4 个托管服务通过 SDK/CLI 直接调用。
-
-**调用顺序**（一次完整流程）：
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor U as meetap CLI
-    participant S3 as Amazon S3
-    participant TX as Amazon Transcribe
-    participant BR as Amazon Bedrock
-
-    U->>S3: ① 上传采集的音频
-    U->>TX: ② StartTranscriptionJob
-    loop 每 10 秒轮询
-        U->>TX: GetTranscriptionJob
-        TX-->>U: IN_PROGRESS / COMPLETED
-    end
-    U->>S3: ③ 下载结果 JSON
-    U->>BR: ④ ConverseStream (prompt + transcript)
-    BR-->>U: 流式返回 meeting-notes.md
-    U->>S3: ⑤ 清理桶和转录任务
-```
-
-流式返回让纪要在眼前"慢慢长出来"，而不是等 30 秒才一次性出现。
-
----
-
-
-
-## 七、故障排查
-
-| 症状 | 原因 / 解决 |
+| 命令 | 做什么 |
 |---|---|
-| 首次 `start` 提示无系统音频权限 / 录音全静音 | 运行 `meetap setup` 完成 Process Tap 授权；或在系统设置 → 隐私与安全性 → 系统音频录制 中允许 |
-| 录出 **0 字节音频** / 转录报 `input file empty`（短会议偶发） | macOS Process Tap 的 IO 回调偶发不启动（`AudioDeviceStart` 成功但静默不喂数据），ffmpeg 收不到 PCM。**注意点阵波形读的是麦克风电平，此时仍会跳动，不代表在正常录音**。录音过程中 audio-tap 会自己盯着：有声音在放、tap 却一直没数据，就在进程内重建 tap，录音不中断。`start` 时 audio-tap 或 ffmpeg 起不来，会自动重试最多 3 次，仍失败则明确报错，按提示重跑 `meetap setup` 查授权或重新 `start` 即可 |
-| 转录失败：`AWS credentials not configured` | 跑 `aws configure` 或检查 `AWS_PROFILE` |
-| 转录失败：`AccessDenied` / `ValidationException` | 确认账号已开通 Bedrock Model access，且 IAM 有 `bedrock:InvokeModelWithResponseStream` 权限 |
-| 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../log/meetap.log` 查看具体 AWS 报错 |
-| 音频采集有回声 | 戴耳机采集；外放会把扬声器声音二次采入 |
-| 系统通知没弹出 | 系统设置 → 通知 → 允许 "终端" 或 "Script Editor" 发送通知 |
-| 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零。先看通知里写的是哪个 App：它当时其实没出声（一直开着输出流的 App），就把通知里括号里那一串（bundle ID）加进配置 `zero_alert_ignore`；确实在开会，就跑 `meetap setup` 检查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间在会话的 `log/audio-tap.log` 里（`TAP_ZERO_*`） |
-| `materials/` 里没有 `calendar.md` / 纪要里没用上日历 | 看会话的 `log/meetap.log` 里那一行 📅：写着"没有读取权限"，就在你开录的那个终端里跑一次 `meetap setup`（只有「写入」权限要在 系统设置 › 隐私与安全性 › 日历 改成「完全访问」，改完可能要重开终端）；写着"没有对应的会"，检查 系统设置 › 互联网账户 里的日历是否已同步，或这场录音和日历里的会是否重叠不到 5 分钟；配置里 `calendar = off` 时不会查 |
-| 从 1.x 升级后听不到声音 | 系统输出或会议 App 的扬声器还指着 BlackHole 2ch。跑一次 `meetap setup`，或在 系统设置 › 声音 › 输出、会议 App 的音频设置里改回扬声器 / 耳机 |
+| `meetap` 或 `meetap start [会议名]` | 开始录音（前台运行，Ctrl-C 结束） |
+| `-d 分钟` | 到点自动停 |
+| `-m`（`--mute-mic`、`--mute-microphone`） | 不开麦克风，只录电脑的声音 |
+| `-b` | 在后台录，不占终端 |
+| `-t` | 开录、停止时多显示文件路径、大小、时长 |
+| `meetap stop [-t]` | 结束录音，后台转录、写纪要 |
+| `meetap status` | 看是不是在录，有没有休眠留下的待办 |
+| `meetap again [会话] [补充要求]` | 从断的地方接着跑，或者重写纪要 |
+| `meetap mark [会话]` | 给纪要的重点加高亮 |
+| `meetap [会话] -g 标签`（`--tag`） | 贴标签；不写会话就贴给正在录的，没在录就最新一场 |
+| `meetap [会话] --untag 标签` | 撤掉一个标签 |
+| `meetap [会话] -g` | 列这场的标签和用过的全部标签 |
+| `meetap <会话>` | 显示这场的时间、时长、纪要、标签、日历 |
+| `meetap tidy [--yes] [--include-no-audio]` | 整理老会话；不加 `--yes` 只列清单 |
+| `meetap setup` | 授权系统录音、日历，检查 1.x 留下的设置；每个终端 App 跑一次 |
+| `meetap config` / `meetap config show` | 编辑配置 / 看当前配置值 |
+| `meetap version` | 显示版本号 |
+| `meetap help`（`-h`、`--help`） | 显示所有命令 |
+
+"会话"写文件夹名（`20261119_1430`），月份文件夹里的写路径（`2026-10/20261008_1046`），也可以写完整路径。
+
+### 配置项
+
+配置文件是 `~/.config/meetap/config`，第一次跑任何 `meetap` 命令时自动生成。`meetap config` 用 `$VISUAL` / `$EDITOR` 打开它；想恢复默认，删掉它再跑任意 `meetap` 命令。
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `region` | `us-east-1` | AWS 区域，S3、Transcribe、Bedrock 都用它 |
+| `ai_backend` | `bedrock` | 用什么写纪要：`bedrock`，或 `claude-code`（走 `claude` 命令行，用不了时退回 Bedrock） |
+| `model` | `global.anthropic.claude-sonnet-5` | 写纪要用的 Bedrock 模型 ID |
+| `transcribe_languages` | `en-US zh-CN ja-JP` | 转录候选语言，按优先级 |
+| `multi_language` | `false` | 一场会里中英混着讲时改成 `true` |
+| `max_speakers` | `10` | 最多分几个说话人（2–10） |
+| `recording_dir` | `~/Record` | 会话文件夹放在哪 |
+| `audio_bitrate` | `128k` | 录音码率：`64k` 文件小，`256k` 音质高 |
+| `audio_persist` | `true` | 转录成功后留不留本地音频；`false` 就删 |
+| `language` | `zh-CN` | 终端界面语言：`zh-CN` 或 `en-US`，不影响纪要 |
+| `visualizer` | `dot` | 终端底部电平的样式：`dot`、`bar`、`spectrum`、`block` |
+| `calendar` | `on` | 用不用日历；`off` 时完全不碰日历，也不多调一次模型 |
+| `zero_alert_ignore` | `com.amazon.workspaces` | 静音报警时不算"在放声音"的 App，逗号分隔（见[故障排查](#troubleshooting)） |
+| `email` | 空 | 纪要收件人，逗号分隔；空着就不发 |
+| `email_sender` | 空 | SES 验证过的发件地址；填了 `email` 就要填 |
 
 ---
 
+<a id="files"></a>
 
+## 会话文件夹里有什么
 
-## 附录 A：最小 IAM 权限
-
-给 MeeTap 使用的 IAM 用户或角色附加以下策略（按需启用 SES 部分）：
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "S3ObjectOps",
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:DeleteObject",
-        "s3:PutBucketPublicAccessBlock"
-      ],
-      "Resource": [
-        "arn:aws:s3:::meetap-transcribe-*",
-        "arn:aws:s3:::meetap-transcribe-*/*"
-      ]
-    },
-    {
-      "Sid": "TranscribeStartJob",
-      "Effect": "Allow",
-      "Action": ["transcribe:StartTranscriptionJob"],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": { "aws:RequestedRegion": "us-east-1" }
-      }
-    },
-    {
-      "Sid": "TranscribeGetDeleteJob",
-      "Effect": "Allow",
-      "Action": [
-        "transcribe:GetTranscriptionJob",
-        "transcribe:DeleteTranscriptionJob"
-      ],
-      "Resource": "arn:aws:transcribe:us-east-1:*:transcription-job/meetap-*"
-    },
-    {
-      "Sid": "BedrockInvoke",
-      "Effect": "Allow",
-      "Action": ["bedrock:InvokeModelWithResponseStream"],
-      "Resource": [
-        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-*",
-        "arn:aws:bedrock:us-east-1:*:inference-profile/us.anthropic.claude-sonnet-4-*"
-      ]
-    },
-    {
-      "Sid": "SESSendFromConfiguredSender",
-      "Effect": "Allow",
-      "Action": ["ses:SendRawEmail"],
-      "Resource": "arn:aws:ses:us-east-1:*:identity/noreply@example.com",
-      "Condition": {
-        "StringEquals": {
-          "ses:FromAddress": "noreply@example.com"
-        }
-      }
-    }
-  ]
-}
-```
-
-> **最小权限说明**（按实际调用收紧，切 region / 换模型时记得同步 ARN）：
-> - **S3**：meetap 首次运行会自动建桶（`meetap-transcribe-<AccountID 短哈希>-<region>`），无需手动预建。此策略未含建桶权限，故**套用时首次运行请临时补上 `s3:CreateBucket`**（跑一次后可收回），或手动预建同名桶。
-> - **Transcribe**：`StartTranscriptionJob` 不支持资源级 ARN，只能 `Resource:"*"` + `aws:RequestedRegion` 锁 region；`Get/Delete` 已收窄到 `transcription-job/meetap-*`。
-> - **Bedrock**：ARN 锁在 `us-east-1`，换 region 或模型（Nova / Llama / DeepSeek 等）需同步调整。
-> - **SES**：把两处 `noreply@example.com` 换成你**已在 SES 验证**的发件地址，且 ARN 的 region 要与验证 region 一致（SES 按 region 独立验证）；验证整个域时改用域 identity ARN（`identity/example.com`）。**新账户默认 sandbox**，只能发给已验证地址，群发需先申请生产访问。
-
-
-
-
-
-## 开发
-
-```bash
-git clone https://github.com/henceman777/meetap.git
-cd meetap
-make            # 只编译，不安装
-make install    # 安装到 ~/bin（含 audio-tap 重新签名，保证 Process Tap 授权生效）
-make clean      # 清理构建产物
-```
-
-代码布局：
+每场会一个文件夹，默认在 `~/Record/<YYYYMMDD_HHMM>/`（起了名的话后面接 `_<会议名>`）：
 
 ```
-src/
-├── meetap                    # bash 主控脚本
-├── audio-tap.swift           # Core Audio Process Tap 采集 + 麦克风进程内混音（macOS 14.4+）
-├── audio-tap-Info.plist      # 嵌入 audio-tap 的音频录制权限描述
-├── audio-multi-output.swift  # CoreAudio 设备查询 / 切换默认输出（升级迁移用）+ 休眠自动结束（sleep-watch）+ 日历查询（EventKit）
-├── audio-multi-output-Info.plist  # 嵌入 audio-multi-output 的日历用途说明
-└── i18n/                     # CLI 双语消息表
+/Users/you/Record/20261119_1430/
+├── 2026-11-19_1430_<主题>.md    ← 纪要（主要看这个）
+├── 2026-11-19_1430_<主题>.html  ← 排好版的 HTML，邮件正文就是它
+├── meeting_20261119_143005.m4a ← 录音（边录边写，每 10 秒落一次盘；audio_persist = false 时转录成功后删掉）
+├── materials/                   ← 放参考资料，写纪要时交给模型；calendar.md 是从日历认出的这场会
+├── archive/                     ← （again 以后才有）旧版纪要
+├── log/
+│   ├── transcript.txt           ← 带说话人的转录稿
+│   └── meetap.log               ← 每一步的时间和报错，排错看这个
+└── .meetap/                     ← 隐藏文件夹（Finder 里按 Cmd+Shift+. 显示，或 ls -a）
+    ├── meta.json                ← （贴过标签或查过日历才有）标签、日历等信息
+    ├── calendar-candidates.json ← （同时段日历里有会才有）收下的候选会议，认会、重查时用
+    ├── transcribe-job.json      ← （转录还没取回来时才有）AWS 上的转录任务，again 接着用
+    ├── speaker-stats.txt        ← 每人发言时长占比，重写纪要时用
+    └── audio-tap.log            ← 录音诊断：采样率、变零 / 恢复的时间
 ```
 
+Transcribe 返回的原始结果 `transcribe-raw.json`（平均 700 多 KB）在转录稿和发言统计写出来以后就删掉了。**它是唯一带逐词时间的文件，删了以后想找回时间，只能从音频重新转录**（删掉 `log/transcript.txt` 再跑 `meetap again`）。转录没成功时它会留在 `.meetap/` 里。
 
+---
+
+<a id="troubleshooting"></a>
+
+## 故障排查
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| 第一次 `start` 提示没有系统音频权限，或者录音全是静音 | 终端 App 没有"系统录音"授权 | 在这个终端里跑 `meetap setup`；或者在 系统设置 › 隐私与安全性 › 屏幕与系统录音 里把终端 App 加进"仅系统录音"，再重开终端 |
+| 录出 0 字节的音频，或者转录报 `input file empty`（短会议偶发） | macOS Process Tap 的回调偶尔不启动，ffmpeg 收不到数据。终端底部的波形读的是麦克风，这时照样会跳，不代表在正常录 | 录音中 audio-tap 会自己盯着：有声音在放、tap 却一直没数据，就在进程内重建 tap，录音不中断。`start` 时起不来会自动重试 3 次；还不行就按提示跑 `meetap setup` 查授权，或者重新 `start`。细节见 [docs/tap-静默空录排障.md](docs/tap-静默空录排障.md) |
+| 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零：授权失效，或者系统录音中途出了故障；也可能那个 App 只是开着音频输出、其实没出声 | 看通知里写的是哪个 App。它当时其实没出声（比如 Amazon WorkSpaces 客户端一直开着输出），就把通知里**括号里那一串**（bundle ID，比如 `com.google.Chrome.helper`；命令行程序没有括号，写程序名）加进配置 `zero_alert_ignore`，逗号分隔。确实在开会，就跑 `meetap setup` 查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间记在 `.meetap/audio-tap.log`（`TAP_ZERO_START` / `TAP_ZERO_END`；名单里的 App 记作 `ignored=`） |
+| 转录失败：`AWS credentials not configured` | 没配 AWS 凭证 | 跑 `aws configure`，或者检查 `AWS_PROFILE` |
+| 弹通知"AWS 凭证可能过期了"，日志里"凭证取不到或者已经过期" | 凭证过期了，或者刷新时网断了一下 | 刷新凭证就行，meetap 自己接着跑，不用 `again`；每一步最多等 15 分钟。放弃了（第二次通知），就在凭证恢复以后跑通知里写的 `meetap again <会话>`，AWS 上已经转完的结果会直接拿来用 |
+| 转录或写纪要报 `AccessDenied` / `ValidationException` | 账号没开通模型，或者 IAM 权限不够 | 在 Bedrock 控制台的 Model access 里开通模型；IAM 要有 `bedrock:InvokeModelWithResponseStream`，默认模型是跨区域推理配置文件，推理配置文件、本区域的基础模型、不分区域的基础模型三段都要有，见 [docs/iam.md](docs/iam.md) |
+| 纪要一直没出来，卡在 "Generating meeting notes..." | 多半是 Bedrock 报错或者流断了 | 看会话的 `log/meetap.log` 里具体的 AWS 报错；断流的排查见 [docs/bedrock-纪要断流排障.md](docs/bedrock-纪要断流排障.md)；修好后 `meetap again` |
+| 通知"录音里没有识别出说话内容"，没有纪要 | 录音只有几秒，或者一直没人说话，转录出来一个词都没有 | 不用处理：不生成纪要，音频留着。`meetap <文件夹>` 的纪要一行写"没有（录音里没有说话内容）"，日历一行写"录音里没有说话内容，没认日历" |
+| 录音有回声 | 外放的声音又被麦克风录进去一遍 | 戴耳机；只要电脑声音时用 `-m` |
+| 系统通知没弹出来 | 通知权限没开 | 系统设置 › 通知 里允许"终端"（或你用的终端 App）和"脚本编辑器"发送通知 |
+| `materials/` 里没有 `calendar.md`，纪要里没用上日历 | 日历没授权、没同步、时段里没有会，或者模型判断内容对不上 | 先看纪要完成的通知和 `log/meetap.log` 里的 📅，或者跑 `meetap <文件夹>` 看日历那一行。写着"按内容判断都不是这场"：模型认为录音和同时段的会对不上。写着"没有读取权限"：在开录的那个终端里跑 `meetap setup`（只有「写入」权限的，去 系统设置 › 隐私与安全性 › 日历 改成「完全访问」，改完可能要重开终端）。写着"没有对应的会"：检查 系统设置 › 互联网账户 里的日历是否已同步，或者这场录音和日历里的会是否重叠不到 5 分钟。配置 `calendar = off` 时不会查 |
+| 从 1.x 升级后听不到声音 | 系统输出或会议 App 的扬声器还指着 BlackHole 2ch | 跑一次 `meetap setup`，或者在 系统设置 › 声音 › 输出、会议 App 的音频设置里改回扬声器 / 耳机 |
+
+---
+
+## 更多
+
+- **实现原理**（Process Tap 怎么录、云上走了哪几步）：[docs/how-it-works.md](docs/how-it-works.md)
+- **最小 IAM 权限**：[docs/iam.md](docs/iam.md)
+- **开发、测试**：[docs/development.md](docs/development.md)
 
 ## License
 

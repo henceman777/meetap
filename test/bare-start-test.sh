@@ -101,13 +101,13 @@ for args in "-g 周会" "--tag 周会" "$S -g 周会" "-g 周会 -g 客户A" "-g
         fail "meetap $args 不对 (rc=$RC): $OUT"
     fi
 done
-rm -f "$TMP/rec/$S/meta.json"
+rm -f "$TMP/rec/$S/meta.json" "$TMP/rec/$S/.meetap/meta.json"
 
 # 4d. 报错、不开录、不写文件：开录选项和 -g 混用、不认识的命令、真实存在但不是会话的目录
 for args in "-m -g 周会" "-g 周会 -m" "-d 60 --untag 周会" "周会" "stpo" "." "src" "20991231_2359"; do
     # shellcheck disable=SC2086
     OUT=$(cd "$REPO_ROOT" && "$MEETAP" $args </dev/null 2>&1); RC=$?
-    if [[ "$OUT" != *"$ALREADY"* && $RC -ne 0 && ! -e "$TMP/rec/$S/meta.json" ]]; then
+    if [[ "$OUT" != *"$ALREADY"* && $RC -ne 0 && ! -e "$TMP/rec/$S/meta.json" && ! -e "$TMP/rec/$S/.meetap/meta.json" ]]; then
         pass "meetap $args 报错且不开录"
     else
         fail "meetap $args 不对 (rc=$RC): $OUT"

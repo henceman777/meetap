@@ -98,7 +98,7 @@ record() {
         < /dev/null > "$fifo" 2> "$log" &
     local tap=$!
     ffmpeg -y -f f32le -ar "$RATE" -ac 1 -i "$fifo" -c:a aac -b:a 128k -ac 1 \
-        -movflags frag_keyframe+empty_moov "$m4a" < /dev/null > "$TMP/ffmpeg.log" 2>&1 &
+        -movflags frag_keyframe+empty_moov -frag_duration 10000000 -flush_packets 1 "$m4a" < /dev/null > "$TMP/ffmpeg.log" 2>&1 &
     local ff=$!
     if [[ $action != none ]]; then
         while (( $(echo "$(now) - $T0 < 20" | bc -l) )); do sleep 0.1; done

@@ -185,21 +185,27 @@ func overlapSec(_ e: CalItem, _ ws: Date, _ we: Date) -> Double {
 // 重叠门槛：至少 5 分钟；录音不到 10 分钟时，至少录音时长的一半
 func minOverlapSec(window: Double) -> Double { window < 600 ? window / 2 : 300 }
 
-// 重叠最长的当「这场会」，并列取开始时间离开录最近的；其余过门槛的当候选（最多 5 个）。
-// 全天、已取消、我已拒绝的不算。按重叠算，提前开录、会议拖堂都能匹配上。
-func pickMeeting(_ items: [CalItem], start ws: Date, end we: Date) -> (match: Int?, candidates: [Int]) {
+// 时间分 = 重叠时长 ÷ 录音和这场会合起来的总时长（0~1）。一场 3 小时的占位日程重叠再多，
+// 合起来的总时长也长，分就低；时间和录音贴合的会分高。
+func timeScore(_ e: CalItem, _ ws: Date, _ we: Date) -> Double {
+    let union = max(e.end, we).timeIntervalSince(min(e.start, ws))
+    return union > 0 ? overlapSec(e, ws, we) / union : 0
+}
+
+// 候选：先过门槛（全天、已取消、我已拒绝的不算），再按时间分从高到低排，分数一样取开始时间离开录
+// 最近的；最多 5 场。只按时间排个序，是哪一场由 meetap 转录完以后按内容认。
+func rankCandidates(_ items: [CalItem], start ws: Date, end we: Date) -> [Int] {
     let need = minOverlapSec(window: we.timeIntervalSince(ws))
     let ok = items.indices.filter { i in
         let e = items[i], o = overlapSec(e, ws, we)
         return !e.allDay && !e.canceled && !e.declined && o > 0 && o >= need
     }
     let sorted = ok.sorted { a, b in
-        let oa = overlapSec(items[a], ws, we), ob = overlapSec(items[b], ws, we)
-        if oa != ob { return oa > ob }
+        let sa = timeScore(items[a], ws, we), sb = timeScore(items[b], ws, we)
+        if abs(sa - sb) > 1e-9 { return sa > sb }
         return abs(items[a].start.timeIntervalSince(ws)) < abs(items[b].start.timeIntervalSince(ws))
     }
-    guard let first = sorted.first else { return (nil, []) }
-    return (first, Array(sorted.dropFirst().prefix(5)))
+    return Array(sorted.prefix(5))
 }
 
 let isoOut: ISO8601DateFormatter = {
@@ -279,27 +285,25 @@ func runCalendarQuery(start ws: Date, end we: Date, timeout: Double) -> Never {
                     canceled: e.status == .canceled,
                     declined: e.attendees?.contains { $0.isCurrentUser && $0.participantStatus == .declined } == true)
         }
-        let (m, cands) = pickMeeting(items, start: ws, end: we)
-        var r: [String: Any] = ["status": "ok", "window": window, "match": NSNull()]
-        if let i = m {
+        // 候选全部带上完整字段（正文、参会人是原样的，去掉入会信息由 meetap 做）；
+        // match 是时间分最高的那场，只是按时间的猜测，留着给只看时间的调用方
+        let cands = rankCandidates(items, start: ws, end: we).map { i -> [String: Any] in
             let e = evs[i]
-            var md: [String: Any] = [
+            var d: [String: Any] = [
                 "title": items[i].title,
                 "start": isoOut.string(from: e.startDate), "end": isoOut.string(from: e.endDate),
                 "overlap_sec": Int(overlapSec(items[i], ws, we)),
+                "time_score": (timeScore(items[i], ws, we) * 1000).rounded() / 1000,
                 "calendar": e.calendar?.title ?? "",
                 "attendees": (e.attendees ?? []).map(participantJSON),
                 "attendee_count": e.attendees?.count ?? 0,
                 "location": e.location ?? "", "notes": e.notes ?? "",
             ]
-            if let o = e.organizer { md["organizer"] = participantJSON(o) }
-            r["match"] = md
+            if let o = e.organizer { d["organizer"] = participantJSON(o) }
+            return d
         }
-        // 候选只给标题和时间，不带正文
-        r["candidates"] = cands.map { i -> [String: Any] in
-            ["title": items[i].title, "start": isoOut.string(from: items[i].start),
-             "end": isoOut.string(from: items[i].end), "overlap_sec": Int(overlapSec(items[i], ws, we))]
-        }
+        var r: [String: Any] = ["status": "ok", "window": window, "candidates": cands]
+        r["match"] = cands.first ?? NSNull()
         result = r
         done.signal()
     }
@@ -342,46 +346,65 @@ func runSelftestCalendar() -> Never {
               declined: Bool = false) -> CalItem {
         CalItem(title: title, start: at(s), end: at(e), allDay: allDay, canceled: canceled, declined: declined)
     }
-    func titles(_ items: [CalItem], _ r: (match: Int?, candidates: [Int])) -> (String?, [String]) {
-        (r.match.map { items[$0].title }, r.candidates.map { items[$0].title })
+    func pick(_ items: [CalItem], _ s: Double, _ e: Double) -> (String?, [String]) {
+        let r = rankCandidates(items, start: at(s), end: at(e))
+        return (r.first.map { items[$0].title }, r.dropFirst().map { items[$0].title })
     }
     do {  // 提前开录、会议拖堂：录音 -2 ~ 70，会议 0 ~ 60
         let items = [item("周会", 0, 60)]
-        let r = titles(items, pickMeeting(items, start: at(-2), end: at(70)))
+        let r = pick(items, -2, 70)
         check(r.0 == "周会", "提前开录、拖堂都能匹配上（按重叠算）")
     }
-    do {  // 重叠最长的当这场会，其余当候选
+    do {  // 时间分最高的排第一，重叠不到 5 分钟的不进候选
         let items = [item("office hour", 30, 60), item("架构周会", 0, 60), item("下一场", 55, 90)]
-        let r = titles(items, pickMeeting(items, start: at(1), end: at(52)))
-        check(r.0 == "架构周会" && r.1 == ["office hour"], "重叠最长的当这场会，重叠不到 5 分钟的不当候选：\(r)")
+        let r = pick(items, 1, 52)
+        check(r.0 == "架构周会" && r.1 == ["office hour"], "时间分最高的排第一，重叠不到 5 分钟的不进候选：\(r)")
+    }
+    do {  // 11-19 的真实情况：09:00–12:00 的占位日程和 11:00–12:00 的会，录音 10:53–12:09
+        // 以 09:00 为 0 分钟：占位 0~180，会 120~180，录音 113~189
+        let items = [item("占位日程", 0, 180), item("分享会", 120, 180)]
+        let r = rankCandidates(items, start: at(113), end: at(189))
+        let s0 = timeScore(items[0], at(113), at(189)), s1 = timeScore(items[1], at(113), at(189))
+        check(r.map { items[$0].title } == ["分享会", "占位日程"],
+              String(format: "占位日程重叠更久也排在后面：分享会 %.3f > 占位日程 %.3f", s1, s0))
+    }
+    do {  // 同一时段两场真会：时间完全一样，分数一样，两场都进候选（交给按内容认）
+        let items = [item("会 A", 0, 60), item("会 B", 0, 60)]
+        let r = rankCandidates(items, start: at(0), end: at(60))
+        check(r.count == 2, "同一时段两场一样的会都进候选，按内容认")
     }
     do {  // 全天、已取消、我已拒绝的不算
         let items = [item("生日", -600, 840, allDay: true), item("取消了", 0, 60, canceled: true),
                      item("我拒了", 0, 60, declined: true), item("真会", 10, 40)]
-        let r = titles(items, pickMeeting(items, start: at(0), end: at(60)))
+        let r = pick(items, 0, 60)
         check(r.0 == "真会" && r.1.isEmpty, "全天、已取消、我已拒绝的都不算：\(r)")
     }
     do {  // 门槛：录音 60 分钟时，重叠 4 分钟的不算
         let items = [item("上一场", -30, 4)]
-        let r = pickMeeting(items, start: at(0), end: at(60))
-        check(r.match == nil, "重叠不到 5 分钟的不算（防止把上一场会当成这场）")
+        check(rankCandidates(items, start: at(0), end: at(60)).isEmpty, "重叠不到 5 分钟的不算（防止把上一场会当成这场）")
     }
     do {  // 短录音：8 分钟的录音，门槛是 4 分钟
         let items = [item("站会", 0, 15)]
-        check(pickMeeting(items, start: at(13), end: at(21)).match == nil, "8 分钟录音只重叠 2 分钟（不到一半）：不算")
-        check(pickMeeting(items, start: at(9), end: at(17)).match == 0, "8 分钟录音重叠 6 分钟（过半）：算")
+        check(rankCandidates(items, start: at(13), end: at(21)).isEmpty, "8 分钟录音只重叠 2 分钟（不到一半）：不算")
+        check(rankCandidates(items, start: at(9), end: at(17)) == [0], "8 分钟录音重叠 6 分钟（过半）：算")
     }
-    do {  // 并列：重叠一样长，取开始时间离开录最近的
+    do {  // 重叠一样长：时间更贴合录音的分高
         let items = [item("远的", -60, 30), item("近的", -5, 30)]
-        let r = titles(items, pickMeeting(items, start: at(0), end: at(30)))
-        check(r.0 == "近的" && r.1 == ["远的"], "重叠一样长时，取开始时间离开录最近的：\(r)")
+        let r = pick(items, 0, 30)
+        check(r.0 == "近的" && r.1 == ["远的"], "重叠一样长时，时间更贴合录音的排前面：\(r)")
+    }
+    do {  // 分数完全一样：取开始时间离开录最近的
+        // 录音 0~60：A 是 -20~60（重叠 60、合起来 80），B 是 0~80（重叠 60、合起来 80），分数都是 0.75
+        let items = [item("提前 20 分钟开", -20, 60), item("准点开", 0, 80)]
+        let r = pick(items, 0, 60)
+        check(r.0 == "准点开", "分数一样时，取开始时间离开录最近的：\(r)")
     }
     do {  // 候选最多 5 个
         let items = (0..<8).map { item("会\($0)", 0, 60) }
-        check(pickMeeting(items, start: at(0), end: at(60)).candidates.count == 5, "候选最多 5 个")
+        check(rankCandidates(items, start: at(0), end: at(60)).count == 5, "候选最多 5 个")
     }
     do {
-        check(pickMeeting([], start: at(0), end: at(60)).match == nil, "没有事件：没匹配到，不报错")
+        check(rankCandidates([], start: at(0), end: at(60)).isEmpty, "没有事件：没有候选，不报错")
         check(parseTime("1794960000") == t0 && parseTime("2026-11-18T12:01:06+08:00") != nil && parseTime("昨天") == nil,
               "--start / --end 认 epoch 秒和 ISO 8601，认不出返回 nil")
     }
@@ -408,7 +431,7 @@ guard let cmd = args.first else {
       calendar-request     只给 setup 用：请求日历完全访问权限（会弹授权框），输出请求后的状态
       calendar-count       已授权时能读到的日历个数
       calendar-query --start T --end T [--timeout 10]
-                           按时间段找对应的会，输出 JSON（match + candidates）；T 是 epoch 秒或
+                           按时间段收候选会议，输出 JSON（candidates 按时间分排好，match 是第一场）；T 是 epoch 秒或
                            ISO 8601。没有完全访问权限就直接返回 not_authorized，绝不请求授权
       selftest-calendar    匹配规则自检
 

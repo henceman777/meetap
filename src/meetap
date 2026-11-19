@@ -1,10 +1,16 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="1.7.2"
+VERSION="2.0.0"
 BUILD_ID=""   # make install 写入「分支@提交号」，区分本地试用构建；Homebrew 安装为空
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
+MEETAP_ARGV="$*"   # 这次是怎么调用的，写进日志的分隔行
+
+# 录音边录边落盘：分片 MP4，每 10 秒切一片（-frag_duration 单位是微秒），每片写完马上刷到磁盘。
+# frag_keyframe 只在视频关键帧处切片，纯音频光靠它永远切不了，整场都攒在内存里、文件一直 32 字节，
+# 进程被强杀或断电就全丢了；-flush_packets 1 不加的话，写好的片还会在缓冲里攒到 256 KB 才落盘
+FFMPEG_MUX_ARGS=(-movflags frag_keyframe+empty_moov -frag_duration 10000000 -flush_packets 1)
 
 # Defaults
 CFG_REGION="us-east-1"
@@ -375,17 +381,194 @@ autostop_daemon() {
     done
 }
 
+# 会话的诊断文件——录音诊断 audio-tap.log、发言统计 speaker-stats.txt、转录失败时留下的
+# transcribe-raw.json——放在会话里的隐藏目录 .meetap/（Finder 和 ls 默认看不到）。
+# log/ 里放用户会看的：转录文本 transcript.txt 和排错日志 meetap.log。
+_diag_dir() {
+    mkdir -p "$1/.meetap" 2>/dev/null
+    printf '%s' "$1/.meetap"
+}
+
+# ── AWS 调用失败时别马上放弃：凭证过期、网络断一下，恢复了接着跑（2.0）──
+# 每一步各自最多等 RETRY_LIMIT 秒（15 分钟），间隔从 10 秒起逐次翻倍、最长 2 分钟；
+# 一步成功了，下一步重新计时。通知只弹两次：一次断掉时第一次失败弹一次，最后放弃再弹一次。
+RETRY_LIMIT="${MEETAP_RETRY_LIMIT_SEC:-900}"   # 环境变量只给测试用（缩短等待），间隔按比例跟着缩
+RETRY_DOWN=""        # 正在断着：第一次失败已经记过、弹过通知
+RETRY_GAVE_UP=""     # 这一轮有一步等到上限放弃了
+RETRY_SESSION=""     # 放弃时提示 meetap again 哪一场
+RETRY_LAST_MSG=""    # 最近一次失败时 stderr 的最后一行（调用方要写出错原因时用）
+
+# _aws_error_kind <stderr 文件>：cred（取不到凭证、令牌过期）/ net（连不上、超时、限流、服务端出错）/
+# gone（要的东西没了，重试也没用）/ other
+_aws_error_kind() {
+    if grep -qiE 'Unable to locate credentials|ExpiredToken|security token included in the request is (expired|invalid)|RequestExpired|InvalidClientTokenId|UnrecognizedClient|Error when retrieving credentials|Error loading SSO|SSO session|Token has expired|token is expired|Partial credentials found|NoCredentialsError|CredentialRetrievalError|TokenRetrievalError|Unable to load credentials' "$1" 2>/dev/null; then
+        echo cred
+    elif grep -qiE "couldn.t be found|could not be found|NoSuchKey|NoSuchUpload|\(404\)|Not Found" "$1" 2>/dev/null; then
+        echo gone
+    elif grep -qiE 'Could not connect to the endpoint|EndpointConnectionError|Connection (was closed|reset|refused|aborted)|ConnectionClosedError|Connect timeout|Read timeout|timed out|Temporary failure in name resolution|nodename nor servname|Network is unreachable|Name or service not known|SSLError|SSL validation|EOF occurred|RemoteDisconnected|Throttl|TooManyRequests|SlowDown|ServiceUnavailable|InternalServerError|InternalFailure|InternalError|\(50[0-9]\)' "$1" 2>/dev/null; then
+        echo net
+    else
+        echo other
+    fi
+}
+
+_notify() {
+    osascript -e "display notification \"$1\" with title \"MeeTap\"" 2>/dev/null
+}
+
+# _retry <步骤> <策略> <命令…>：失败了按策略重试，成功返回 0，放弃时返回命令的退出码。
+# 命令的 stdout 原样透传（要取输出用 _retry_out，别放进 $(...)：子 shell 里改的状态带不回来）；
+# stderr 先存下来分辨原因，再写进日志。步骤是提示语里 STEP_<步骤> 的名字。
+#   aws：凭证、网络问题一直重试到上限；别的错误最多试 3 次
+#   once：凭证、网络问题一直重试到上限；别的错误不重试（命令自己已经重试过）
+#   cred：只有凭证问题等着恢复；别的（包括网络、超时）马上返回，调用方自己兜底
+_retry() {
+    local step="$1" policy="$2" t0=$SECONDS n=0 other=0 rc kind delay name errf
+    shift 2
+    name=$(_tn "STEP_$step")
+    errf=$(mktemp "${TMPDIR:-/tmp}/meetap-err.XXXXXX") || { "$@"; return; }
+    while true; do
+        "$@" 2>"$errf"; rc=$?
+        cat "$errf" >&2
+        RETRY_LAST_MSG=$(grep -v '^[[:space:]]*$' "$errf" | tail -1 | cut -c1-200)
+        if (( rc == 0 )); then
+            if [[ -n "$RETRY_DOWN" ]]; then
+                echo "[$(date '+%H:%M:%S')] $(_tn RETRY_RECOVERED "$name")" >&2
+                RETRY_DOWN=""
+            fi
+            rm -f "$errf"; return 0
+        fi
+        kind=$(_aws_error_kind "$errf")
+        case "$policy:$kind" in
+            aws:cred|aws:net|once:cred|once:net|cred:cred) ;;
+            aws:other) other=$((other + 1)); (( other < 3 )) || { rm -f "$errf"; return $rc; } ;;
+            *) rm -f "$errf"; return $rc ;;
+        esac
+        n=$((n + 1))
+        if (( SECONDS - t0 >= RETRY_LIMIT )); then
+            echo "[$(date '+%H:%M:%S')] $(_tn RETRY_GAVE_UP "$name" "$(( (RETRY_LIMIT + 59) / 60 ))" "$RETRY_SESSION")" >&2
+            _notify "$(_tn NOTIFY_RETRY_GAVE_UP "$name" "$RETRY_SESSION")"
+            RETRY_GAVE_UP=1; RETRY_DOWN=""
+            rm -f "$errf"; return $rc
+        fi
+        if [[ -z "$RETRY_DOWN" && "$kind" != other ]]; then
+            # 这次断掉的第一次失败：日志写明原因，弹一次通知
+            RETRY_DOWN=1
+            if [[ "$kind" == cred ]]; then
+                echo "[$(date '+%H:%M:%S')] $(_tn RETRY_CRED "$name" "$(( (RETRY_LIMIT + 59) / 60 ))")" >&2
+                _notify "$(_tn NOTIFY_RETRY_CRED "$name")"
+            else
+                echo "[$(date '+%H:%M:%S')] $(_tn RETRY_NET "$name" "$(( (RETRY_LIMIT + 59) / 60 ))")" >&2
+                _notify "$(_tn NOTIFY_RETRY_NET "$name")"
+            fi
+        fi
+        # 间隔：上限的 1/90 起（15 分钟 → 10 秒）逐次翻倍，最长上限的 1/7.5（2 分钟），不超过剩下的时间
+        delay=$(awk -v l="$RETRY_LIMIT" -v n="$n" -v e="$((SECONDS - t0))" 'BEGIN {
+            d = l / 90 * 2 ^ (n - 1); if (d > l / 7.5) d = l / 7.5; if (d > l - e) d = l - e; if (d < 0.05) d = 0.05
+            if (d >= 1) printf "%d", d + 0.5; else printf "%.2f", d }')
+        echo "[$(date '+%H:%M:%S')] $(_tn RETRY_WAIT "$name" "$n" "$delay")" >&2
+        sleep "$delay"
+    done
+}
+
+# _retry_out <变量名> <步骤> <策略> <命令…>：同 _retry，命令的输出存进变量
+_retry_out() {
+    local __var="$1" __f __rc
+    shift
+    __f=$(mktemp "${TMPDIR:-/tmp}/meetap-out.XXXXXX") || return 1
+    _retry "$@" > "$__f"; __rc=$?
+    printf -v "$__var" '%s' "$(cat "$__f")"
+    rm -f "$__f"
+    return $__rc
+}
+
+# 日志接着往后写，每次开头一行分隔：几点、哪个命令
+_log_separator() {
+    echo "===== $(date '+%Y-%m-%d %H:%M:%S') · $(basename "$0")${MEETAP_ARGV:+ $MEETAP_ARGV} ====="
+}
+
+# 桶不在就建，并锁死公共访问（兜底防止误配导致内容泄露）。
+# 只有凭证、网络问题算失败（交给 _retry 等着恢复）；别的报错照旧不管——最小权限策略里没有
+# ListBucket / CreateBucket，查不到、建不了都正常，桶多半已经在了，上传那一步自然见分晓
+_ensure_bucket() {
+    local bucket="$1" region="$2" errf kind
+    errf=$(mktemp "${TMPDIR:-/tmp}/meetap-err.XXXXXX") || return 0
+    if ! aws s3api head-bucket --bucket "$bucket" --region "$region" >/dev/null 2>&1; then
+        aws s3 mb "s3://${bucket}" --region "$region" 2>"$errf"
+    fi
+    aws s3api put-public-access-block \
+        --bucket "$bucket" \
+        --public-access-block-configuration \
+        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
+        --region "$region" 2>>"$errf"
+    kind=$(_aws_error_kind "$errf")
+    if [[ "$kind" == cred || "$kind" == net ]]; then
+        cat "$errf" >&2; rm -f "$errf"; return 1
+    fi
+    rm -f "$errf"; return 0
+}
+
+# 提交转录任务。上一次其实已经提交上去、只是回应丢了的话，再提交会报任务名已存在，算成功
+_start_transcription_job() {
+    local job="$1" bucket="$2" key="$3" region="$4" lang_flag="--identify-language" errf rc
+    [[ "$CFG_MULTI_LANGUAGE" == "true" ]] && lang_flag="--identify-multiple-languages"
+    errf=$(mktemp "${TMPDIR:-/tmp}/meetap-err.XXXXXX") || return 1
+    aws transcribe start-transcription-job \
+        --transcription-job-name "$job" \
+        $lang_flag \
+        --language-options $CFG_TRANSCRIBE_LANGUAGES \
+        --media-format "mp4" \
+        --media "{\"MediaFileUri\": \"s3://${bucket}/${key}\"}" \
+        --output-bucket-name "$bucket" \
+        --region "$region" \
+        --settings "{\"ShowSpeakerLabels\": true, \"MaxSpeakerLabels\": $CFG_MAX_SPEAKERS}" \
+        > /dev/null 2>"$errf"
+    rc=$?
+    if (( rc != 0 )) && grep -qi 'already exists' "$errf"; then rc=0; fi
+    (( rc == 0 )) || cat "$errf" >&2
+    rm -f "$errf"
+    return $rc
+}
+
+# 这一场的转录任务记在 .meetap/transcribe-job.json：again 时任务还在 AWS 上就直接接着用
+_job_file_write() {   # _job_file_write <文件> <任务名> <桶> <区域> <音频 key>
+    python3 -I -c 'import json, sys
+from datetime import datetime
+f, job, bucket, region, key = sys.argv[1:6]
+json.dump({"job": job, "bucket": bucket, "region": region, "audio_key": key,
+           "started_at": datetime.now().astimezone().isoformat(timespec="seconds")}, open(f, "w"), indent=2)' "$@"
+}
+_job_file_read() {    # 输出：任务名 \t 桶 \t 区域 \t 音频 key
+    python3 -I -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+print("\t".join(str(d.get(k) or "-") for k in ("job", "bucket", "region", "audio_key")))' "$1" 2>/dev/null
+}
+
+# 只删这一场自己的文件：所有会话共用一个桶，别把别的会还在转、或者留着等 again 的文件一起删掉
+_transcribe_cleanup() {   # _transcribe_cleanup <桶> <音频 key> <任务名> <区域>
+    aws s3 rm "s3://${1}/${2}" --region "$4" 2>/dev/null
+    aws s3 rm "s3://${1}/${3}.json" --region "$4" 2>/dev/null
+    aws transcribe delete-transcription-job --transcription-job-name "$3" --region "$4" 2>/dev/null
+}
+
 transcribe_recording() {
     local AUDIO_FILE="$1"
     local SESSION_DIR="$2"
     local LOG_DIR="$SESSION_DIR/log"
     mkdir -p "$LOG_DIR"
+    local DIAG_DIR
+    DIAG_DIR=$(_diag_dir "$SESSION_DIR")
     local LOG_FILE="$LOG_DIR/meetap.log"
     local AWS_REGION="$CFG_REGION"
 
+    local JOB_FILE="$DIAG_DIR/transcribe-job.json"
+    RETRY_SESSION=$(_session_ref "$SESSION_DIR")
+
     # 语音文件保留在 session 根目录原位，不再移入 log/（用户要求位置不变动）
 
-    exec > "$LOG_FILE" 2>&1
+    # 接着往后写，不冲掉上一次的日志（again 重跑时，上一次为什么失败还看得到）
+    exec >> "$LOG_FILE" 2>&1
+    _log_separator
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
 
     # 整段是数字静音（全 0 样本）就不上传转录：多半是没授权系统音频录制，
@@ -399,17 +582,17 @@ transcribe_recording() {
         return 1
     fi
 
-    # 日历：按录音时段找对应的会，写 materials/calendar.md（查不到就跳过，最多十几秒）
-    calendar_lookup_for_session "$SESSION_DIR"
+    # 日历：按录音时段收候选（查不到就跳过，最多十几秒）；转录完、生成纪要之前再按内容认
+    calendar_collect_for_session "$SESSION_DIR"
 
     if ! command -v aws &>/dev/null; then
         _t ERR_AWS_CLI_MISSING
         return 1
     fi
 
-    local ACCOUNT_ID
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-    if [[ -z "$ACCOUNT_ID" ]]; then
+    # 凭证过期、网络断了：等着恢复（最多 15 分钟），不马上放弃
+    local ACCOUNT_ID=""
+    if ! _retry_out ACCOUNT_ID STS aws aws sts get-caller-identity --query Account --output text || [[ -z "$ACCOUNT_ID" ]]; then
         _t ERR_AWS_CREDS_MISSING
         return 1
     fi
@@ -418,133 +601,159 @@ transcribe_recording() {
     local ACCOUNT_HASH
     ACCOUNT_HASH=$(printf '%s' "$ACCOUNT_ID" | shasum -a 256 | cut -c1-12)
     local BUCKET="meetap-transcribe-${ACCOUNT_HASH}-${AWS_REGION}"
-    local AUDIO_BASENAME
-    AUDIO_BASENAME=$(basename "$AUDIO_FILE")
+    local AUDIO_KEY
+    AUDIO_KEY=$(basename "$AUDIO_FILE")
     local JOB_NAME="meetap-$(date +%Y%m%d-%H%M%S)-$$"
+    local STATUS="" REUSE=""
 
-    # Create bucket if not exists
-    aws s3 mb "s3://${BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
-
-    # 锁死公共访问，兜底防止误配导致内容泄露
-    aws s3api put-public-access-block \
-        --bucket "$BUCKET" \
-        --public-access-block-configuration \
-        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
-        --region "$AWS_REGION" 2>/dev/null || true
-
-    # Upload
-    echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"
-    if ! aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_BASENAME}" --region "$AWS_REGION"; then
-        _t ERR_UPLOAD_FAILED
-        return 1
-    fi
-
-    # Start transcription
-    local LANG_FLAG="--identify-language"
-    if [[ "$CFG_MULTI_LANGUAGE" == "true" ]]; then
-        LANG_FLAG="--identify-multiple-languages"
-    fi
-    echo "[$(date '+%H:%M:%S')] $(_tn START_JOB "$JOB_NAME")"
-    aws transcribe start-transcription-job \
-        --transcription-job-name "$JOB_NAME" \
-        $LANG_FLAG \
-        --language-options $CFG_TRANSCRIBE_LANGUAGES \
-        --media-format "mp4" \
-        --media "{\"MediaFileUri\": \"s3://${BUCKET}/${AUDIO_BASENAME}\"}" \
-        --output-bucket-name "$BUCKET" \
-        --region "$AWS_REGION" \
-        --settings "{\"ShowSpeakerLabels\": true, \"MaxSpeakerLabels\": $CFG_MAX_SPEAKERS}" \
-        > /dev/null
-
-    # Poll for completion
-    local POLL_ERRORS=0
-    while true; do
-        local STATUS
-        STATUS=$(aws transcribe get-transcription-job \
-            --transcription-job-name "$JOB_NAME" \
-            --region "$AWS_REGION" \
-            --query 'TranscriptionJob.TranscriptionJobStatus' \
-            --output text 2>/dev/null)
-        if [[ -z "$STATUS" ]]; then
-            POLL_ERRORS=$((POLL_ERRORS + 1))
-            echo "[$(date '+%H:%M:%S')] $(_tn STATUS_QUERY_RETRY "$POLL_ERRORS")"
-            if [[ $POLL_ERRORS -ge 5 ]]; then
-                _t STATUS_QUERY_ABORT
-                break
-            fi
-            sleep 10
-            continue
+    # again：上一次的转录任务还在 AWS 上（转完了、或者还在转），直接接着用，不重新上传、不重新转录
+    if [[ -f "$JOB_FILE" ]]; then
+        local saved_job saved_bucket saved_region saved_key
+        IFS=$'\t' read -r saved_job saved_bucket saved_region saved_key < <(_job_file_read "$JOB_FILE")
+        if [[ "$saved_job" == meetap-* && "$saved_bucket" == "$BUCKET" && "$saved_region" == "$AWS_REGION" && "$saved_key" != "-" ]] \
+           && _retry_out STATUS POLL aws aws transcribe get-transcription-job --transcription-job-name "$saved_job" \
+                  --region "$AWS_REGION" --query 'TranscriptionJob.TranscriptionJobStatus' --output text; then
+            case "$STATUS" in
+                COMPLETED|IN_PROGRESS|QUEUED) REUSE=1; JOB_NAME="$saved_job"; AUDIO_KEY="$saved_key" ;;
+            esac
         fi
-        POLL_ERRORS=0
+        [[ -n "$RETRY_GAVE_UP" ]] && return 1
+        if [[ -n "$REUSE" ]]; then
+            echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_REUSE "$JOB_NAME")"
+        else
+            # 上一次的任务失败了或者没了：它留下的文件先清掉，从头转
+            [[ "$saved_job" == meetap-* && "$saved_key" != "-" ]] && _transcribe_cleanup "$saved_bucket" "$saved_key" "$saved_job" "$saved_region"
+            rm -f "$JOB_FILE"; STATUS=""
+        fi
+    fi
+
+    if [[ -z "$REUSE" ]]; then
+        if ! _retry BUCKET aws _ensure_bucket "$BUCKET" "$AWS_REGION"; then
+            _t ERR_UPLOAD_FAILED
+            return 1
+        fi
+
+        # Upload
+        echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"
+        if ! _retry UPLOAD aws aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION"; then
+            _t ERR_UPLOAD_FAILED
+            return 1
+        fi
+
+        # Start transcription
+        echo "[$(date '+%H:%M:%S')] $(_tn START_JOB "$JOB_NAME")"
+        if ! _retry START aws _start_transcription_job "$JOB_NAME" "$BUCKET" "$AUDIO_KEY" "$AWS_REGION"; then
+            _t ERR_TRANSCRIBE_FAILED "${RETRY_LAST_MSG:-start-transcription-job}"
+            # 凭证一直没恢复的话删也删不掉；别的原因提交失败，就把刚传上去的音频删掉
+            [[ -n "$RETRY_GAVE_UP" ]] || aws s3 rm "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION" 2>/dev/null
+            osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+            return 1
+        fi
+        _job_file_write "$JOB_FILE" "$JOB_NAME" "$BUCKET" "$AWS_REGION" "$AUDIO_KEY"
+    fi
+
+    # Poll for completion：每次查状态都按同一套规则重试（凭证、网络断了等着，每次各自最多 15 分钟）
+    while [[ "$STATUS" != COMPLETED && "$STATUS" != FAILED ]]; do
+        [[ -n "$STATUS" ]] && sleep 10
+        if ! _retry_out STATUS POLL aws aws transcribe get-transcription-job \
+                --transcription-job-name "$JOB_NAME" \
+                --region "$AWS_REGION" \
+                --query 'TranscriptionJob.TranscriptionJobStatus' \
+                --output text; then
+            STATUS=""
+            break
+        fi
         echo "[$(date '+%H:%M:%S')] $(_tn STATUS_LINE "$STATUS")"
-        [[ "$STATUS" != "IN_PROGRESS" ]] && break
-        sleep 10
+        [[ "$STATUS" == IN_PROGRESS || "$STATUS" == QUEUED ]] || break
     done
 
     if [[ "$STATUS" != "COMPLETED" ]]; then
+        # 等到上限放弃：AWS 上的任务和文件都留着，恢复以后 meetap again 直接接着用
+        [[ -n "$RETRY_GAVE_UP" ]] && return 1
         local REASON
         REASON=$(aws transcribe get-transcription-job \
             --transcription-job-name "$JOB_NAME" \
             --region "$AWS_REGION" \
             --query 'TranscriptionJob.FailureReason' \
             --output text 2>/dev/null)
-        _t ERR_TRANSCRIBE_FAILED "${STATUS:-empty} ${REASON:+— $REASON}"
-        aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
-        aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
+        _t ERR_TRANSCRIBE_FAILED "${STATUS:-${RETRY_LAST_MSG:-empty}} ${REASON:+— $REASON}"
+        _transcribe_cleanup "$BUCKET" "$AUDIO_KEY" "$JOB_NAME" "$AWS_REGION"
+        rm -f "$JOB_FILE"
         osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
         return 1
     fi
 
     # Download result
     echo "[$(date '+%H:%M:%S')] $(_tn DOWNLOADING)"
-    aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$LOG_DIR/transcribe-raw.json" --region "$AWS_REGION"
+    if ! _retry DOWNLOAD aws aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$DIAG_DIR/transcribe-raw.json" --region "$AWS_REGION"; then
+        [[ -n "$RETRY_GAVE_UP" ]] && return 1
+        # 结果文件没了（不是凭证、网络问题）：任务也清掉，again 时从头转
+        _t ERR_TRANSCRIBE_FAILED "${RETRY_LAST_MSG:-download}"
+        _transcribe_cleanup "$BUCKET" "$AUDIO_KEY" "$JOB_NAME" "$AWS_REGION"
+        rm -f "$JOB_FILE"
+        osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
+    fi
 
-    # Extract transcript with speaker labels
+    # 生成转录稿。没有说话人标签（录音只有几秒、或者只有一个人时，Transcribe 给的 speaker_labels 是空的）
+    # 就全部当作 spk_0；一个词都没识别出来时退出码 3，不写转录稿
+    local tx_rc
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 
 session_dir = sys.argv[1]
 log_dir = os.path.join(session_dir, "log")
-raw_json = os.path.join(log_dir, "transcribe-raw.json")
+raw_json = os.path.join(session_dir, ".meetap", "transcribe-raw.json")
 output_txt = os.path.join(log_dir, "transcript.txt")
 
-with open(raw_json) as f:
-    data = json.load(f)
-
-items = data["results"]["items"]
-segments = data["results"]["speaker_labels"]["segments"]
+try:
+    with open(raw_json) as f:
+        data = json.load(f)
+    results = data.get("results") or {}
+    items = results.get("items") or []
+    segments = (results.get("speaker_labels") or {}).get("segments") or []
+except (OSError, ValueError, AttributeError) as e:
+    print(f"Transcript failed: cannot read {raw_json}: {e}", file=sys.stderr)
+    sys.exit(1)
 
 time_speaker = {}
 for seg in segments:
-    for si in seg["items"]:
-        time_speaker[si["start_time"]] = si["speaker_label"]
+    for si in seg.get("items") or []:
+        if "start_time" in si and si.get("speaker_label"):
+            time_speaker[si["start_time"]] = si["speaker_label"]
 
 lines = []
 current_speaker = None
 current_words = []
 
 for item in items:
-    if item["type"] == "pronunciation":
-        speaker = time_speaker.get(item["start_time"], current_speaker)
-        word = item["alternatives"][0]["content"]
+    alts = item.get("alternatives") or [{}]
+    word = alts[0].get("content", "")
+    if item.get("type") == "pronunciation" and word:
+        speaker = time_speaker.get(item.get("start_time"), current_speaker or "spk_0")
         if speaker != current_speaker:
             if current_speaker and current_words:
                 lines.append(f"{current_speaker}: {' '.join(current_words)}")
             current_speaker = speaker
             current_words = []
         current_words.append(word)
-    elif item["type"] == "punctuation":
+    elif item.get("type") == "punctuation":
         if current_words:
-            current_words[-1] += item["alternatives"][0]["content"]
+            current_words[-1] += word
 
 if current_speaker and current_words:
     lines.append(f"{current_speaker}: {' '.join(current_words)}")
+
+if not lines:
+    print("No speech recognized")
+    sys.exit(3)
 
 with open(output_txt, "w") as f:
     f.write("\n\n".join(lines) + "\n")
 
 print(f"Transcript saved: {len(lines)} speaker turns")
 PYEOF
+    tx_rc=$?
 
     # 本地音频要等转录文本落盘后再删：上传后立刻删的话，转录中途休眠/断网，
     # transcript 没出来、音频也没了，meetap again 无从重跑
@@ -553,25 +762,45 @@ PYEOF
         echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
     fi
 
-    # Cleanup S3 bucket and Transcribe job
-    aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
-    aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
+    # 清掉 AWS 上这一场的音频、结果和转录任务（原始结果本地已经有一份）
+    _transcribe_cleanup "$BUCKET" "$AUDIO_KEY" "$JOB_NAME" "$AWS_REGION"
+    rm -f "$JOB_FILE"
 
-    # Extract speaker stats from raw JSON
+    if (( tx_rc == 3 )); then
+        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 .meetap/ 里备查。
+        # meta.json 记下来，等着认的日历也定成 no_speech，meetap <文件夹> 照这个显示
+        _meta no-speech "$SESSION_DIR" on >/dev/null 2>&1
+        echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_NO_SPEECH "$AUDIO_FILE")"
+        osascript -e "display notification \"$(_tn NOTIFY_NO_SPEECH)\" with title \"MeeTap\"" 2>/dev/null
+        return 0
+    elif (( tx_rc != 0 )); then
+        _t ERR_TRANSCRIBE_FAILED "transcript"
+        osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
+    fi
+    _meta no-speech "$SESSION_DIR" off >/dev/null 2>&1
+
+    # 发言统计。没有说话人标签时整段算 spk_0，时长取第一个词到最后一个词
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 session_dir = sys.argv[1]
-log_dir = os.path.join(session_dir, "log")
-raw_json = os.path.join(log_dir, "transcribe-raw.json")
-stats_file = os.path.join(log_dir, "speaker-stats.txt")
+diag_dir = os.path.join(session_dir, ".meetap")
+raw_json = os.path.join(diag_dir, "transcribe-raw.json")
+stats_file = os.path.join(diag_dir, "speaker-stats.txt")
 with open(raw_json) as f:
     data = json.load(f)
-segments = data["results"]["speaker_labels"]["segments"]
+results = data.get("results") or {}
+segments = (results.get("speaker_labels") or {}).get("segments") or []
 speakers = {}
 for seg in segments:
     spk = seg["speaker_label"]
     dur = float(seg["end_time"]) - float(seg["start_time"])
     speakers[spk] = speakers.get(spk, 0) + dur
+if not speakers:
+    times = [(float(i["start_time"]), float(i["end_time"])) for i in results.get("items") or []
+             if i.get("type") == "pronunciation" and "start_time" in i and "end_time" in i]
+    if times:
+        speakers["spk_0"] = max(e for _, e in times) - min(st for st, _ in times)
 total = sum(speakers.values())
 lines = []
 for spk in sorted(speakers):
@@ -586,6 +815,10 @@ with open(stats_file, "w") as f:
 print(f"Speaker stats saved: {stats_file}")
 PYEOF
 
+    if [[ -s "$LOG_DIR/transcript.txt" && -s "$DIAG_DIR/speaker-stats.txt" ]]; then
+        rm -f "$DIAG_DIR/transcribe-raw.json"
+    fi
+
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_DONE "$LOG_DIR/transcript.txt")"
     osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_DONE)\" with title \"MeeTap\"" 2>/dev/null
 
@@ -597,7 +830,9 @@ build_prompt() {
     local SESSION_DIR="$1"
     local LOG_DIR="$SESSION_DIR/log"
     local TRANSCRIPT="$LOG_DIR/transcript.txt"
-    local SPEAKER_STATS="$LOG_DIR/speaker-stats.txt"
+    # 发言统计：新会话在 .meetap/，还没整理过的老会话在 log/
+    local SPEAKER_STATS="$SESSION_DIR/.meetap/speaker-stats.txt"
+    [[ -f "$SPEAKER_STATS" ]] || SPEAKER_STATS="$LOG_DIR/speaker-stats.txt"
     local SESSION_NAME
     SESSION_NAME=$(basename "$SESSION_DIR")
 
@@ -773,6 +1008,10 @@ client = boto3.client("bedrock-runtime", region_name=region, config=cfg)
 
 MAX_TRIES = 3
 last_err = None
+# 凭证问题（取不到、过期）重发也没用：马上退出，交给 meetap 外面等凭证恢复再整个重来
+CRED_RE = re.compile(r"Unable to locate credentials|ExpiredToken|security token included in the request is (expired|invalid)|"
+                     r"InvalidClientTokenId|UnrecognizedClient|Error when retrieving credentials|Token has expired|"
+                     r"NoCredentialsError|CredentialRetrievalError|TokenRetrievalError", re.I)
 
 # 纪要末尾必须出现的 Meetap 签名尾巴（footer）。模型会把签名里每个单词
 # 首字母包进 <strong> 标签拼出藏头，所以完整性判断前先剥掉 HTML 标签再比。
@@ -834,12 +1073,14 @@ for attempt in range(1, MAX_TRIES + 1):
 
     except Exception as e:
         last_err = e
+        if CRED_RE.search(f"{type(e).__name__}: {e}"):
+            break
         if attempt < MAX_TRIES:
             wait = 5 * attempt   # 递增退避：5s、10s
             print(f"Bedrock attempt {attempt}/{MAX_TRIES} failed: {e} — retrying in {wait}s")
             time.sleep(wait)
 
-print(f"Error: {last_err}")
+print(f"Error: {type(last_err).__name__}: {last_err}", file=sys.stderr)
 sys.exit(1)
 PYEOF
 }
@@ -863,30 +1104,9 @@ summarize_via_claude_code() {
     fi
 }
 
-send_meeting_notes() {
-    local NOTES_FILE="$1"
-    local SESSION_DIR="$2"
-    local recipients="$CFG_EMAIL"
-    local sender="$CFG_EMAIL_SENDER"
-
-    # venv 缺失：无法做 HTML 转换；仅在用户配了邮件时才报错提示
-    if [[ ! -x "$VENV_PYTHON" ]]; then
-        [[ -n "$recipients" ]] && echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
-        return 1
-    fi
-    # 配了收件人但缺发件人：提示后降级为只生成 HTML 文件、不发送
-    if [[ -n "$recipients" && -z "$sender" ]]; then
-        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_SENDER_MISSING)"
-        recipients=""
-    fi
-
-    local PDF_FILE="${NOTES_FILE%.md}.pdf"
-    local HTML_FILE="${NOTES_FILE%.md}.html"
-    echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_CONVERTING)"
-
-    # SCRIPT_DIR 作为 argv 传入：heredoc 运行时 sys.argv[0] 是 '-'，
-    # Python 侧无法自行定位安装目录，必须由 bash 显式传递
-    "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$recipients" "$sender" "$CFG_REGION" "$HTML_FILE" "$SCRIPT_DIR" <<'PYEOF'
+# 转 HTML 并发一次邮件（没配收件人时只生成 HTML）；参数见 send_meeting_notes
+_send_email_once() {
+    "$VENV_PYTHON" - "$@" <<'PYEOF'
 import sys, os, re, boto3
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -1110,9 +1330,36 @@ try:
     )
     print(f"Email sent to: {', '.join(recipients)}")
 except Exception as e:
-    print(f"Email send failed: {e}")
+    print(f"Email send failed: {type(e).__name__}: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
+}
+
+send_meeting_notes() {
+    local NOTES_FILE="$1"
+    local SESSION_DIR="$2"
+    local recipients="$CFG_EMAIL"
+    local sender="$CFG_EMAIL_SENDER"
+
+    # venv 缺失：无法做 HTML 转换；仅在用户配了邮件时才报错提示
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        [[ -n "$recipients" ]] && echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
+        return 1
+    fi
+    # 配了收件人但缺发件人：提示后降级为只生成 HTML 文件、不发送
+    if [[ -n "$recipients" && -z "$sender" ]]; then
+        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_SENDER_MISSING)"
+        recipients=""
+    fi
+
+    local PDF_FILE="${NOTES_FILE%.md}.pdf"
+    local HTML_FILE="${NOTES_FILE%.md}.html"
+    echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_CONVERTING)"
+
+    # SCRIPT_DIR 作为 argv 传入：heredoc 运行时 sys.argv[0] 是 '-'，
+    # Python 侧无法自行定位安装目录，必须由 bash 显式传递
+    # 凭证过期、网络断了：等着恢复再发（最多 15 分钟）
+    _retry EMAIL once _send_email_once "$NOTES_FILE" "$PDF_FILE" "$recipients" "$sender" "$CFG_REGION" "$HTML_FILE" "$SCRIPT_DIR"
 
     local py_rc=$?
     if [[ -n "$recipients" ]]; then
@@ -1194,6 +1441,16 @@ smart_name_notes() {
     printf '%s' "$target"
 }
 
+# 生成一次纪要，生成出来了才算成功
+_generate_notes_once() {
+    rm -f "$2"
+    case "$CFG_AI_BACKEND" in
+        claude-code) summarize_via_claude_code "$1" "$2" ;;
+        *)           summarize_via_bedrock "$1" "$2" ;;
+    esac
+    [[ -s "$2" ]]
+}
+
 summarize_transcript() {
     local SESSION_DIR="$1"
     local LOG_DIR="$SESSION_DIR/log"
@@ -1206,6 +1463,10 @@ summarize_transcript() {
         return 1
     fi
 
+    # 日历候选按内容认是哪一场，认出来才写 materials/calendar.md（build_prompt 会读它）；
+    # 怎么认的只进日志、信息页和纪要完成的通知
+    calendar_recognize "$SESSION_DIR"
+
     echo "[$(date '+%H:%M:%S')] $(_tn GENERATING_NOTES "$CFG_AI_BACKEND")"
 
     # build_prompt 失败（模板缺失/损坏）时中止：删掉已被截断的空 prompt 文件，
@@ -1215,19 +1476,14 @@ summarize_transcript() {
         return 1
     fi
 
-    case "$CFG_AI_BACKEND" in
-        claude-code)
-            summarize_via_claude_code "$PROMPT_FILE" "$OUTPUT"
-            ;;
-        bedrock|*)
-            if [[ ! -x "$VENV_PYTHON" ]]; then
-                echo "[$(date '+%H:%M:%S')] $(_tn ERR_VENV_MISSING "$VENV_PYTHON")"
-                rm -f "$PROMPT_FILE"
-                return 1
-            fi
-            summarize_via_bedrock "$PROMPT_FILE" "$OUTPUT"
-            ;;
-    esac
+    if [[ "$CFG_AI_BACKEND" != claude-code && ! -x "$VENV_PYTHON" ]]; then
+        echo "[$(date '+%H:%M:%S')] $(_tn ERR_VENV_MISSING "$VENV_PYTHON")"
+        rm -f "$PROMPT_FILE"
+        return 1
+    fi
+    # 凭证过期、网络断了：等着恢复再生成（最多 15 分钟）；别的错误 summarize_via_* 自己已经重试过
+    [[ -n "$RETRY_SESSION" ]] || RETRY_SESSION=$(_session_ref "$SESSION_DIR")
+    _retry NOTES once _generate_notes_once "$PROMPT_FILE" "$OUTPUT"
 
     rm -f "$PROMPT_FILE"
 
@@ -1239,7 +1495,11 @@ summarize_transcript() {
         local FINAL_OUTPUT
         FINAL_OUTPUT=$(smart_name_notes "$OUTPUT" "$SESSION_DIR")
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$FINAL_OUTPUT")"
-        osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE)\" with title \"MeeTap\"" 2>/dev/null
+        # 通知里带上日历是怎么认的（纪要里不写）
+        local notes_name="${FINAL_OUTPUT##*/}" notes_msg
+        notes_msg=$(_tn NOTIFY_NOTES_DONE "$notes_name")
+        [[ -n "$CAL_NOTIFY" ]] && notes_msg+="$(_tn NOTIFY_CAL_SEP)$CAL_NOTIFY"
+        osascript -e "display notification \"${notes_msg//\"/}\" with title \"MeeTap\"" 2>/dev/null
         send_meeting_notes "$FINAL_OUTPUT" "$SESSION_DIR"
     else
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_FAILED)"
@@ -1293,6 +1553,186 @@ _looks_like_session() {
     [[ "${b##*/}" =~ $SESSION_NAME_RE ]]
 }
 
+# ── meetap tidy：整理老会话（log/ 只留 transcript.txt）──
+# 新会话转录完就删 transcribe-raw.json、audio-tap.log 和 speaker-stats.txt 放进 .meetap/、meetap.log 留在
+# log/；这个命令把老会话整理成同样的样子（以前被挪进 .meetap/ 的 meetap.log 挪回 log/）。
+# 在整个 recording_dir 下按文件名找（第一层、月份文件夹、更深的子文件夹、老版本把文件放在会话根目录
+# 的布局都算），不碰 ~/Record-2 这类 recording_dir 以外的目录。默认只列清单、不改任何东西；--yes 才执行。
+# transcribe-raw.json 是唯一带逐词时间的文件：会话里还有音频的，删了以后能从音频重新转录找回来；
+# 没有音频的删了就再也找不回来，所以默认不删，加 --include-no-audio 才删。音频、纪要、materials/、
+# archive/ 一概不动。
+_tidy_py() {
+    cat <<'TIDYPY'
+import os, shutil, sys
+
+rec, apply_, include_no_audio = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1"
+DIAG = ("audio-tap.log", "speaker-stats.txt")   # 挪进 .meetap/；meetap.log 留在 log/
+SESSION_LIKE = __import__("re").compile(r'^(20\d{6}_\d{4}|\d{4}_\d{4})')
+
+def out(*f):
+    print("\t".join(str(x).replace("\t", " ").replace("\n", " ") for x in f))
+
+def human(n):
+    return "%.1f MB" % (n / 1048576) if n >= 1048576 else "%d KB" % max(1, round(n / 1024))
+
+def nonempty(path):
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+def has_audio(session):
+    try:
+        return any(n.endswith(".m4a") and os.path.isfile(os.path.join(session, n)) for n in os.listdir(session))
+    except OSError:
+        return False
+
+sessions = {}   # 会话目录 → {"json": 路径, "moves": [文件名]}
+for root, dirs, files in os.walk(rec):
+    dirs[:] = sorted(d for d in dirs if d != ".meetap")   # .meetap/ 里的是转录失败时故意留下的，不碰
+    base = os.path.basename(root)
+    if base == "log":
+        session = os.path.dirname(root)
+        if "transcribe-raw.json" in files:
+            sessions.setdefault(session, {})["json"] = os.path.join(root, "transcribe-raw.json")
+        moves = [n for n in DIAG if n in files]
+        if moves:
+            sessions.setdefault(session, {})["moves"] = moves
+    elif "transcribe-raw.json" in files:   # 老版本：文件直接放在会话根目录
+        sessions.setdefault(root, {})["json"] = os.path.join(root, "transcribe-raw.json")
+    if os.path.isfile(os.path.join(root, ".meetap", "meetap.log")):   # 以前被挪进 .meetap/ 的排错日志
+        sessions.setdefault(root, {})["back"] = True
+    # 根目录的 meta.json（以前的版本放这里）：只认会话目录——有 log/、有音频，或者文件夹名像会话
+    if "meta.json" in files and base not in ("log", "materials", "archive") and (
+            "log" in dirs or any(f.endswith(".m4a") for f in files) or SESSION_LIKE.match(base)):
+        sessions.setdefault(root, {})["meta"] = True
+
+sums = {"del_audio": [0, 0], "keep_noaudio": [0, 0], "del_noaudio": [0, 0], "keep_notranscript": [0, 0]}
+moved = moved_back = moved_meta = conflicts = 0
+rows = []
+for session in sorted(sessions):
+    info = sessions[session]
+    rel = os.path.relpath(session, rec)
+    kind, size = "none", 0
+    j = info.get("json")
+    if j:
+        size = os.path.getsize(j)
+        has_tr = nonempty(os.path.join(session, "log", "transcript.txt")) or nonempty(os.path.join(session, "transcript.txt"))
+        if not has_tr:
+            kind = "keep_notranscript"
+        elif has_audio(session):
+            kind = "del_audio"
+        else:
+            kind = "del_noaudio" if include_no_audio else "keep_noaudio"
+        sums[kind][0] += 1
+        sums[kind][1] += size
+    n_move = n_conf = 0
+    for name in info.get("moves", []):
+        src = os.path.join(session, "log", name)
+        dst = os.path.join(session, ".meetap", name)
+        if os.path.exists(dst):
+            n_conf += 1
+            continue
+        n_move += 1
+        if apply_:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+    n_back = 0
+    if info.get("back"):
+        src = os.path.join(session, ".meetap", "meetap.log")
+        dst = os.path.join(session, "log", "meetap.log")
+        if os.path.exists(dst):
+            n_conf += 1
+        else:
+            n_back = 1
+            if apply_:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
+    n_meta = 0
+    if info.get("meta"):
+        src = os.path.join(session, "meta.json")
+        dst = os.path.join(session, ".meetap", "meta.json")
+        if os.path.exists(dst):
+            n_conf += 1
+        else:
+            n_meta = 1
+            if apply_:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
+    if apply_ and kind in ("del_audio", "del_noaudio"):
+        os.remove(j)
+    moved += n_move
+    moved_back += n_back
+    moved_meta += n_meta
+    conflicts += n_conf
+    if kind != "none" or n_move or n_conf or n_back or n_meta:
+        rows.append((kind, rel, human(size), n_move, n_conf, n_back, n_meta))
+
+order = {"del_audio": 0, "keep_noaudio": 1, "del_noaudio": 1, "keep_notranscript": 2, "none": 3}
+for kind, rel, size, n_move, n_conf, n_back, n_meta in sorted(rows, key=lambda r: (order[r[0]], r[1])):
+    out("item", kind, rel, size, n_move, n_conf, n_back, n_meta)
+b = sums["keep_noaudio"] if not include_no_audio else sums["del_noaudio"]
+out("sum", sums["del_audio"][0], human(sums["del_audio"][1]), b[0], human(b[1]),
+    sums["keep_notranscript"][0], human(sums["keep_notranscript"][1]), moved, conflicts, moved_back, moved_meta)
+TIDYPY
+}
+
+# meetap tidy [--yes] [--include-no-audio]
+tidy_sessions() {
+    local apply=0 include=0 arg py line kind rel size nmove nconf nback nmeta group="" suffix
+    for arg in "$@"; do
+        case "$arg" in
+            --yes)              apply=1 ;;
+            --include-no-audio) include=1 ;;
+            *) _t ERR_UNKNOWN_OPTION "$arg"; _t USAGE_TIDY; exit 1 ;;
+        esac
+    done
+    py="$VENV_PYTHON"; [[ -x "$py" ]] || py="$(command -v python3)"
+    [[ -n "$py" ]] || { _t ERR_META_NO_PYTHON; exit 1; }
+    if (( apply )); then _t TIDY_HEADER_APPLY "$RECORDING_DIR"; else _t TIDY_HEADER_DRY "$RECORDING_DIR"; fi
+    while IFS=$'\t' read -r -a f; do
+        case "${f[0]}" in
+            item)
+                kind="${f[1]}"; rel="${f[2]}"; size="${f[3]}"; nmove="${f[4]}"; nconf="${f[5]}"; nback="${f[6]}"; nmeta="${f[7]}"
+                if [[ "$kind" != "$group" ]]; then
+                    group="$kind"
+                    echo ""
+                    case "$kind" in
+                        del_audio)         _t TIDY_GROUP_AUDIO ;;
+                        keep_noaudio)      _t TIDY_GROUP_NOAUDIO_KEEP ;;
+                        del_noaudio)       _t TIDY_GROUP_NOAUDIO_DEL ;;
+                        keep_notranscript) _t TIDY_GROUP_NOTRANSCRIPT ;;
+                        none)              _t TIDY_GROUP_MOVE_ONLY ;;
+                    esac
+                fi
+                suffix=""
+                (( nmove > 0 )) && suffix+="$(_tn TIDY_ITEM_MOVES "$nmove")"
+                (( nback > 0 )) && suffix+="$(_tn TIDY_ITEM_BACK)"
+                (( nmeta > 0 )) && suffix+="$(_tn TIDY_ITEM_META)"
+                (( nconf > 0 )) && suffix+="$(_tn TIDY_ITEM_CONFLICTS "$nconf")"
+                if [[ "$kind" == none ]]; then
+                    suffix="${suffix#，}"; suffix="${suffix#, }"   # 去掉开头的逗号（中英两种写法）
+                    _t TIDY_ITEM "$rel" "$suffix"
+                else
+                    _t TIDY_ITEM "$rel" "transcribe-raw.json（${size}）${suffix}"
+                fi
+                ;;
+            sum)
+                echo ""
+                _t TIDY_SUM_AUDIO "${f[1]}" "${f[2]}"
+                if (( include )); then _t TIDY_SUM_NOAUDIO_DEL "${f[3]}" "${f[4]}"; else _t TIDY_SUM_NOAUDIO_KEEP "${f[3]}" "${f[4]}"; fi
+                (( ${f[5]} > 0 )) && _t TIDY_SUM_NOTRANSCRIPT "${f[5]}" "${f[6]}"
+                _t TIDY_SUM_MOVED "${f[7]}"
+                (( ${f[9]} > 0 )) && _t TIDY_SUM_BACK "${f[9]}"
+                (( ${f[10]} > 0 )) && _t TIDY_SUM_META "${f[10]}"
+                (( ${f[8]} > 0 )) && _t TIDY_SUM_CONFLICTS "${f[8]}"
+                echo ""
+                if (( apply )); then _t TIDY_DONE; else _t TIDY_DRY_HINT "$(basename "$0")"; fi
+                ;;
+        esac
+    done < <("$py" -I -c "$(_tidy_py)" "$RECORDING_DIR" "$apply" "$include")
+}
+
 # meetap again [会议目录名] —— 对已有会议重新执行生成任务。
 # 应对三类场景：1) materials/ 新增了资料要重新生成纪要；2) 上次转录或
 # 纪要生成失败要重跑；3) 有新要求（编辑 <session>/extra-requirements.md
@@ -1344,8 +1784,8 @@ again_session() {
         # 追加模式保留本会话既有日志（只归档旧纪要，不清空 log）。
         _t AGAIN_FROM_NOTES
         {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
-            calendar_lookup_for_session "$SESSION_DIR"
+            _log_separator
+            calendar_collect_for_session "$SESSION_DIR"
             summarize_transcript "$SESSION_DIR"
         } 2>&1 | tee -a "$LOG_DIR/meetap.log"
     else
@@ -1478,18 +1918,19 @@ PYEOF
     rm -f "$PROMPT_FILE" "$LLM_OUT"
 }
 
-# ── 日历：停止录音后按录音时段找对应的会（第三批）──
-# 匹配在 audio-multi-output calendar-query 里做（它只在已经完全授权时读、绝不请求授权）；
-# 这里负责：去掉入会信息、截断参会人、写 materials/calendar.md、把摘要写进 meta.json。
-# 查不到——没授权、没同步、没匹配到、超时、出错——都跳过，不写文件、不报错，只记一行日志，
-# 不耽误转录和生成纪要。calendar.md 是给模型看的资料，和纪要一样固定用中文写。
+# ── 日历：先按时间收候选，转录完再按内容认是哪一场（2.0）──
+# 停止录音（转录开始前）：audio-multi-output calendar-query 按录音时段收候选——过门槛、按时间分排好，
+#   最多 5 场；这里去掉入会信息，存进 .meetap/calendar-candidates.json，还不写 materials/calendar.md。
+# 转录完、生成纪要之前：有候选就调一次模型（和纪要同一个后端、同一个模型），按内容认是哪一场，
+#   都对不上就不用日历；认出来才写 calendar.md。meetap 自己往纪要签名前加一行，写明认的是哪场、凭什么。
+# 查不到——没授权、没同步、没候选、超时、出错——都跳过，不报错，只在 log/meetap.log 记一行。
+# 只在已经完全授权时读日历，绝不请求授权。calendar.md 是给模型看的资料，和纪要一样固定用中文写。
 CALENDAR_TIMEOUT=10
+CAL_LLM_TIMEOUT="${MEETAP_CAL_LLM_TIMEOUT:-30}"   # 认会那次模型调用的上限（秒）；环境变量只给测试用
 
-# 处理 calendar-query 的 JSON（stdin）。argv：会话目录、录音开始 / 结束（epoch 秒）。
-# 输出 TSV：result\t状态\t…（给日志用），匹配到时再输出 meta\t<calendar 字段的 JSON>
 _calendar_py() {
     cat <<'CALPY'
-import json, os, re, sys, tempfile
+import hashlib, json, os, re, sys, tempfile
 from datetime import datetime
 
 # ── 去掉入会信息：会议链接、会议号、密码、电话拨入。各家邀请模板五花八门，宁可多删 ──
@@ -1497,21 +1938,19 @@ URL_RE = re.compile(r'<?\b(?:https?|ftp)://[^\s<>"]+>?', re.I)
 BARE_URL_RE = re.compile(r'\b(?:[\w-]+\.)*(?:chime\.aws|zoom\.(?:us|com)|teams\.(?:microsoft|live)\.com|'
                          r'meet\.google\.com|webex\.com|meeting\.tencent\.com|voovmeeting\.com|feishu\.cn|'
                          r'larksuite\.com|dingtalk\.com)(?:/\S*)?', re.I)
-# 有这些词的整行删掉
 STRONG_RE = re.compile(r'(?i)(meeting\s*(id|number|code)|webinar\s*id|会议\s*(号|id|码|密码)|conference\s*id|'
                        r'access\s*code|pass\s*code|password|\bpwd\b|密码|口令|\bpin\b|\bdial\b|dial[- ]?in|拨入|'
                        r'one[- ]tap|tap to join|join by phone|电话入会|拨号|一键入会|local number|international numbers|toll[- ]free)')
-# 「入会」类的词，配上链接或会议平台名才删（免得把「请大家准时参加」这类议程删掉）
 JOIN_RE = re.compile(r'(?i)(\bjoin\b|入会|加入会议|会议链接|meeting link|click here)')
 PLATFORM_RE = re.compile(r'(?i)(chime|zoom|teams|webex|google meet|腾讯会议|voov|飞书|lark|钉钉|meeting|会议|web|computer|mobile|phone|电话)')
-# 像电话号码 / 会议号的数字串：+ 开头的号码、3-4-4 分组的 9 位以上数字、连续 9 位以上数字、,,123# 拨号串
 NUMBER_RE = re.compile(r'(\+\d[\d\s().-]{6,}\d|\b\d{3}[\s-]?\d{3,4}[\s-]?\d{3,4}\b|\b\d{9,}\b|,,\d+#?)')
 # Teams 等：两条长下划线分隔线之间是整段入会信息。只认下划线——议程里用 ---- / ==== 分节的，
 # 两条一配对就会把中间的议程整段删掉
 SEP_RE = re.compile(r'^\s*_{20,}\s*$')
 PUNCT = ' \t:：-–—|·•,，;；()（）[]【】<>'
-# 正文里写着的邮箱只留 @ 前面那段（会进纪要和邮件）
 EMAIL_RE = re.compile(r'(?:mailto:)?([\w.+-]+)@[\w-]+(?:\.[\w-]+)+', re.I)
+EXCERPT = 500        # 交给模型的会议说明只截前 500 字
+PROMPT_ATTENDEES = 20
 
 def scrub(text):
     lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -1519,7 +1958,7 @@ def scrub(text):
     drop = set(seps)
     for a, b in zip(seps[0::2], seps[1::2]):
         drop.update(range(a, b + 1))
-    out = []
+    out_lines = []
     for i, l in enumerate(lines):
         if i in drop:
             continue
@@ -1531,9 +1970,9 @@ def scrub(text):
         rest = BARE_URL_RE.sub("", URL_RE.sub("", l)).rstrip()
         if had_url and not rest.strip(PUNCT):
             continue
-        out.append(EMAIL_RE.sub(lambda e: e.group(1), rest))
+        out_lines.append(EMAIL_RE.sub(lambda e: e.group(1), rest))
     res = []
-    for l in out:                       # 连续空行合并成一行，首尾空行去掉
+    for l in out_lines:
         if not l.strip():
             if res and res[-1] == "":
                 continue
@@ -1552,7 +1991,7 @@ def scrub_location(loc):
     return "; ".join(x for x in parts if x)
 
 def name_of(p):
-    # 没有名字时只用邮箱 @ 前面那段，calendar.md 里不出现完整邮箱
+    # 没有名字时只用邮箱 @ 前面那段，文件里不出现完整邮箱
     return ((p or {}).get("name") or "").strip() or ((p or {}).get("email") or "").split("@")[0].strip()
 
 def parse_time(iso):
@@ -1561,11 +2000,54 @@ def parse_time(iso):
     except (TypeError, ValueError):
         return None
 
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
 def out(*fields):
     print("\t".join(str(f).replace("\t", " ").replace("\n", " ") for f in fields))
 
-def main():
-    session_dir, rec_start, rec_end = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+def atomic_write(path, text):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".cal.", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+def cand_path(session_dir):
+    return os.path.join(session_dir, ".meetap", "calendar-candidates.json")
+
+def cal_md_path(session_dir):
+    return os.path.join(session_dir, "materials", "calendar.md")
+
+def load_meta(session_dir):
+    for p in (os.path.join(session_dir, ".meetap", "meta.json"), os.path.join(session_dir, "meta.json")):
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                return d if isinstance(d, dict) else {}
+            except (OSError, ValueError):
+                return {}
+    return {}
+
+def sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+def brief(c):
+    return {"title": c["title"], "start": c.get("start", ""), "end": c.get("end", ""), "time_score": c.get("time_score", 0)}
+
+# collect：处理 calendar-query 的 JSON（stdin），去掉入会信息，存候选
+def cmd_collect(session_dir, rec_start, rec_end):
     raw = sys.stdin.read()
     if not raw.strip():
         out("result", "error", "no output")
@@ -1585,70 +2067,250 @@ def main():
     if status != "ok":
         out("result", status if status in ("timeout", "error") else "error", d.get("message", ""))
         return
-    m = d.get("match")
-    if not isinstance(m, dict) or not (m.get("title") or "").strip():
+    cands = []
+    for c in d.get("candidates") or []:
+        if not isinstance(c, dict) or not (c.get("title") or "").strip():
+            continue
+        org = c.get("organizer") or {}
+        org_name, org_email = name_of(org), (org.get("email") or "").lower()
+        people = [a for a in c.get("attendees") or [] if a.get("type", "person") not in ("room", "resource")]
+        def is_org(a):
+            return bool(org_email and (a.get("email") or "").lower() == org_email) or bool(org_name and name_of(a) == org_name)
+        rank = {"chair": 0, "required": 1, "unknown": 2, "optional": 3, "nonParticipant": 4}
+        others = sorted([a for a in people if not is_org(a)], key=lambda a: rank.get(a.get("role"), 2))
+        notes = scrub(c.get("notes"))
+        cands.append({
+            "title": c["title"].strip(), "start": c.get("start", ""), "end": c.get("end", ""),
+            "time_score": c.get("time_score", 0), "overlap_sec": c.get("overlap_sec", 0),
+            "organizer": org_name,
+            "attendees": [n for n in (name_of(a) for a in others) if n],
+            "attendee_count": len(others) + (1 if org_name else 0),
+            "location": scrub_location(c.get("location")),
+            "notes": notes, "notes_excerpt": notes[:EXCERPT],
+        })
+    cp = cand_path(session_dir)
+    if state_of(session_dir) == "own":
+        os.remove(cal_md_path(session_dir))
+    if not cands:
+        if os.path.exists(cp):
+            os.remove(cp)
+        out("clear")
         out("result", "none")
         return
+    atomic_write(cp, json.dumps({"window": d.get("window", {}), "recording": [rec_start, rec_end],
+                                  "collected_at": now_iso(), "candidates": cands}, ensure_ascii=False, indent=2) + "\n")
+    out("meta", json.dumps({"candidates": [brief(c) for c in cands], "matched_by": "pending",
+                            "collected_at": now_iso()}, ensure_ascii=False))
+    out("result", "collected", len(cands))
 
-    title = m["title"].strip()
-    org = m.get("organizer") or {}
-    org_name, org_email = name_of(org), (org.get("email") or "").lower()
-    # 只列人：会议室、设备这类资源不算参会人；组织者单独一行，不在参会人里重复
-    people = [a for a in m.get("attendees") or [] if a.get("type", "person") not in ("room", "resource")]
-    def is_org(a):
-        return bool(org_email and (a.get("email") or "").lower() == org_email) or bool(org_name and name_of(a) == org_name)
-    rank = {"chair": 0, "required": 1, "unknown": 2, "optional": 3, "nonParticipant": 4}
-    others = sorted([a for a in people if not is_org(a)], key=lambda a: rank.get(a.get("role"), 2))
-    total = len(others) + (1 if org_name else 0)
-    names = [n for n in (name_of(a) for a in others) if n]
+# 转录稿截一段给模型：开头 4000 字 + 结尾 1000 字（开场多半是议题，结尾常有总结和下一步）
+HEAD_CHARS, TAIL_CHARS = 4000, 1000
 
-    st, en = parse_time(m.get("start")), parse_time(m.get("end"))
-    rs, rend = datetime.fromtimestamp(rec_start).astimezone(), datetime.fromtimestamp(rec_end).astimezone()
+def transcript_excerpt(session_dir):
+    try:
+        with open(os.path.join(session_dir, "log", "transcript.txt"), encoding="utf-8") as f:
+            t = f.read()
+    except OSError:
+        return ""
+    if len(t) <= HEAD_CHARS + TAIL_CHARS:
+        return t
+    return t[:HEAD_CHARS] + "\n……（中间省略 %d 字）……\n" % (len(t) - HEAD_CHARS - TAIL_CHARS) + t[-TAIL_CHARS:]
+
+# 时间优先：时间分最高的那场，加上和它起止时间完全一样的几场。只有这几场交给模型——
+# 一场时让模型核对内容对不对得上；几场时间完全一样时按内容选。
+def top_group(cands):
+    def key(c):
+        s, e = parse_time(c.get("start")), parse_time(c.get("end"))
+        return (s.timestamp() if s else c.get("start"), e.timestamp() if e else c.get("end"))
+    k0 = key(cands[0])
+    return [c for c in cands if key(c) == k0]
+
+def hm(epoch):
+    return datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d %H:%M")
+
+def cmd_prompt(session_dir, template):
+    cand = load_cand(session_dir)
+    cands = top_group(cand["candidates"])
+    rs, re_ = cand.get("recording", [0, 0])
+    with open(template, encoding="utf-8") as f:
+        tpl = f.read()
+    mdir = os.path.join(session_dir, "materials")
+    try:
+        names = sorted(n for n in os.listdir(mdir) if not n.startswith(".") and n != "calendar.md")
+    except OSError:
+        names = []
+    blocks = []
+    for i, c in enumerate(cands, 1):
+        st, en = parse_time(c["start"]), parse_time(c["end"])
+        when = "%s–%s" % (st.strftime("%Y-%m-%d %H:%M"), en.strftime("%H:%M")) if st and en else "?"
+        att = c["attendees"][:PROMPT_ATTENDEES]
+        lines = ["[%d] 标题：%s" % (i, c["title"]), "    时间：" + when]
+        if c.get("organizer"):
+            lines.append("    组织者：" + c["organizer"])
+        if att:
+            lines.append("    参会人（共 %d 人，列前 %d 位）：%s" % (c.get("attendee_count", len(att)), len(att), "、".join(att)))
+        if c.get("notes_excerpt"):
+            lines.append("    会议说明（摘录）：" + c["notes_excerpt"].replace("\n", " "))
+        blocks.append("\n".join(lines))
+    text = (tpl.replace("${recording}", "%s–%s" % (hm(rs), datetime.fromtimestamp(float(re_)).strftime("%H:%M")))
+               .replace("${candidate_count}", str(len(cands)))
+               .replace("${candidates}", "\n\n".join(blocks))
+               .replace("${materials_list}", "、".join(names) if names else "（无）")
+               .replace("${transcript_excerpt}", transcript_excerpt(session_dir)))
+    sys.stdout.write(text)
+
+ERR_ZH = {"timeout": "超时", "failed": "调用失败", "empty": "没有回答", "bad_json": "回的不是 JSON",
+          "no_pick": "回的 JSON 里没有 pick", "bad_pick": "回的序号不在候选里"}
+
+# 模型的回答：{"pick": 序号或 null, "reason": "…"}；前后多了文字也认，只取第一个 {…}
+def parse_pick(path, n):
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None, "empty"
+    if not text.strip():
+        return None, "empty"
+    m = re.search(r"\{.*?\}", text, re.S)
+    try:
+        d = json.loads(m.group(0)) if m else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return None, "bad_json"
+    if "pick" not in d:
+        return None, "no_pick"
+    p, reason = d.get("pick"), " ".join(str(d.get("reason") or "").split())
+    if p is None:
+        return ("null", reason), None
+    if isinstance(p, str) and p.strip().isdigit():
+        p = int(p.strip())
+    if isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= n:
+        return None, "bad_pick"
+    return (p, reason), None
+
+def write_calendar_md(session_dir, c, how):
+    st, en = parse_time(c.get("start")), parse_time(c.get("end"))
+    cand = load_cand(session_dir)
+    rs, re_ = (cand or {}).get("recording", [None, None])
     lines = ["# 日历里的这场会", "",
              "> 来自系统日历，是会前的安排，实际讨论以录音为准。入会链接、会议号、密码、拨入电话已去掉。", "",
-             "- 标题：" + title]
+             "- 标题：" + c["title"]]
     if st and en:
         end_fmt = "%H:%M" if en.date() == st.date() else "%Y-%m-%d %H:%M"
-        lines.append("- 时间：%s–%s（录音 %s–%s）" % (st.strftime("%Y-%m-%d %H:%M"), en.strftime(end_fmt),
-                                                  rs.strftime("%H:%M"), rend.strftime("%H:%M")))
-    if org_name:
-        lines.append("- 组织者：" + org_name)
+        rec = ""
+        if rs and re_:
+            rec = "（录音 %s–%s）" % (datetime.fromtimestamp(float(rs)).strftime("%H:%M"),
+                                    datetime.fromtimestamp(float(re_)).strftime("%H:%M"))
+        lines.append("- 时间：%s–%s%s" % (st.strftime("%Y-%m-%d %H:%M"), en.strftime(end_fmt), rec))
+    lines.append("- 怎么认出来的：" + how)
+    if c.get("organizer"):
+        lines.append("- 组织者：" + c["organizer"])
+    names, total = c.get("attendees") or [], c.get("attendee_count", 0)
     if total > 30:
         lines.append("- 参会人：共 %d 人，下面只列组织者和前 20 位：%s" % (total, "、".join(names[:20])))
     elif names:
         lines.append("- 参会人（%d 人）：%s" % (total, "、".join(names)))
-    loc = scrub_location(m.get("location"))
-    if loc:
-        lines.append("- 地点：" + loc)
-    notes = scrub(m.get("notes"))
-    if notes:
-        lines += ["", "## 会议说明", "", notes]
-    text = "\n".join(lines) + "\n"
+    if c.get("location"):
+        lines.append("- 地点：" + c["location"])
+    if c.get("notes"):
+        lines += ["", "## 会议说明", "", c["notes"]]
+    path = cal_md_path(session_dir)
+    atomic_write(path, "\n".join(lines) + "\n")
+    return sha256(path)
 
-    mdir = os.path.join(session_dir, "materials")
-    os.makedirs(mdir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".calendar.", suffix=".tmp", dir=mdir)
+def load_cand(session_dir):
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, os.path.join(mdir, "calendar.md"))
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+        with open(cand_path(session_dir), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
-    cal = {"title": title, "start": m.get("start", ""), "end": m.get("end", ""),
-           "organizer": org_name, "attendee_count": total,
-           "candidates": [c.get("title", "") for c in d.get("candidates") or [] if isinstance(c, dict) and c.get("title")],
-           "looked_up_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+# decide：时间优先，模型核对内容（几场时间完全一样时按内容选），写 calendar.md 和 meta。
+# 怎么认的只进日志、信息页和纪要完成的通知，不写进纪要：纪要会转给别人，会把日历里别的会带出去
+def cmd_decide(session_dir, llm_out, llm_status):
+    cand = load_cand(session_dir)
+    if not cand or not cand.get("candidates"):
+        out("result", "none")
+        return
+    cands = cand["candidates"]
+    group = top_group(cands)
+    k = len(group)
+    if llm_status == "ok":
+        res, err = parse_pick(llm_out, k)
+    else:
+        res, err = None, ("timeout" if llm_status == "timeout" else "failed")
+    picked, kind, reason = None, "none", ""
+    if res is not None:
+        p, reason = res
+        if p != "null":
+            picked, kind = group[p - 1], ("content" if k > 1 else "time")
+    elif k == 1:
+        # 模型没回上来：时间最接近的只有一场，照时间定
+        picked, kind = group[0], "time"
+    why = reason or "没有给理由"
+    if picked and kind == "content":
+        how = "按内容：同一时间有 %d 场，%s" % (k, why)
+        result = ("matched_content", picked["title"], why)
+    elif picked and res is not None:
+        how = "按时间：和录音时间最接近；内容也对得上：" + why
+        result = ("matched_time", picked["title"], why)
+    elif picked:
+        reason = "认会的模型%s，内容没核对" % ERR_ZH[err]
+        how = "按时间：和录音时间最接近（%s）" % reason
+        result = ("matched_time_unchecked", picked["title"], err)
+    elif res is not None:
+        result = ("matched_none", len(cands), why)
+    else:
+        reason = "认会的模型%s" % ERR_ZH[err]
+        result = ("undecided", k, err, len(cands))
+    cal = {"candidates": [brief(c) for c in cands], "matched_by": kind, "reason": reason, "looked_up_at": now_iso()}
+    path = cal_md_path(session_dir)
+    if picked:
+        cal.update({"title": picked["title"], "start": picked.get("start", ""), "end": picked.get("end", ""),
+                    "organizer": picked.get("organizer", ""), "attendee_count": picked.get("attendee_count", 0),
+                    "fingerprint": write_calendar_md(session_dir, picked, how)})
+    elif os.path.exists(path):
+        os.remove(path)   # 调用方已确认这份是 meetap 自己写的、没被改过（见 state）
     out("meta", json.dumps(cal, ensure_ascii=False))
-    out("result", "matched", title, int(m.get("overlap_sec", 0)) // 60)
+    out("result", *result)
+
+# state：materials/calendar.md 是不是 meetap 自己写的、没被人改过
+#   none：没有这个文件；own：是 meetap 写的、没改过；edited：被改过，或者分辨不出
+def state_of(session_dir):
+    path = cal_md_path(session_dir)
+    if not os.path.exists(path):
+        return "none"
+    cal = load_meta(session_dir).get("calendar") or {}
+    fp = cal.get("fingerprint")
+    if fp:
+        return "own" if sha256(path) == fp else "edited"
+    # 没有指纹的老文件（2.0 之前写的）：修改时间和 looked_up_at 相差 60 秒以内，就当是 meetap 写的
+    t = parse_time(cal.get("looked_up_at"))
+    return "own" if t and abs(os.path.getmtime(path) - t.timestamp()) <= 60 else "edited"
+
+def cmd_state(session_dir):
+    print(state_of(session_dir))
+
+def main():
+    cmd = sys.argv[1]
+    if cmd == "collect":
+        cmd_collect(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))
+    elif cmd == "prompt":
+        cmd_prompt(sys.argv[2], sys.argv[3])
+    elif cmd == "decide":
+        cmd_decide(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif cmd == "state":
+        cmd_state(sys.argv[2])
 
 main()
 CALPY
+}
+
+_calendar_python() {
+    local py="$VENV_PYTHON"
+    [[ -x "$py" ]] || py="$(command -v python3)"
+    printf '%s' "$py"
 }
 
 # _run_with_timeout <秒> <命令…>：命令在自己的进程组里跑，到时连同子进程一起杀掉（退出码 124）
@@ -1665,22 +2327,39 @@ _run_with_timeout() {
     ' "$@"
 }
 
-# calendar_lookup <会话目录> <录音开始 epoch> <录音结束 epoch>：结果只输出一行日志
-calendar_lookup() {
-    local dir="$1" start="$2" end="$3" out py kind a b c msg
+# 认会用的提示词模板（单独一个文件，纪要的提示词不动）
+_calendar_match_template() {
+    local cand
+    for cand in "$SCRIPT_DIR/../share/meetap/prompts/calendar-match.md" "$SCRIPT_DIR/share/meetap/prompts/calendar-match.md"; do
+        [[ -f "$cand" ]] && grep -qF '${candidates}' "$cand" && { printf '%s' "$cand"; return 0; }
+    done
+    return 1
+}
+
+# _calendar_state <会话目录>：none / own / edited（见 _calendar_py 的 state_of）
+_calendar_state() {
+    local py
+    py=$(_calendar_python)
+    [[ -n "$py" ]] || { echo edited; return; }
+    "$py" -I -c "$(_calendar_py)" state "$1" 2>/dev/null || echo edited
+}
+
+# calendar_collect <会话目录> <录音开始 epoch> <录音结束 epoch>：收候选，结果只输出一行日志
+calendar_collect() {
+    local dir="$1" start="$2" end="$3" out py kind a b c msg=""
     [[ "$CFG_CALENDAR" == "on" && -x "$TOOL" ]] || return 0
-    py="$VENV_PYTHON"; [[ -x "$py" ]] || py="$(command -v python3)"
+    py=$(_calendar_python)
     [[ -n "$py" ]] || return 0
-    # 查询程序自己 10 秒超时；万一卡死，外面 12 秒强杀。放进单独的进程组、超时杀整个组：
-    # 只杀它本身的话，它要是起了子进程，子进程还占着输出管道，这里就得一直等下去
+    # 查询程序自己 10 秒超时；万一卡死，外面 12 秒连子进程一起强杀
     out=$(_run_with_timeout $((CALENDAR_TIMEOUT + 2)) \
         "$TOOL" calendar-query --start "$start" --end "$end" --timeout "$CALENDAR_TIMEOUT" </dev/null 2>/dev/null)
     while IFS=$'\t' read -r kind a b c; do
         case "$kind" in
-            meta) _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
+            meta)  _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
+            clear) _meta calendar-clear "$dir" >/dev/null 2>&1 ;;
             result)
                 case "$a" in
-                    matched)        msg=$(_tn CAL_LOG_MATCHED "$b" "$c") ;;
+                    collected)      msg=$(_tn CAL_LOG_COLLECTED "$b") ;;
                     none)           msg=$(_tn CAL_LOG_NONE) ;;
                     not_authorized) msg=$(_tn CAL_LOG_NOT_AUTHORIZED "$b" "$(basename "$0")") ;;
                     timeout)        msg=$(_tn CAL_LOG_TIMEOUT) ;;
@@ -1689,17 +2368,19 @@ calendar_lookup() {
                 echo "[$(date '+%H:%M:%S')] $msg"
                 ;;
         esac
-    done < <(printf '%s' "$out" | "$py" -I -c "$(_calendar_py)" "$dir" "$start" "$end" 2>/dev/null)
+    done < <(printf '%s' "$out" | "$py" -I -c "$(_calendar_py)" collect "$dir" "$start" "$end" 2>/dev/null)
     return 0
 }
 
-# 按会话里的音频算录音时段（开始 = 文件名 meeting_YYYYMMDD_HHMMSS，结束 = 开始 + 音频时长）再查。
-# 转录开始前（stop 的后台流程、again 从转录重跑）和 again 只重跑纪要时调用；
-# materials/calendar.md 已经有了（查过，或用户自己放的）就不再查、不覆盖。
-calendar_lookup_for_session() {
+# 按会话里的音频算录音时段（开始 = 文件名 meeting_YYYYMMDD_HHMMSS，结束 = 开始 + 音频时长）再收候选。
+# materials/calendar.md 被人改过（或者是自己放的）就不动：不重新收、不重新认，提示一句。
+calendar_collect_for_session() {
     local dir="$1" audio base start dur
     [[ "$CFG_CALENDAR" == "on" ]] || return 0
-    [[ -e "$dir/materials/calendar.md" ]] && return 0
+    if [[ "$(_calendar_state "$dir")" == edited ]]; then
+        echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_KEEP_EDITED)"
+        return 0
+    fi
     audio=$(find "$dir" -maxdepth 1 -name "meeting_*.m4a" | sort | tail -1)
     base="${audio##*/}"
     [[ "$base" =~ ^meeting_([0-9]{8}_[0-9]{6})\.m4a$ ]] || return 0
@@ -1707,12 +2388,93 @@ calendar_lookup_for_session() {
     dur=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$audio" </dev/null 2>/dev/null)
     dur="${dur%%.*}"
     [[ "$dur" =~ ^[0-9]+$ && "$dur" -gt 0 ]] || return 0
-    calendar_lookup "$dir" "$start" "$((start + dur))"
+    calendar_collect "$dir" "$start" "$((start + dur))"
+}
+
+# 认会那次模型调用：和纪要同一个后端、同一个模型。只要一行 JSON，不走纪要那套签名检查和重试。
+# calendar_llm_call <提示词文件> <输出文件>；失败时把出错原因写到 stderr
+calendar_llm_call() {
+    local prompt="$1" out="$2"
+    if [[ "$CFG_AI_BACKEND" == claude-code ]] && command -v claude &>/dev/null; then
+        claude -p "$(cat "$prompt")" > "$out" </dev/null && [[ -s "$out" ]] && return 0
+    fi
+    [[ -x "$VENV_PYTHON" ]] || { echo "no venv: $VENV_PYTHON" >&2; return 1; }
+    "$VENV_PYTHON" - "$prompt" "$out" "$CFG_REGION" "$CFG_MODEL" <<'PYEOF'
+import sys, boto3
+from botocore.config import Config
+prompt_path, out_path, region, model_id = sys.argv[1:5]
+with open(prompt_path, encoding="utf-8") as f:
+    prompt = f.read()
+try:
+    client = boto3.client("bedrock-runtime", region_name=region,
+                          config=Config(read_timeout=25, connect_timeout=10, retries={"max_attempts": 0}))
+    # 和生成纪要一样走流式接口：最小权限策略里只有 bedrock:InvokeModelWithResponseStream
+    r = client.converse_stream(modelId=model_id, messages=[{"role": "user", "content": [{"text": prompt}]}],
+                               inferenceConfig={"maxTokens": 400},
+                               additionalModelRequestFields={"thinking": {"type": "disabled"}})
+    text = "".join(ev["contentBlockDelta"]["delta"].get("text", "")
+                   for ev in r["stream"] if "contentBlockDelta" in ev)
+except Exception as e:
+    # 一行就够：meetap 靠这行分辨是不是凭证问题
+    print(f"{type(e).__name__}: {e}".replace("\n", " "), file=sys.stderr)
+    sys.exit(1)
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(text)
+PYEOF
+}
+
+# calendar_recognize <会话目录>：转录完、生成纪要之前，核对内容、定是哪一场（时间优先，
+# 起止时间完全一样的几场按内容选）。结果写进 meta.json 和日志；纪要完成的通知里要带的那一句放进 CAL_NOTIFY。
+# 纪要里不写：纪要会转给别人，会把日历里别的会、客户名带出去
+CAL_NOTIFY=""
+calendar_recognize() {
+    local dir="$1" py tpl tmpdir prompt llm rc status="ok" kind a b c d msg="" err
+    CAL_NOTIFY=""
+    [[ "$CFG_CALENDAR" == "on" ]] || return 0
+    [[ -f "$dir/.meetap/calendar-candidates.json" && -s "$dir/log/transcript.txt" ]] || return 0
+    [[ "$(_calendar_state "$dir")" == edited ]] && return 0
+    py=$(_calendar_python)
+    [[ -n "$py" ]] || return 0
+    tmpdir=$(mktemp -d) || return 0
+    prompt="$tmpdir/prompt.md"; llm="$tmpdir/answer.txt"
+    if tpl=$(_calendar_match_template) && "$py" -I -c "$(_calendar_py)" prompt "$dir" "$tpl" > "$prompt" 2>/dev/null && [[ -s "$prompt" ]]; then
+        # 放进单独的进程组，超时连子进程一起杀。凭证问题等着恢复（反正下一步生成纪要也要用凭证）；
+        # 别的问题（超时、出错）不重试，马上按时间兜底
+        [[ -n "$RETRY_SESSION" ]] || RETRY_SESSION=$(_session_ref "$dir")
+        _retry CALENDAR cred _run_with_timeout "$CAL_LLM_TIMEOUT" "$0" _calendar-llm "$prompt" "$llm" </dev/null >/dev/null; rc=$?
+        if (( rc == 124 )); then status="timeout"; elif (( rc != 0 )) || [[ ! -s "$llm" ]]; then status="failed"; fi
+        if [[ "$status" != ok ]]; then
+            err="$RETRY_LAST_MSG"
+            echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_LLM_FAILED "$status${err:+: $err}")"
+        fi
+    else
+        status="failed"
+        echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_LLM_FAILED "prompt")"
+    fi
+    while IFS=$'\t' read -r kind a b c d; do
+        case "$kind" in
+            meta)   _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
+            result)
+                case "$a" in
+                    matched_time)           msg=$(_tn CAL_LOG_MATCHED "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_TIME "$b") ;;
+                    matched_content)        msg=$(_tn CAL_LOG_MATCHED_CONTENT "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_CONTENT "$b") ;;
+                    matched_time_unchecked) msg=$(_tn CAL_LOG_MATCHED_UNCHECKED "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_TIME "$b") ;;
+                    matched_none)           msg=$(_tn CAL_LOG_MATCHED_NONE "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_NONE "$b") ;;
+                    undecided)              msg=$(_tn CAL_LOG_UNDECIDED "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_UNDECIDED "$d") ;;
+                    *)                      msg="" ;;
+                esac
+                [[ -n "$msg" ]] && echo "[$(date '+%H:%M:%S')] $msg"
+                ;;
+        esac
+    done < <("$py" -I -c "$(_calendar_py)" decide "$dir" "$llm" "$status" 2>/dev/null)
+    rm -rf "$tmpdir"
+    return 0
 }
 
 # ── 会议标签（meta.json）与会话信息 ──
 # meetap [<会话>] -g 标签 / --untag 标签 / -g（列标签） / meetap <会话>（显示信息）
-# 标签存在会话目录最外层的 meta.json，不放 materials/（那里的东西会喂给模型）。
+# 标签存在会话的隐藏目录 .meetap/ 里的 meta.json（以前的版本放在会话根目录，读的时候兜底），
+# 不放 materials/（那里的东西会喂给模型）。
 # 以后会被菜单栏 app 调用：没有终端时不交互、不阻塞、不起后台进程。
 TAG_GUARD_HOURS=12   # 没写文件夹、没在录、最新一场早于这么多小时 → 有终端先确认，没终端直接拒绝
 
@@ -1736,8 +2498,16 @@ MONTH_RE = re.compile(r'^20\d{2}-\d{2}$')
 def out(*fields):
     print("\t".join(fields))
 
+# meta.json 在会话的隐藏目录 .meetap/ 里；以前的版本放在会话根目录。读的时候新位置优先、老位置兜底
+def meta_path(session_dir):
+    new = os.path.join(session_dir, ".meetap", "meta.json")
+    old = os.path.join(session_dir, "meta.json")
+    if os.path.exists(new) or not os.path.exists(old):
+        return new
+    return old
+
 def load(session_dir):
-    path = os.path.join(session_dir, "meta.json")
+    path = meta_path(session_dir)
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as f:
@@ -1750,7 +2520,11 @@ def load(session_dir):
     return data
 
 def write(session_dir, data):
-    fd, tmp = tempfile.mkstemp(prefix=".meta.", suffix=".tmp", dir=session_dir)
+    diag = os.path.join(session_dir, ".meetap")
+    os.makedirs(diag, exist_ok=True)
+    new, old = os.path.join(diag, "meta.json"), os.path.join(session_dir, "meta.json")
+    had_new = os.path.exists(new)
+    fd, tmp = tempfile.mkstemp(prefix=".meta.", suffix=".tmp", dir=diag)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1758,13 +2532,17 @@ def write(session_dir, data):
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, 0o644)
-        os.replace(tmp, os.path.join(session_dir, "meta.json"))
+        os.replace(tmp, new)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+    # 根目录的老文件刚才已经读进来、一起写进新位置了，删掉不留两份。
+    # 两处本来都有（不是我们挪的）就不动，交给 meetap tidy 列出来
+    if not had_new and os.path.exists(old):
+        os.remove(old)
 
 def sessions(rec):
     try:
@@ -1859,6 +2637,36 @@ def cmd_calendar_set(session_dir, cal_json):
     write(session_dir, data)
     out("ok")
 
+# 这个时段日历里没有候选了：去掉 calendar 字段；没有 meta.json 时不为这个新建一个
+def cmd_calendar_clear(session_dir):
+    data = load(session_dir)
+    if "calendar" in data:
+        del data["calendar"]
+        data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        write(session_dir, data)
+    out("ok")
+
+# 录音里有没有说话内容：一个词都没识别出来时记 no_speech；等着认的日历（pending）也定下来，
+# 不再停在 pending。后来又转出了内容（again）就把记号去掉
+def cmd_no_speech(session_dir, flag):
+    data = load(session_dir)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    if flag == "on":
+        if not data:
+            data = {"schema": 1, "session": os.path.basename(session_dir)}
+        data["no_speech"] = True
+        cal = data.get("calendar")
+        if isinstance(cal, dict) and cal.get("matched_by") == "pending":
+            cal["matched_by"] = "no_speech"
+            cal["looked_up_at"] = now
+        data["updated_at"] = now
+        write(session_dir, data)
+    elif data.get("no_speech"):
+        del data["no_speech"]
+        data["updated_at"] = now
+        write(session_dir, data)
+    out("ok")
+
 def main(argv):
     cmd = argv[1]
     try:
@@ -1866,10 +2674,22 @@ def main(argv):
             data = load(argv[2])
             out("tags", *data.get("tags", []))
             cal = data.get("calendar")
-            if isinstance(cal, dict) and isinstance(cal.get("title"), str) and cal["title"].strip():
-                out("calendar", one_line(cal["title"]), one_line(cal.get("start", "")), one_line(cal.get("end", "")))
+            # calendar <标题> <开始> <结束> <怎么认的> <候选场数>；空的写 -（bash 按制表符拆时会吞掉空字段）
+            # 怎么认的：content / time / none / pending；2.0 之前写的没有这个字段，记 legacy
+            if isinstance(cal, dict):
+                title = cal.get("title") if isinstance(cal.get("title"), str) else ""
+                by = cal.get("matched_by") or ("legacy" if title.strip() else "")
+                n = len(cal.get("candidates") or []) if isinstance(cal.get("candidates"), list) else 0
+                if title.strip() or by in ("none", "pending", "no_speech"):
+                    out("calendar", *[one_line(v) or "-" for v in (title, cal.get("start", ""), cal.get("end", ""), by, n)])
+            if data.get("no_speech"):
+                out("no_speech")
         elif cmd == "calendar-set":
             cmd_calendar_set(argv[2], argv[3])
+        elif cmd == "calendar-clear":
+            cmd_calendar_clear(argv[2])
+        elif cmd == "no-speech":
+            cmd_no_speech(argv[2], argv[3])
         elif cmd == "update":
             rest = argv[4:]
             cmd_update(argv[2], argv[3], list(zip(rest[0::2], rest[1::2])))
@@ -1898,17 +2718,22 @@ _meta() {
     "$py" -I -c "$(_meta_py)" "$@" </dev/null
 }
 
-# 读一场会的标签到 SESSION_TAGS 数组，日历标题到 SESSION_CAL_TITLE / _START / _END；
-# meta.json 读不了时返回 1
+# 读一场会的标签到 SESSION_TAGS 数组，日历到 SESSION_CAL_TITLE / _START / _END / _BY（怎么认的）/ _N（候选场数），
+# 录音里没识别出说话内容时 SESSION_NO_SPEECH=1；meta.json 读不了时返回 1
 _read_tags() {
-    local line f ok=1
+    local line f ok=1 i
     SESSION_TAGS=()
-    SESSION_CAL_TITLE=""; SESSION_CAL_START=""; SESSION_CAL_END=""
+    SESSION_CAL_TITLE=""; SESSION_CAL_START=""; SESSION_CAL_END=""; SESSION_CAL_BY=""; SESSION_CAL_N=0; SESSION_NO_SPEECH=""
     while IFS= read -r line; do
         IFS=$'\t' read -r -a f <<< "$line"
         case "${f[0]}" in
             tags) SESSION_TAGS=("${f[@]:1}"); ok=0 ;;
-            calendar) SESSION_CAL_TITLE="${f[1]}"; SESSION_CAL_START="${f[2]:-}"; SESSION_CAL_END="${f[3]:-}" ;;
+            no_speech) SESSION_NO_SPEECH=1 ;;
+            calendar)
+                for i in 1 2 3 4; do [[ "${f[$i]:-}" == "-" ]] && f[$i]=""; done
+                SESSION_CAL_TITLE="${f[1]:-}"; SESSION_CAL_START="${f[2]:-}"; SESSION_CAL_END="${f[3]:-}"
+                SESSION_CAL_BY="${f[4]:-legacy}"; SESSION_CAL_N="${f[5]:-0}"
+                ;;
         esac
     done < <(_meta get "$1")
     return $ok
@@ -2052,11 +2877,16 @@ _tag_guard() {
     return 1
 }
 
+# 这场会的 meta.json 在哪（新位置 .meetap/ 优先，没有再看根目录的老文件；报错提示用）
+_meta_file() {
+    if [[ -f "$1/.meetap/meta.json" || ! -f "$1/meta.json" ]]; then printf '%s' "$1/.meetap/meta.json"; else printf '%s' "$1/meta.json"; fi
+}
+
 _meta_error() {
     case "$1" in
-        badjson)  _t ERR_META_BAD "$2/meta.json" ;;
+        badjson)  _t ERR_META_BAD "$(_meta_file "$2")" ;;
         nopython) _t ERR_META_NO_PYTHON ;;
-        *)        _t ERR_META_IO "$2/meta.json" "${3:-}" ;;
+        *)        _t ERR_META_IO "$(_meta_file "$2")" "${3:-}" ;;
     esac
 }
 
@@ -2158,9 +2988,19 @@ _session_info() {
     else
         _t INFO_DURATION "$(_fmt_minutes "$(_session_minutes "$dir" false)")"
     fi
-    if [[ -n "$title" ]]; then _t INFO_NOTES "$title"; else _t INFO_NO_NOTES; fi
+    if [[ -n "$title" ]]; then _t INFO_NOTES "$title"
+    elif [[ -n "$SESSION_NO_SPEECH" ]]; then _t INFO_NO_NOTES_NO_SPEECH
+    else _t INFO_NO_NOTES
+    fi
     _t INFO_TAGS "$tags"
-    [[ -n "$SESSION_CAL_TITLE" ]] && _t INFO_CALENDAR "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")"
+    case "$SESSION_CAL_BY" in
+        content) _t INFO_CALENDAR_CONTENT "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
+        time)    _t INFO_CALENDAR_TIME "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
+        none)    _t INFO_CALENDAR_NONE "$SESSION_CAL_N" ;;
+        pending) _t INFO_CALENDAR_PENDING "$SESSION_CAL_N" ;;
+        no_speech) _t INFO_CALENDAR_NO_SPEECH ;;
+        *)       [[ -n "$SESSION_CAL_TITLE" ]] && _t INFO_CALENDAR "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
+    esac
     if [[ "$recording" == true ]]; then _t INFO_STATE_RECORDING; else _t INFO_STATE_ENDED; fi
 }
 
@@ -2617,7 +3457,7 @@ start_recording() {
         _jobctl_on
         ffmpeg -y -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
             -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
-            -movflags frag_keyframe+empty_moov \
+            "${FFMPEG_MUX_ARGS[@]}" \
             "$OUTPUT_FILE" \
             < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
@@ -2815,8 +3655,10 @@ stop_recording() {
             # 留存 audio-tap 诊断日志（设备采样率、重采样、时钟自检）：/tmp 下的
             # tap.log 每次开录都会被覆盖，事后排查录音变速/静音全靠这份副本
             if [[ -s "$STATE_DIR/tap.log" ]]; then
-                mkdir -p "$SESSION_DIR/log" && cp "$STATE_DIR/tap.log" "$SESSION_DIR/log/audio-tap.log"
-                grep -q "CLOCK_DRIFT" "$STATE_DIR/tap.log" && _t REC_CLOCK_DRIFT "$SESSION_DIR/log/audio-tap.log"
+                local diag
+                diag=$(_diag_dir "$SESSION_DIR")
+                cp "$STATE_DIR/tap.log" "$diag/audio-tap.log"
+                grep -q "CLOCK_DRIFT" "$STATE_DIR/tap.log" && _t REC_CLOCK_DRIFT "$diag/audio-tap.log"
             fi
             if $SLEEP_MODE; then
                 # 马上要休眠，上传会被打断：只记下会话，唤醒后提示 meetap again。
@@ -3053,6 +3895,7 @@ show_usage() {
     _t USAGE_STATUS
     _t USAGE_AGAIN
     _t USAGE_HIGHLIGHT
+    _t USAGE_TIDY
     _t USAGE_TAG
     _t USAGE_TAG_SESSION
     _t USAGE_TAG_LIST
@@ -3083,12 +3926,24 @@ case "${1:-}" in
     _wake-notify)
         wake_notify
         ;;
-    _calendar-lookup)
-        # 内部：meetap _calendar-lookup <会话目录> [<开始 epoch> <结束 epoch>]（测试、排查用）
-        if [[ -n "${3:-}" ]]; then calendar_lookup "${2:-}" "$3" "${4:-$3}"; else calendar_lookup_for_session "${2:-}"; fi
+    _calendar-collect)
+        # 内部：meetap _calendar-collect <会话目录> [<开始 epoch> <结束 epoch>]（测试、排查用）
+        if [[ -n "${3:-}" ]]; then calendar_collect "${2:-}" "$3" "${4:-$3}"; else calendar_collect_for_session "${2:-}"; fi
+        ;;
+    _calendar-recognize)
+        # 内部：meetap _calendar-recognize <会话目录>：按内容认，打印纪要末尾要加的那一行（测试、排查用）
+        calendar_recognize "${2:-}"
+        [[ -n "$CAL_NOTIFY" ]] && printf 'notify: %s\n' "$CAL_NOTIFY"
+        ;;
+    _calendar-llm)
+        # 内部：认会那次模型调用，calendar_recognize 放进单独的进程组里跑
+        calendar_llm_call "${2:-}" "${3:-}"
         ;;
     mark)
         highlight_notes "${2:-}"
+        ;;
+    tidy)
+        tidy_sessions "${@:2}"
         ;;
     setup)
         setup_apps

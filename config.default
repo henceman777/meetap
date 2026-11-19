@@ -24,7 +24,7 @@ multi_language = false
 recording_dir = ~/Record
 # Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
 audio_bitrate = 128k
-# Keep local audio file after S3 upload (true=keep, false=delete after upload)
+# Keep the local audio file after transcription (true=keep, false=delete once the transcript is saved)
 audio_persist = true
 # Audio is always captured with Process Tap (macOS 14.4+); there is no capture setting.
 # Silent-recording alert: if an app is playing sound but the capture is all zeros,
@@ -37,11 +37,17 @@ audio_persist = true
 zero_alert_ignore = com.amazon.workspaces
 
 # ── Calendar ──────────────────────────────────────────────────
-# After a recording stops, read the matching meeting from the macOS Calendar (title,
-# organizer, attendees, agenda) into the session's materials/calendar.md for the notes.
-# Join links, meeting IDs, passwords and dial-in numbers are removed. Requires calendar
+# After a recording stops, collect the meetings that overlap it from the macOS Calendar.
+# After transcription, the meeting closest in start/end time is checked against the
+# content by one extra call to the same AI backend as the notes (several meetings at exactly
+# the same time: picked by content; content clearly unrelated: calendar not used). The
+# picked meeting (title, organizer, attendees, agenda) goes into materials/calendar.md for
+# the notes. Which meeting was picked and why is shown in log/meetap.log, `meetap <folder>`
+# and the "notes ready" notification -- not in the notes, which get forwarded to others.
+# Join links, meeting IDs, passwords and dial-in numbers are removed; the model only sees
+# the first 500 characters of the agenda and the first 20 attendees. Requires calendar
 # access granted once via `meetap setup` (per terminal app); never prompts otherwise.
-# on | off  (off = never touch the calendar)
+# on | off  (off = never touch the calendar, no extra model call)
 calendar = on
 
 # ── Auto-stop ─────────────────────────────────────────────────
