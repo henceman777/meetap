@@ -90,11 +90,11 @@ CAL="$S/materials/calendar.md"
 CANDS="$S/.meetap/calendar-candidates.json"
 START=1794974466   # 2026-11-18 12:01:06 +08:00
 END=$((START + 51 * 60))
-# collect <会话> <开始> <结束>：只收候选；recognize <会话>：按内容认，OUT 里有日志和「footer: …」那一行
+# collect <会话> <开始> <结束>：只收候选；recognize <会话>：按内容认，OUT 里有日志和「notify: …」那一句（纪要完成的通知里带的）
 collect() { rm -f "$FAKE/calls.log"; OUT=$(cd "$TMP" && "$MEETAP" _calendar-collect "$1" "$2" "$3" </dev/null 2>&1); RC=$?; }
 recognize() { rm -f "$FAKE/cal-prompt.txt"; OUT=$(cd "$TMP" && "$MEETAP" _calendar-recognize "$1" </dev/null 2>&1); RC=$?; }
 lookup() { rm -f "$CAL"; collect "$S" "$START" "$END"; local o1="$OUT"; recognize "$S"; OUT="$o1"$'\n'"$OUT"; }
-footer_of() { printf '%s\n' "$OUT" | sed -n 's/^footer: //p'; }
+notify_of() { printf '%s\n' "$OUT" | sed -n 's/^notify: //p'; }
 M="$S/.meetap/meta.json"   # 第一次写以后，根目录的老 meta.json 就挪到这里
 mjson() { python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); exec(sys.argv[2])' "$@"; }   # mjson <meta.json> <python，d 是内容>
 
@@ -226,8 +226,8 @@ for bad in http chime.aws 123456 aB3dE5 example.com Passcode calendar.md; do
 done
 grep -qF -- '- 怎么认出来的：按时间：和录音时间最接近；内容也对得上：讨论的是架构评审' "$CAL" \
     && pass "calendar.md 写明怎么认出来的" || fail "缺「怎么认出来的」: $(cat "$CAL")"
-[[ "$(footer_of)" == "📅 对应日历：架构周会（时间最接近，内容也对得上：讨论的是架构评审）；同时段还有：迁移 office hour" ]] \
-    && pass "纪要末尾那一行：对应哪场、凭什么、同时段还有哪些" || fail "footer: $(footer_of)"
+[[ "$(notify_of)" == "日历：按时间认出 架构周会" ]] \
+    && pass "纪要完成的通知里带一句：日历按时间认出哪场" || fail "通知: $(notify_of)"
 [[ "$OUT" == *"这场会是「架构周会」（时间最接近，内容也对得上：讨论的是架构评审）"* ]] && pass "日志记一行认的结果" || fail "日志: $OUT"
 grep -q '来自系统日历，是会前的安排，实际讨论以录音为准' "$CAL" && pass "开头写明来源、以录音为准" || fail "缺来源说明"
 grep -q '^1. Q4 复盘$' "$CAL" && grep -q -- '^--------------------------------$' "$CAL" \
@@ -316,7 +316,7 @@ collect "$S" "$START" "$END"
     && mjson "$M" 'assert "calendar" not in d and d["tags"] == ["周会"]' \
     && pass "没有候选：去掉过期的候选和 calendar 字段，标签还在" || fail "没有候选 (rc=$RC): $OUT / $(cat "$M")"
 recognize "$S"
-[[ -z "$(footer_of)" && ! -e "$FAKE/cal-prompt.txt" ]] && pass "没有候选：不调模型，纪要末尾不加那一行" || fail "没有候选时: $OUT"
+[[ -z "$(notify_of)" && ! -e "$FAKE/cal-prompt.txt" ]] && pass "没有候选：不调模型，通知里不带日历" || fail "没有候选时: $OUT"
 S0="$TMP/rec/20261118_0800"; mkdir -p "$S0"
 collect "$S0" "$START" "$END"
 [[ ! -e "$S0/.meetap/meta.json" && ! -e "$S0/meta.json" ]] && pass "没有候选、也没有 meta.json：不新建" || fail "新建了 meta.json"
@@ -329,7 +329,7 @@ rm -f "$CAL"
 collect "$S" "$START" "$END"
 [[ $RC -eq 0 && -z "$OUT" && ! -e "$CAL" && ! -e "$FAKE/calls.log" ]] && pass "calendar = off：查询程序一次都没被调用" || fail "off 时还是查了: $OUT"
 recognize "$S"
-[[ ! -e "$FAKE/cal-prompt.txt" && ! -e "$CAL" && -z "$(footer_of)" ]] && pass "calendar = off：候选文件还在也不调模型" || fail "off 时调了模型: $OUT"
+[[ ! -e "$FAKE/cal-prompt.txt" && ! -e "$CAL" && -z "$(notify_of)" ]] && pass "calendar = off：候选文件还在也不调模型" || fail "off 时调了模型: $OUT"
 use_cfg
 
 # ── 6. 查询流程从不请求授权 ──
@@ -349,13 +349,14 @@ run_case q-real.json "$R" "$RS" "$RE"
 P=$(cat "$FAKE/cal-prompt.txt")
 [[ "$P" == *"[1] 标题：产品分享会"* && "$P" != *"占位"* ]] && pass "真实情况：时间最接近的是 11:00 那场，占位日程不交给模型" || fail "真实情况的提示词: $P"
 grep -qF -- '- 标题：产品分享会' "$R/materials/calendar.md" && mjson "$R/.meetap/meta.json" 'assert d["calendar"]["matched_by"] == "time"' \
-    && [[ "$(footer_of)" == "📅 对应日历：产品分享会（时间最接近，内容也对得上：在演示新功能）；同时段还有：专注时间（占位）" ]] \
-    && pass "真实情况：认出 11:00–12:00 那场，纪要末尾写明同时段还有占位日程" || fail "真实情况: $OUT"
+    && [[ "$(notify_of)" == "日历：按时间认出 产品分享会" ]] \
+    && pass "真实情况：认出 11:00–12:00 那场" || fail "真实情况: $OUT"
 # 假模型回了一个不存在的序号：当作出错，时间最接近的只有一场，照时间定
 answer '{"pick": 2, "reason": "占位那场"}'
 run_case q-real.json "$R" "$RS" "$RE"
-grep -qF -- '- 标题：产品分享会' "$R/materials/calendar.md" && [[ "$(footer_of)" == "📅 对应日历：产品分享会（按时间认出；认会的模型回的序号不在候选里，内容没核对）；同时段还有：专注时间（占位）" ]] \
-    && pass "模型回的序号不在候选里：按时间定，写明内容没核对" || fail "序号越界: $(footer_of) / $OUT"
+grep -qF -- '- 标题：产品分享会' "$R/materials/calendar.md" && [[ "$(notify_of)" == "日历：按时间认出 产品分享会" && "$OUT" == *"内容没核对（认会的模型出错：bad_pick）"* ]] \
+    && grep -qF -- '- 怎么认出来的：按时间：和录音时间最接近（认会的模型回的序号不在候选里，内容没核对）' "$R/materials/calendar.md" \
+    && pass "模型回的序号不在候选里：按时间定，日志和 calendar.md 写明内容没核对" || fail "序号越界: $(notify_of) / $OUT"
 
 # 7b. 同一时段两场真会（时间完全一样）：按模型选的那场定
 T="$TMP/rec/20261119_1403"; mkdir -p "$T/log" "$T/materials"
@@ -367,8 +368,8 @@ P=$(cat "$FAKE/cal-prompt.txt")
 [[ "$P" == *"共 2 场"* && "$P" == *"[1] 标题：预算评审"* && "$P" == *"[2] 标题：招聘同步"* ]] && pass "两场时间完全一样：两场都交给模型" || fail "两场的提示词: $P"
 grep -qF -- '- 标题：招聘同步' "$T/materials/calendar.md" && grep -qF -- '- 怎么认出来的：按内容：同一时间有 2 场，讨论的是岗位进展' "$T/materials/calendar.md" \
     && mjson "$T/.meetap/meta.json" 'assert d["calendar"]["matched_by"] == "content" and d["calendar"]["title"] == "招聘同步"' \
-    && [[ "$(footer_of)" == "📅 对应日历：招聘同步（同一时间有 2 场，按内容认出：讨论的是岗位进展）；同时段还有：预算评审" ]] \
-    && pass "两场时间完全一样：按模型选的第 2 场定，matched_by 记 content" || fail "两场: $(footer_of) / $OUT"
+    && [[ "$(notify_of)" == "日历：按内容认出 招聘同步" ]] \
+    && pass "两场时间完全一样：按模型选的第 2 场定，matched_by 记 content" || fail "两场: $(notify_of) / $OUT"
 answer '{"pick": 1, "reason": "讨论的是预算"}'
 run_case q-twins.json "$T" "$TS" "$TE"
 grep -qF -- '- 标题：预算评审' "$T/materials/calendar.md" && pass "两场时间完全一样：模型选第 1 场就是第 1 场" || fail "两场选 1: $OUT"
@@ -383,8 +384,8 @@ answer '{"pick": null, "reason": "录到的是新闻评论，不是周会"}'
 run_case q-single.json "$W" "$WS" "$WE"
 [[ ! -e "$W/materials/calendar.md" && -f "$W/.meetap/calendar-candidates.json" ]] \
     && mjson "$W/.meetap/meta.json" 'c = d["calendar"]; assert c["matched_by"] == "none" and "title" not in c and len(c["candidates"]) == 1 and c["reason"]' \
-    && [[ "$(footer_of)" == "📅 同时段日历里有 团队周会，按内容判断都不是这场（录到的是新闻评论，不是周会）" ]] \
-    && pass "只有一场、模型回 null：不写 calendar.md，matched_by 记 none，候选留着，末尾那行写都不是" || fail "null: $(footer_of) / $OUT"
+    && [[ "$(notify_of)" == "日历：同时段 1 场，内容对不上，没用" ]] \
+    && pass "只有一场、模型回 null：不写 calendar.md，matched_by 记 none，候选留着，通知写内容对不上" || fail "null: $(notify_of) / $OUT"
 [[ "$OUT" == *"同时段的 1 场会按内容判断都不是这场"* ]] && pass "日志记一行「都不是」" || fail "日志: $OUT"
 OUT=$(cd "$TMP" && "$MEETAP" 20261119_0944 </dev/null 2>&1)
 [[ "$OUT" == *"  日历：同时段有 1 场会，按内容判断都不是这场"* ]] && pass "meetap <文件夹>：显示都不是" || fail "信息页: $OUT"
@@ -406,12 +407,12 @@ P=$(cat "$FAKE/cal-prompt.txt")
 [[ "$P" == *"[1] 标题：youtube-watching"* && "$P" == *"会议说明（摘录）：议程：1. 季度预算复盘"* && "$P" == *"欢迎收看这期视频"* ]] \
     && pass "标题、复制来的正文、转录稿都交给了模型" || fail "交给模型的材料不全: $P"
 grep -qF -- '- 标题：youtube-watching' "$Y/materials/calendar.md" \
-    && [[ "$(footer_of)" == "📅 对应日历：youtube-watching（时间最接近，内容也对得上：标题是看视频，录到的正是视频演讲）" ]] \
-    && pass "标题对得上、正文是别的会的议程：选中 youtube-watching" || fail "youtube-watching: $(footer_of) / $OUT"
+    && [[ "$(notify_of)" == "日历：按时间认出 youtube-watching" ]] \
+    && pass "标题对得上、正文是别的会的议程：选中 youtube-watching" || fail "youtube-watching: $(notify_of) / $OUT"
 answer '{"pick": null, "reason": "标题是周会，录到的是新闻时评，正文也对不上"}'
 run_case q-single.json "$W" "$WS" "$WE"
-[[ ! -e "$W/materials/calendar.md" && "$(footer_of)" == "📅 同时段日历里有 团队周会，按内容判断都不是这场（标题是周会，录到的是新闻时评，正文也对不上）" ]] \
-    && pass "标题是周会、录到的是新闻时评：判都不是" || fail "周会 + 新闻: $(footer_of) / $OUT"
+[[ ! -e "$W/materials/calendar.md" && "$(notify_of)" == "日历：同时段 1 场，内容对不上，没用" ]] \
+    && pass "标题是周会、录到的是新闻时评：判都不是" || fail "周会 + 新闻: $(notify_of) / $OUT"
 
 # 7d. 模型出错的三种情况：调用失败、超时、回的不是 JSON
 for mode in fail hang garbage; do
@@ -419,13 +420,14 @@ for mode in fail hang garbage; do
     llm_mode $mode
     t0=$(date +%s); run_case q-real.json "$R" "$RS" "$RE"; took=$(( $(date +%s) - t0 ))
     grep -qF -- '- 标题：产品分享会' "$R/materials/calendar.md" && mjson "$R/.meetap/meta.json" 'assert d["calendar"]["matched_by"] == "time"' \
-        && [[ "$(footer_of)" == "📅 对应日历：产品分享会（按时间认出；认会的模型${why}，内容没核对）；同时段还有：专注时间（占位）" ]] \
-        && pass "模型${why}：时间最接近的只有一场，按时间定（matched_by 记 time）" || fail "模型${why}: $(footer_of) / $OUT"
+        && [[ "$(notify_of)" == "日历：按时间认出 产品分享会" ]] \
+        && grep -qF -- "- 怎么认出来的：按时间：和录音时间最接近（认会的模型${why}，内容没核对）" "$R/materials/calendar.md" \
+        && pass "模型${why}：时间最接近的只有一场，按时间定（matched_by 记 time）" || fail "模型${why}: $(notify_of) / $OUT"
     llm_mode $mode
     run_case q-twins.json "$T" "$TS" "$TE"
     [[ ! -e "$T/materials/calendar.md" ]] && mjson "$T/.meetap/meta.json" 'assert d["calendar"]["matched_by"] == "none"' \
-        && [[ "$(footer_of)" == "📅 同时段日历里有 预算评审、招聘同步，其中 2 场时间完全一样，认会的模型${why}，没能按内容认出是哪一场，没有用日历" ]] \
-        && pass "模型${why}：两场时间完全一样，分不出就不用日历" || fail "模型${why}（两场）: $(footer_of) / $OUT"
+        && [[ "$(notify_of)" == "日历：同时段 2 场，分不出是哪一场，没用" ]] \
+        && pass "模型${why}：两场时间完全一样，分不出就不用日历" || fail "模型${why}（两场）: $(notify_of) / $OUT"
     if [[ $mode != garbage ]]; then
         [[ "$OUT" == *"认会的模型没给出可用的回答"* ]] && pass "模型${why}：日志里记一行原因" || fail "模型${why}的日志: $OUT"
     fi
@@ -590,35 +592,32 @@ if command -v ffmpeg >/dev/null; then
     # 假 aws 查凭证时报不认识的错：最多试 3 次就停（凭证、网络问题才会一直等）
     [[ -z "$(grep -v '^aws sts get-caller-identity' "$TMP/aws.log")" && $(grep -c . "$TMP/aws.log") -le 3 ]] \
         && pass "这条测试没有上传任何东西（假 aws 只被问了凭证）" || fail "aws 调用: $(cat "$TMP/aws.log" 2>/dev/null)"
-    # again 只重跑纪要（已有转录）：收候选、认会、生成纪要（假 claude），末尾那一行插在签名前
+    # again 只重跑纪要（已有转录）：收候选、认会、生成纪要（假 claude）。怎么认的不写进纪要，
+    # 只进日志、信息页和纪要完成的通知
     S5="$TMP/rec/20261118_1600"; mkdir -p "$S5/materials" "$S5/log"
     cp "$S4/meeting_20261118_150005.m4a" "$S5/meeting_20261118_160005.m4a"
     echo "spk_0: 架构评审开始。" > "$S5/log/transcript.txt"
     answer '{"pick": 1, "reason": "讨论的是架构评审"}'
-    rm -f "$FAKE/calls.log" "$TMP/aws.log" "$FAKE/claude.log"
+    rm -f "$FAKE/calls.log" "$TMP/aws.log" "$FAKE/claude.log" "$TMP/sys.log"
     OUT=$(cd "$TMP" && HOME="$TMP/home" "$MEETAP" again "$S5" </dev/null 2>&1)
     NOTES="$S5/2026-11-18_1600_测试纪要.md"
     [[ -f "$S5/materials/calendar.md" && "$OUT" == *"这场会是「架构周会」"* && ! -e "$TMP/aws.log" && "$(cat "$FAKE/claude.log")" == $'cal\nnotes' ]] \
         && pass "again 只重跑纪要：先认会、再生成纪要（认会在前，纪要能读到 calendar.md）" || fail "again 纪要路径: $OUT / $(cat "$FAKE/claude.log" 2>/dev/null)"
-    python3 -I - "$NOTES" <<'PYEOF' && pass "纪要末尾那一行插在签名分割线前面，签名仍是最后一行" || fail "纪要末尾: $(tail -8 "$NOTES" 2>/dev/null)"
-import sys
-lines = [l for l in open(sys.argv[1], encoding="utf-8").read().split("\n")]
-body = [l for l in lines if l.strip()]
-assert "github.com/henceman777/meetap" in body[-1], body[-3:]
-assert body[-2] == "---" and body[-3] == "📅 对应日历：架构周会（时间最接近，内容也对得上：讨论的是架构评审）；同时段还有：迁移 office hour", body[-4:]
-i = lines.index(body[-3])
-assert lines[i - 1] == "" and lines[i + 1] == "", lines[i - 2:i + 3]
-PYEOF
+    [[ -f "$NOTES" ]] && ! grep -qE '📅|对应日历|同时段日历|同时段还有|office hour' "$NOTES" && grep -q 'github.com/henceman777/meetap' "$NOTES" \
+        && pass "纪要里没有认日历那一行，也没有同时段别的会；签名照旧" || fail "纪要里还有日历那一行: $(tail -6 "$NOTES" 2>/dev/null)"
+    grep -qF '会议纪要已生成: 2026-11-18_1600_测试纪要.md。日历：按时间认出 架构周会' "$TMP/sys.log" \
+        && pass "纪要完成的通知：写纪要文件名，带一句「日历：按时间认出 架构周会」" || fail "通知: $(grep 'display notification' "$TMP/sys.log" 2>/dev/null)"
+    grep -q '这场会是「架构周会」（时间最接近，内容也对得上：讨论的是架构评审）' "$S5/log/meetap.log" \
+        && pass "怎么认的照旧写进 log/meetap.log" || fail "日志: $(grep '📅' "$S5/log/meetap.log")"
+    INFO=$(cd "$TMP" && "$MEETAP" 20261118_1600 </dev/null 2>&1)
+    [[ "$INFO" == *"  日历：架构周会（12:00–13:00，按时间认出）"* ]] && pass "meetap <文件夹> 信息页写明按什么认的" || fail "信息页: $INFO"
     grep -q 'calendar-request' "$FAKE/calls.log" && fail "转录 / again 流程请求了授权" || pass "转录 / again 流程从不请求授权"
-    # 找不到签名：加在文件最后；没有候选：不加
-    printf '# 纪要\n\n正文\n' > "$TMP/nosig.md"
-    python3 -I -c "$(sed -n "/^_calendar_py() {/,/^CALPY/p" "$MEETAP" | sed '1,2d;$d')" footer-insert "$TMP/nosig.md" "📅 测试行" 2>/dev/null
-    [[ "$(grep -v '^$' "$TMP/nosig.md" | tail -1)" == "📅 测试行" ]] && pass "找不到签名：那一行加在文件最后" || fail "没签名时: $(cat "$TMP/nosig.md")"
     use_cfg "calendar = off"
     rm -f "$FAKE/claude.log"
     OUT=$(cd "$TMP" && HOME="$TMP/home" "$MEETAP" again "$S5" </dev/null 2>&1)
     N2=$(ls -t "$S5"/2026-11-18_1600_*.md | head -1)
-    [[ "$(cat "$FAKE/claude.log")" == "notes" ]] && ! grep -q '📅' "$N2" && pass "calendar = off：不调认会的模型，纪要末尾不加那一行" || fail "off 时纪要: $(cat "$FAKE/claude.log")"
+    [[ "$(cat "$FAKE/claude.log")" == "notes" ]] && ! grep -q '📅' "$N2" && grep 'display notification' "$TMP/sys.log" | tail -1 | grep -v -q '日历：' \
+        && pass "calendar = off：不调认会的模型，通知里也不带日历" || fail "off 时纪要: $(cat "$FAKE/claude.log")"
     use_cfg
 else
     echo "SKIP: 没装 ffmpeg，跳过挂接点的用例"

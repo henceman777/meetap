@@ -1463,7 +1463,8 @@ summarize_transcript() {
         return 1
     fi
 
-    # 日历候选按内容认是哪一场，认出来才写 materials/calendar.md（build_prompt 会读它）
+    # 日历候选按内容认是哪一场，认出来才写 materials/calendar.md（build_prompt 会读它）；
+    # 怎么认的只进日志、信息页和纪要完成的通知
     calendar_recognize "$SESSION_DIR"
 
     echo "[$(date '+%H:%M:%S')] $(_tn GENERATING_NOTES "$CFG_AI_BACKEND")"
@@ -1493,11 +1494,12 @@ summarize_transcript() {
         # smart_name_notes 把 meeting-notes.md 重命名为智能名,返回最终路径
         local FINAL_OUTPUT
         FINAL_OUTPUT=$(smart_name_notes "$OUTPUT" "$SESSION_DIR")
-        # 纪要末尾（签名前）加一行：对应日历里的哪场、怎么认的；邮件里的 html 由这份 md 生成
-        calendar_footer_insert "$FINAL_OUTPUT"
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$FINAL_OUTPUT")"
-        local notes_name="${FINAL_OUTPUT##*/}"
-        osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE "${notes_name//\"/}")\" with title \"MeeTap\"" 2>/dev/null
+        # 通知里带上日历是怎么认的（纪要里不写）
+        local notes_name="${FINAL_OUTPUT##*/}" notes_msg
+        notes_msg=$(_tn NOTIFY_NOTES_DONE "$notes_name")
+        [[ -n "$CAL_NOTIFY" ]] && notes_msg+="$(_tn NOTIFY_CAL_SEP)$CAL_NOTIFY"
+        osascript -e "display notification \"${notes_msg//\"/}\" with title \"MeeTap\"" 2>/dev/null
         send_meeting_notes "$FINAL_OUTPUT" "$SESSION_DIR"
     else
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_FAILED)"
@@ -2224,7 +2226,8 @@ def load_cand(session_dir):
     except (OSError, ValueError):
         return None
 
-# decide：时间优先，模型核对内容（几场时间完全一样时按内容选），写 calendar.md、meta、纪要末尾那一行
+# decide：时间优先，模型核对内容（几场时间完全一样时按内容选），写 calendar.md 和 meta。
+# 怎么认的只进日志、信息页和纪要完成的通知，不写进纪要：纪要会转给别人，会把日历里别的会带出去
 def cmd_decide(session_dir, llm_out, llm_status):
     cand = load_cand(session_dir)
     if not cand or not cand.get("candidates"):
@@ -2246,29 +2249,21 @@ def cmd_decide(session_dir, llm_out, llm_status):
         # 模型没回上来：时间最接近的只有一场，照时间定
         picked, kind = group[0], "time"
     why = reason or "没有给理由"
-    others = [c["title"] for c in cands if c is not picked]
-    tail = "；同时段还有：" + "、".join(others) if others and picked else ""
     if picked and kind == "content":
         how = "按内容：同一时间有 %d 场，%s" % (k, why)
-        footer = "📅 对应日历：%s（同一时间有 %d 场，按内容认出：%s）%s" % (picked["title"], k, why, tail)
         result = ("matched_content", picked["title"], why)
     elif picked and res is not None:
         how = "按时间：和录音时间最接近；内容也对得上：" + why
-        footer = "📅 对应日历：%s（时间最接近，内容也对得上：%s）%s" % (picked["title"], why, tail)
         result = ("matched_time", picked["title"], why)
     elif picked:
         reason = "认会的模型%s，内容没核对" % ERR_ZH[err]
         how = "按时间：和录音时间最接近（%s）" % reason
-        footer = "📅 对应日历：%s（按时间认出；%s）%s" % (picked["title"], reason, tail)
         result = ("matched_time_unchecked", picked["title"], err)
     elif res is not None:
-        footer = "📅 同时段日历里有 %s，按内容判断都不是这场（%s）" % ("、".join(c["title"] for c in cands), why)
         result = ("matched_none", len(cands), why)
     else:
         reason = "认会的模型%s" % ERR_ZH[err]
-        footer = "📅 同时段日历里有 %s，其中 %d 场时间完全一样，%s，没能按内容认出是哪一场，没有用日历" % (
-            "、".join(c["title"] for c in cands), k, reason)
-        result = ("undecided", k, err)
+        result = ("undecided", k, err, len(cands))
     cal = {"candidates": [brief(c) for c in cands], "matched_by": kind, "reason": reason, "looked_up_at": now_iso()}
     path = cal_md_path(session_dir)
     if picked:
@@ -2278,7 +2273,6 @@ def cmd_decide(session_dir, llm_out, llm_status):
     elif os.path.exists(path):
         os.remove(path)   # 调用方已确认这份是 meetap 自己写的、没被改过（见 state）
     out("meta", json.dumps(cal, ensure_ascii=False))
-    out("footer", footer)
     out("result", *result)
 
 # state：materials/calendar.md 是不是 meetap 自己写的、没被人改过
@@ -2298,32 +2292,6 @@ def state_of(session_dir):
 def cmd_state(session_dir):
     print(state_of(session_dir))
 
-# footer-insert：把那一行插在纪要签名的分割线前面；找不到签名就加在最后
-def cmd_footer_insert(md, line):
-    with open(md, encoding="utf-8") as f:
-        lines = f.read().split("\n")
-    sig = None
-    for i in range(len(lines) - 1, -1, -1):
-        plain = re.sub(r"<[^>]+>", "", lines[i])
-        if "github.com/henceman777/meetap" in lines[i] or "audio notes generator" in plain:
-            sig = i
-            break
-    if sig is None:
-        while lines and not lines[-1].strip():
-            lines.pop()
-        lines += ["", line, "", ""]
-    else:
-        at, j = sig, sig - 1
-        while j >= 0 and not lines[j].strip():
-            j -= 1
-        if j >= 0 and lines[j].strip() == "---":
-            at = j          # 签名前的分割线；没有分割线就插在签名那行前面
-        ins = [line, ""]
-        if at > 0 and lines[at - 1].strip():
-            ins.insert(0, "")
-        lines[at:at] = ins
-    atomic_write(md, "\n".join(lines))
-
 def main():
     cmd = sys.argv[1]
     if cmd == "collect":
@@ -2334,8 +2302,6 @@ def main():
         cmd_decide(sys.argv[2], sys.argv[3], sys.argv[4])
     elif cmd == "state":
         cmd_state(sys.argv[2])
-    elif cmd == "footer-insert":
-        cmd_footer_insert(sys.argv[2], sys.argv[3])
 
 main()
 CALPY
@@ -2458,11 +2424,12 @@ PYEOF
 }
 
 # calendar_recognize <会话目录>：转录完、生成纪要之前，核对内容、定是哪一场（时间优先，
-# 起止时间完全一样的几场按内容选）。结果写进 meta.json；纪要末尾要加的那一行放进 CAL_FOOTER。
-CAL_FOOTER=""
+# 起止时间完全一样的几场按内容选）。结果写进 meta.json 和日志；纪要完成的通知里要带的那一句放进 CAL_NOTIFY。
+# 纪要里不写：纪要会转给别人，会把日历里别的会、客户名带出去
+CAL_NOTIFY=""
 calendar_recognize() {
-    local dir="$1" py tpl tmpdir prompt llm rc status="ok" kind a b c msg="" err
-    CAL_FOOTER=""
+    local dir="$1" py tpl tmpdir prompt llm rc status="ok" kind a b c d msg="" err
+    CAL_NOTIFY=""
     [[ "$CFG_CALENDAR" == "on" ]] || return 0
     [[ -f "$dir/.meetap/calendar-candidates.json" && -s "$dir/log/transcript.txt" ]] || return 0
     [[ "$(_calendar_state "$dir")" == edited ]] && return 0
@@ -2484,17 +2451,16 @@ calendar_recognize() {
         status="failed"
         echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_LLM_FAILED "prompt")"
     fi
-    while IFS=$'\t' read -r kind a b c; do
+    while IFS=$'\t' read -r kind a b c d; do
         case "$kind" in
             meta)   _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
-            footer) CAL_FOOTER="$a" ;;
             result)
                 case "$a" in
-                    matched_time)           msg=$(_tn CAL_LOG_MATCHED "$b" "$c") ;;
-                    matched_content)        msg=$(_tn CAL_LOG_MATCHED_CONTENT "$b" "$c") ;;
-                    matched_time_unchecked) msg=$(_tn CAL_LOG_MATCHED_UNCHECKED "$b" "$c") ;;
-                    matched_none)           msg=$(_tn CAL_LOG_MATCHED_NONE "$b" "$c") ;;
-                    undecided)              msg=$(_tn CAL_LOG_UNDECIDED "$b" "$c") ;;
+                    matched_time)           msg=$(_tn CAL_LOG_MATCHED "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_TIME "$b") ;;
+                    matched_content)        msg=$(_tn CAL_LOG_MATCHED_CONTENT "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_CONTENT "$b") ;;
+                    matched_time_unchecked) msg=$(_tn CAL_LOG_MATCHED_UNCHECKED "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_TIME "$b") ;;
+                    matched_none)           msg=$(_tn CAL_LOG_MATCHED_NONE "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_NONE "$b") ;;
+                    undecided)              msg=$(_tn CAL_LOG_UNDECIDED "$b" "$c"); CAL_NOTIFY=$(_tn NOTIFY_CAL_UNDECIDED "$d") ;;
                     *)                      msg="" ;;
                 esac
                 [[ -n "$msg" ]] && echo "[$(date '+%H:%M:%S')] $msg"
@@ -2502,15 +2468,6 @@ calendar_recognize() {
         esac
     done < <("$py" -I -c "$(_calendar_py)" decide "$dir" "$llm" "$status" 2>/dev/null)
     rm -rf "$tmpdir"
-    return 0
-}
-
-# 纪要生成好以后，把日历那一行插在签名分割线前面（不经过模型）
-calendar_footer_insert() {
-    local md="$1" py
-    [[ -n "$CAL_FOOTER" && -f "$md" ]] || return 0
-    py=$(_calendar_python)
-    [[ -n "$py" ]] && "$py" -I -c "$(_calendar_py)" footer-insert "$md" "$CAL_FOOTER" 2>/dev/null
     return 0
 }
 
@@ -3976,7 +3933,7 @@ case "${1:-}" in
     _calendar-recognize)
         # 内部：meetap _calendar-recognize <会话目录>：按内容认，打印纪要末尾要加的那一行（测试、排查用）
         calendar_recognize "${2:-}"
-        [[ -n "$CAL_FOOTER" ]] && printf 'footer: %s\n' "$CAL_FOOTER"
+        [[ -n "$CAL_NOTIFY" ]] && printf 'notify: %s\n' "$CAL_NOTIFY"
         ;;
     _calendar-llm)
         # 内部：认会那次模型调用，calendar_recognize 放进单独的进程组里跑
