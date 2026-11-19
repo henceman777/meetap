@@ -2408,10 +2408,12 @@ with open(prompt_path, encoding="utf-8") as f:
 try:
     client = boto3.client("bedrock-runtime", region_name=region,
                           config=Config(read_timeout=25, connect_timeout=10, retries={"max_attempts": 0}))
-    r = client.converse(modelId=model_id, messages=[{"role": "user", "content": [{"text": prompt}]}],
-                        inferenceConfig={"maxTokens": 400},
-                        additionalModelRequestFields={"thinking": {"type": "disabled"}})
-    text = "".join(b.get("text", "") for b in r["output"]["message"]["content"])
+    # 和生成纪要一样走流式接口：最小权限策略里只有 bedrock:InvokeModelWithResponseStream
+    r = client.converse_stream(modelId=model_id, messages=[{"role": "user", "content": [{"text": prompt}]}],
+                               inferenceConfig={"maxTokens": 400},
+                               additionalModelRequestFields={"thinking": {"type": "disabled"}})
+    text = "".join(ev["contentBlockDelta"]["delta"].get("text", "")
+                   for ev in r["stream"] if "contentBlockDelta" in ev)
 except Exception as e:
     # 一行就够：meetap 靠这行分辨是不是凭证问题
     print(f"{type(e).__name__}: {e}".replace("\n", " "), file=sys.stderr)

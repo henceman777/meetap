@@ -125,11 +125,16 @@ class _Client:
     def __init__(self, service):
         self.service = service
     def converse_stream(self, **kw):
-        _gate("notes", "ConverseStream")
-        return {"stream": [{"contentBlockDelta": {"delta": {"text": NOTES}}}, {"messageStop": {"stopReason": "end_turn"}}]}
+        # 认日历的提示词里有 <转录节选>，生成纪要的没有
+        if "<转录节选>" in kw["messages"][0]["content"][0]["text"]:
+            _gate("calendar", "ConverseStream")
+            text = '{"pick": 1, "reason": "内容对得上"}'
+        else:
+            _gate("notes", "ConverseStream")
+            text = NOTES
+        return {"stream": [{"contentBlockDelta": {"delta": {"text": text}}}, {"messageStop": {"stopReason": "end_turn"}}]}
     def converse(self, **kw):
-        _gate("calendar", "Converse")
-        return {"output": {"message": {"content": [{"text": '{"pick": 1, "reason": "内容对得上"}'}]}}}
+        raise Exception("AccessDeniedException: 最小权限策略里没有 bedrock:InvokeModel")
     def send_raw_email(self, **kw):
         _gate("email", "SendRawEmail")
         with open(os.path.join(FAKE, "sent.log"), "a") as f:
