@@ -174,6 +174,10 @@ dump("q-twins.json", query([
     cand("招聘同步", "2026-11-19T14:00:00+08:00", "2026-11-19T15:00:00+08:00", 0.95, 3420, notes="议程：岗位进展")],
     "2026-11-19T14:03:00+08:00", "2026-11-19T15:00:00+08:00"))
 # 只有一场候选（09:44 那种：时段里有周会，录到的其实是别的）
+# 自己建的日程看视频：标题是 youtube-watching，正文是从别的会复制来的议程
+dump("q-watch.json", query([cand("youtube-watching", "2026-11-19T17:00:00+08:00", "2026-11-19T18:00:00+08:00", 0.61, 2700,
+    attendees=[], location="", notes="议程：1. 季度预算复盘 2. 招聘计划 3. 下季度目标")],
+    "2026-11-19T17:15:00+08:00", "2026-11-19T18:00:00+08:00"))
 dump("q-single.json", query([cand("团队周会", "2026-11-19T09:30:00+08:00", "2026-11-19T10:30:00+08:00", 0.72, 2760, notes="议程：周报")],
     "2026-11-19T09:44:00+08:00", "2026-11-19T10:30:00+08:00"))
 PYEOF
@@ -387,6 +391,28 @@ OUT=$(cd "$TMP" && "$MEETAP" 20261119_0944 </dev/null 2>&1)
 OUT=$(cd "$TMP" && "$MEETAP" 20261119_0944 -g </dev/null 2>&1)
 [[ "$OUT" != *"日历标题："* ]] && pass "matched_by 是 none：不给标签建议" || fail "不该建议: $OUT"
 
+# 7c'. 只有一场候选时先看标题（11-19 17:15 那场）：标题对得上就选它，不管正文写的是什么；
+#      标题和正文都对不上才判都不是。假模型判断不了内容，这里查交给模型的规则和材料齐不齐、回答怎么落地；
+#      模型按不按规则判，靠用 1715、0944 两场真实转录调真 Bedrock 试
+Y="$TMP/rec/20261119_1715"; mkdir -p "$Y/log" "$Y/materials"
+echo "spk_0: 欢迎收看这期视频，今天的演讲主题是开源社区怎么运营。" > "$Y/log/transcript.txt"
+YS=$(date -j -f "%Y%m%d_%H%M%S" 20261119_171500 +%s); YE=$((YS + 45 * 60))
+answer '{"pick": 1, "reason": "标题是看视频，录到的正是视频演讲"}'
+run_case q-watch.json "$Y" "$YS" "$YE"
+P=$(cat "$FAKE/cal-prompt.txt")
+[[ "$P" == *"只有一场时：先看标题。标题和录音对得上就回 1，不管会议说明写的是什么"* && "$P" == *"会议说明常常是从别的会复制来的"* \
+   && "$P" == *"只有标题和会议说明都明显对不上才回 null"* ]] \
+    && pass "只有一场候选：提示词写明先看标题、正文可能是复制来的、标题和正文都对不上才判都不是" || fail "提示词里没有先看标题的规则"
+[[ "$P" == *"[1] 标题：youtube-watching"* && "$P" == *"会议说明（摘录）：议程：1. 季度预算复盘"* && "$P" == *"欢迎收看这期视频"* ]] \
+    && pass "标题、复制来的正文、转录稿都交给了模型" || fail "交给模型的材料不全: $P"
+grep -qF -- '- 标题：youtube-watching' "$Y/materials/calendar.md" \
+    && [[ "$(footer_of)" == "📅 对应日历：youtube-watching（时间最接近，内容也对得上：标题是看视频，录到的正是视频演讲）" ]] \
+    && pass "标题对得上、正文是别的会的议程：选中 youtube-watching" || fail "youtube-watching: $(footer_of) / $OUT"
+answer '{"pick": null, "reason": "标题是周会，录到的是新闻时评，正文也对不上"}'
+run_case q-single.json "$W" "$WS" "$WE"
+[[ ! -e "$W/materials/calendar.md" && "$(footer_of)" == "📅 同时段日历里有 团队周会，按内容判断都不是这场（标题是周会，录到的是新闻时评，正文也对不上）" ]] \
+    && pass "标题是周会、录到的是新闻时评：判都不是" || fail "周会 + 新闻: $(footer_of) / $OUT"
+
 # 7d. 模型出错的三种情况：调用失败、超时、回的不是 JSON
 for mode in fail hang garbage; do
     case $mode in fail) why="调用失败" ;; hang) why="超时" ;; garbage) why="回的不是 JSON" ;; esac
@@ -502,7 +528,7 @@ OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 -g </dev/null 2>&1)
 mjson "$M" 'd["calendar"]["title"] = "Weekly Sync"; d["tags"] = ["周会"]; json.dump(d, open(sys.argv[1], "w"), ensure_ascii=False)'
 OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 -g </dev/null 2>&1)
 [[ "$OUT" == *"要贴的话：meetap 20261118_1201 -g 'Weekly Sync'"* ]] && pass "标题带空格时，建议的命令加了引号，照抄能用" || fail "带空格的建议: $OUT"
-rm -rf "$S2" "$S3" "$R" "$T" "$W" "$S0"   # 下面要用「最新一场」，留 S 一场
+rm -rf "$S2" "$S3" "$R" "$T" "$W" "$S0" "$Y"   # 下面要用「最新一场」，留 S 一场
 OUT=$(cd "$TMP" && "$MEETAP" -g </dev/null 2>&1)
 [[ "$OUT" == *"日历标题：Weekly Sync，要贴的话：meetap -g 'Weekly Sync'"* ]] \
     && pass "meetap -g：提示日历标题和要贴的话怎么写" || fail "默认目标的建议: $OUT"
