@@ -7,6 +7,11 @@ BUILD_ID=""   # make install 写入「分支@提交号」，区分本地试用�
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
 MEETAP_ARGV="$*"   # 这次是怎么调用的，写进日志的分隔行
 
+# 录音边录边落盘：分片 MP4，每 10 秒切一片（-frag_duration 单位是微秒），每片写完马上刷到磁盘。
+# frag_keyframe 只在视频关键帧处切片，纯音频光靠它永远切不了，整场都攒在内存里、文件一直 32 字节，
+# 进程被强杀或断电就全丢了；-flush_packets 1 不加的话，写好的片还会在缓冲里攒到 256 KB 才落盘
+FFMPEG_MUX_ARGS=(-movflags frag_keyframe+empty_moov -frag_duration 10000000 -flush_packets 1)
+
 # Defaults
 CFG_REGION="us-east-1"
 CFG_LANGUAGE="zh-CN"
@@ -3429,7 +3434,7 @@ start_recording() {
         _jobctl_on
         ffmpeg -y -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
             -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
-            -movflags frag_keyframe+empty_moov \
+            "${FFMPEG_MUX_ARGS[@]}" \
             "$OUTPUT_FILE" \
             < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
