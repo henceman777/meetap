@@ -375,8 +375,9 @@ autostop_daemon() {
     done
 }
 
-# 会话的诊断文件——排错日志 meetap.log、录音诊断 audio-tap.log、发言统计 speaker-stats.txt——
-# 放在会话里的隐藏目录 .meetap/（Finder 和 ls 默认看不到），log/ 里只留 transcript.txt。
+# 会话的诊断文件——录音诊断 audio-tap.log、发言统计 speaker-stats.txt、转录失败时留下的
+# transcribe-raw.json——放在会话里的隐藏目录 .meetap/（Finder 和 ls 默认看不到）。
+# log/ 里放用户会看的：转录文本 transcript.txt 和排错日志 meetap.log。
 _diag_dir() {
     mkdir -p "$1/.meetap" 2>/dev/null
     printf '%s' "$1/.meetap"
@@ -389,7 +390,7 @@ transcribe_recording() {
     mkdir -p "$LOG_DIR"
     local DIAG_DIR
     DIAG_DIR=$(_diag_dir "$SESSION_DIR")
-    local LOG_FILE="$DIAG_DIR/meetap.log"
+    local LOG_FILE="$LOG_DIR/meetap.log"
     local AWS_REGION="$CFG_REGION"
 
     # 语音文件保留在 session 根目录原位，不再移入 log/（用户要求位置不变动）
@@ -1309,7 +1310,8 @@ _looks_like_session() {
 }
 
 # ── meetap tidy：整理老会话（log/ 只留 transcript.txt）──
-# 新会话转录完就删 transcribe-raw.json、诊断文件放进 .meetap/；这个命令把老会话整理成同样的样子。
+# 新会话转录完就删 transcribe-raw.json、audio-tap.log 和 speaker-stats.txt 放进 .meetap/、meetap.log 留在
+# log/；这个命令把老会话整理成同样的样子（以前被挪进 .meetap/ 的 meetap.log 挪回 log/）。
 # 在整个 recording_dir 下按文件名找（第一层、月份文件夹、更深的子文件夹、老版本把文件放在会话根目录
 # 的布局都算），不碰 ~/Record-2 这类 recording_dir 以外的目录。默认只列清单、不改任何东西；--yes 才执行。
 # transcribe-raw.json 是唯一带逐词时间的文件：会话里还有音频的，删了以后能从音频重新转录找回来；
@@ -1320,7 +1322,7 @@ _tidy_py() {
 import os, shutil, sys
 
 rec, apply_, include_no_audio = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1"
-DIAG = ("meetap.log", "audio-tap.log", "speaker-stats.txt")
+DIAG = ("audio-tap.log", "speaker-stats.txt")   # 挪进 .meetap/；meetap.log 留在 log/
 
 def out(*f):
     print("\t".join(str(x).replace("\t", " ").replace("\n", " ") for x in f))
@@ -1353,9 +1355,11 @@ for root, dirs, files in os.walk(rec):
             sessions.setdefault(session, {})["moves"] = moves
     elif "transcribe-raw.json" in files:   # 老版本：文件直接放在会话根目录
         sessions.setdefault(root, {})["json"] = os.path.join(root, "transcribe-raw.json")
+    if os.path.isfile(os.path.join(root, ".meetap", "meetap.log")):   # 以前被挪进 .meetap/ 的排错日志
+        sessions.setdefault(root, {})["back"] = True
 
 sums = {"del_audio": [0, 0], "keep_noaudio": [0, 0], "del_noaudio": [0, 0], "keep_notranscript": [0, 0]}
-moved = conflicts = 0
+moved = moved_back = conflicts = 0
 rows = []
 for session in sorted(sessions):
     info = sessions[session]
@@ -1384,25 +1388,37 @@ for session in sorted(sessions):
         if apply_:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.move(src, dst)
+    n_back = 0
+    if info.get("back"):
+        src = os.path.join(session, ".meetap", "meetap.log")
+        dst = os.path.join(session, "log", "meetap.log")
+        if os.path.exists(dst):
+            n_conf += 1
+        else:
+            n_back = 1
+            if apply_:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
     if apply_ and kind in ("del_audio", "del_noaudio"):
         os.remove(j)
     moved += n_move
+    moved_back += n_back
     conflicts += n_conf
-    if kind != "none" or n_move or n_conf:
-        rows.append((kind, rel, human(size), n_move, n_conf))
+    if kind != "none" or n_move or n_conf or n_back:
+        rows.append((kind, rel, human(size), n_move, n_conf, n_back))
 
 order = {"del_audio": 0, "keep_noaudio": 1, "del_noaudio": 1, "keep_notranscript": 2, "none": 3}
-for kind, rel, size, n_move, n_conf in sorted(rows, key=lambda r: (order[r[0]], r[1])):
-    out("item", kind, rel, size, n_move, n_conf)
+for kind, rel, size, n_move, n_conf, n_back in sorted(rows, key=lambda r: (order[r[0]], r[1])):
+    out("item", kind, rel, size, n_move, n_conf, n_back)
 b = sums["keep_noaudio"] if not include_no_audio else sums["del_noaudio"]
 out("sum", sums["del_audio"][0], human(sums["del_audio"][1]), b[0], human(b[1]),
-    sums["keep_notranscript"][0], human(sums["keep_notranscript"][1]), moved, conflicts)
+    sums["keep_notranscript"][0], human(sums["keep_notranscript"][1]), moved, conflicts, moved_back)
 TIDYPY
 }
 
 # meetap tidy [--yes] [--include-no-audio]
 tidy_sessions() {
-    local apply=0 include=0 arg py line kind rel size nmove nconf group="" suffix
+    local apply=0 include=0 arg py line kind rel size nmove nconf nback group="" suffix
     for arg in "$@"; do
         case "$arg" in
             --yes)              apply=1 ;;
@@ -1416,7 +1432,7 @@ tidy_sessions() {
     while IFS=$'\t' read -r -a f; do
         case "${f[0]}" in
             item)
-                kind="${f[1]}"; rel="${f[2]}"; size="${f[3]}"; nmove="${f[4]}"; nconf="${f[5]}"
+                kind="${f[1]}"; rel="${f[2]}"; size="${f[3]}"; nmove="${f[4]}"; nconf="${f[5]}"; nback="${f[6]}"
                 if [[ "$kind" != "$group" ]]; then
                     group="$kind"
                     echo ""
@@ -1430,6 +1446,7 @@ tidy_sessions() {
                 fi
                 suffix=""
                 (( nmove > 0 )) && suffix+="$(_tn TIDY_ITEM_MOVES "$nmove")"
+                (( nback > 0 )) && suffix+="$(_tn TIDY_ITEM_BACK)"
                 (( nconf > 0 )) && suffix+="$(_tn TIDY_ITEM_CONFLICTS "$nconf")"
                 if [[ "$kind" == none ]]; then
                     suffix="${suffix#，}"; suffix="${suffix#, }"   # 去掉开头的逗号（中英两种写法）
@@ -1444,6 +1461,7 @@ tidy_sessions() {
                 if (( include )); then _t TIDY_SUM_NOAUDIO_DEL "${f[3]}" "${f[4]}"; else _t TIDY_SUM_NOAUDIO_KEEP "${f[3]}" "${f[4]}"; fi
                 (( ${f[5]} > 0 )) && _t TIDY_SUM_NOTRANSCRIPT "${f[5]}" "${f[6]}"
                 _t TIDY_SUM_MOVED "${f[7]}"
+                (( ${f[9]} > 0 )) && _t TIDY_SUM_BACK "${f[9]}"
                 (( ${f[8]} > 0 )) && _t TIDY_SUM_CONFLICTS "${f[8]}"
                 echo ""
                 if (( apply )); then _t TIDY_DONE; else _t TIDY_DRY_HINT "$(basename "$0")"; fi
@@ -1506,7 +1524,7 @@ again_session() {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
             calendar_lookup_for_session "$SESSION_DIR"
             summarize_transcript "$SESSION_DIR"
-        } 2>&1 | tee -a "$(_diag_dir "$SESSION_DIR")/meetap.log"
+        } 2>&1 | tee -a "$LOG_DIR/meetap.log"
     else
         # 无转录：从音频重跑全链路
         local AUDIO_FILE

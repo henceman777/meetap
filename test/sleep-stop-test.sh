@@ -66,7 +66,7 @@ alive "$FAKE_FFMPEG" && fail "ffmpeg 未被停止" || pass "ffmpeg 已停止"
 alive "$FAKE_WATCH" && pass "sleep-watch 仍存活" || fail "sleep-watch 被误杀"
 [[ "$(cat "$MEETAP_STATE_DIR/pending-again" 2>/dev/null)" == "20261020_1000_sleep" ]] \
     && pass "pending-again 记录了会话名" || fail "pending-again 内容不对: $(cat "$MEETAP_STATE_DIR/pending-again" 2>/dev/null)"
-[[ ! -e "$SESSION/.meetap/meetap.log" ]] && pass "未启动转录" || fail "启动了转录"
+[[ ! -e "$SESSION/log/meetap.log" ]] && pass "未启动转录" || fail "启动了转录"
 [[ -f "$AUDIO" ]] && pass "音频保留" || fail "音频丢失"
 kill "$FAKE_WATCH" 2>/dev/null
 
@@ -76,7 +76,7 @@ setup_recording "20261020_1100_normal"
 "$MEETAP" stop > "$TMP/out2.txt" 2>&1
 sleep 3
 alive "$FAKE_WATCH" && fail "sleep-watch 未被停止" || pass "sleep-watch 已停止"
-[[ -s "$SESSION/.meetap/meetap.log" ]] && pass "已启动后台转录" || fail "未启动转录"
+[[ -s "$SESSION/log/meetap.log" ]] && pass "已启动后台转录" || fail "未启动转录"
 [[ ! -e "$MEETAP_STATE_DIR/sleepwatch.pid" ]] && pass "sleepwatch.pid 已清理" || fail "sleepwatch.pid 残留"
 
 echo "== 用例 3: 无 ffmpeg PID、但 tap 已起（启动阶段被打断）→ 照常收尾 =="

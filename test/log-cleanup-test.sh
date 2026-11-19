@@ -1,6 +1,6 @@
 #!/bin/bash
 # 会话 log/ 只留 transcript.txt 的测试（不需要音频设备、不触达 AWS）：
-#   转录成功 → transcribe-raw.json 删掉，meetap.log、speaker-stats.txt 在隐藏的 .meetap/ 里；
+#   转录成功 → transcribe-raw.json 删掉，log/ 里是 transcript.txt 和 meetap.log，speaker-stats.txt 在隐藏的 .meetap/ 里；
 #   转录失败 → transcribe-raw.json 留着；build_prompt 新老位置的发言统计都读得到。
 # 用假的 aws 模拟整条转录流程（建桶、上传、开任务、查状态、下载一份编的 Transcribe JSON、清理），
 # 用 meetap again <会话> 走「从音频重跑」那条路；没有 venv，生成纪要那步会失败，但不碰 AWS。
@@ -82,16 +82,16 @@ listing() { (cd "$1" && find . -type f | sort | tr '\n' ' '); }
 cp "$TMP/raw-good.json" "$TMP/raw.json"
 S1=$(new_session 20261119_0900 20261119_090005)
 OUT=$(cd "$TMP" && "$MEETAP" again "$S1" </dev/null 2>&1)
-[[ "$(ls -A "$S1/log")" == "transcript.txt" ]] && pass "转录成功：log/ 里只剩 transcript.txt" || fail "log/ 里还有: $(ls -A "$S1/log")"
+[[ "$(ls -A "$S1/log" | tr '\n' ' ')" == "meetap.log transcript.txt " ]] && pass "转录成功：log/ 里只有 transcript.txt 和 meetap.log" || fail "log/ 里: $(ls -A "$S1/log")"
 grep -q '^spk_0: 大家好。' "$S1/log/transcript.txt" && grep -q '^spk_1: 开始吧' "$S1/log/transcript.txt" \
     && pass "转录文本照常生成" || fail "转录文本不对: $(cat "$S1/log/transcript.txt" 2>/dev/null)"
-[[ -s "$S1/.meetap/meetap.log" && -s "$S1/.meetap/speaker-stats.txt" ]] \
-    && pass "排错日志、发言统计在隐藏的 .meetap/ 里" || fail ".meetap/ 里: $(ls -A "$S1/.meetap" 2>/dev/null)"
+[[ "$(ls -A "$S1/.meetap")" == "speaker-stats.txt" ]] \
+    && pass "发言统计在隐藏的 .meetap/ 里，排错日志不在" || fail ".meetap/ 里: $(ls -A "$S1/.meetap" 2>/dev/null)"
 grep -q '^total: 0m04s' "$S1/.meetap/speaker-stats.txt" && pass "发言统计内容照常" || fail "发言统计: $(cat "$S1/.meetap/speaker-stats.txt")"
 [[ ! -e "$S1/.meetap/transcribe-raw.json" && ! -e "$S1/log/transcribe-raw.json" ]] \
     && pass "转录成功后删掉 transcribe-raw.json" || fail "transcribe-raw.json 还在"
-grep -q 'Transcript saved' "$S1/.meetap/meetap.log" && pass "排错日志照常记下转录过程" || fail "日志: $(cat "$S1/.meetap/meetap.log")"
-[[ "$OUT" == *".meetap/meetap.log"* ]] && pass "提示里写的日志位置是 .meetap/meetap.log" || fail "提示: $OUT"
+grep -q 'Transcript saved' "$S1/log/meetap.log" && pass "排错日志照常记下转录过程" || fail "日志: $(cat "$S1/log/meetap.log")"
+[[ "$OUT" == *"（日志: log/meetap.log）"* ]] && pass "提示里写的日志位置是 log/meetap.log" || fail "提示: $OUT"
 other=$(grep -v -E '^(sts|s3|s3api|transcribe) ' "$TMP/aws.log")
 [[ $(grep -c . "$TMP/aws.log") -ge 5 && -z "$other" ]] && grep -q '^transcribe start-transcription-job' "$TMP/aws.log" \
     && pass "整条转录走的是假 aws" || fail "aws 调用: $(cat "$TMP/aws.log")"
@@ -103,11 +103,11 @@ S2=$(new_session 20261119_1000 20261119_100005)
 [[ -f "$S2/.meetap/transcribe-raw.json" && ! -s "$S2/log/transcript.txt" ]] \
     && pass "生成不出转录时，transcribe-raw.json 留在 .meetap/" || fail "失败时原始结果没留下: $(ls -A "$S2/.meetap" 2>/dev/null)"
 
-# ── 3. again 只重跑纪要（已有转录）：日志追加到 .meetap/meetap.log ──
-before=$(wc -l < "$S1/.meetap/meetap.log")
+# ── 3. again 只重跑纪要（已有转录）：日志追加到 log/meetap.log ──
+before=$(wc -l < "$S1/log/meetap.log")
 (cd "$TMP" && "$MEETAP" again "$S1" </dev/null >/dev/null 2>&1)
-[[ $(wc -l < "$S1/.meetap/meetap.log") -gt $before && ! -e "$S1/log/meetap.log" ]] \
-    && pass "again 只重跑纪要时，日志追加到 .meetap/meetap.log" || fail "again 的日志位置不对: $(ls -A "$S1/log")"
+[[ $(wc -l < "$S1/log/meetap.log") -gt $before && ! -e "$S1/.meetap/meetap.log" ]] \
+    && pass "again 只重跑纪要时，日志追加到 log/meetap.log" || fail "again 的日志位置不对: $(ls -A "$S1/.meetap")"
 
 # ── 4. build_prompt：新位置、老位置的发言统计都读得到，两处都有时用新位置 ──
 prompt_of() {
@@ -144,9 +144,12 @@ mk "$R2/2026-07/temp/20260723_1055/meeting_20260723_105505.m4a"; mk "$R2/2026-07
 mk "$R2/2026-07/temp/20260723_1055/log/transcribe-raw.json" 5120; mk "$R2/2026-07/temp/20260723_1055/log/speaker-stats.txt"
 # C：有音频、有 JSON，但没有转录文本
 mk "$R2/20261102_0900/meeting_20261102_090005.m4a"; mk "$R2/20261102_0900/log/transcribe-raw.json" 1024
-# F：.meetap/ 里已经有同名的 meetap.log
+# F：.meetap/ 里已经有同名的 speaker-stats.txt
 mk "$R2/20261103_0900/meeting_20261103_090005.m4a"; mk "$R2/20261103_0900/log/transcript.txt"
-mk "$R2/20261103_0900/log/meetap.log" 7; mk "$R2/20261103_0900/.meetap/meetap.log" 9
+mk "$R2/20261103_0900/log/speaker-stats.txt" 7; mk "$R2/20261103_0900/.meetap/speaker-stats.txt" 9
+# H：以前被挪进 .meetap/ 的 meetap.log（log-cleanup 早期版本录的会）
+mk "$R2/20261105_0900/meeting_20261105_090005.m4a"; mk "$R2/20261105_0900/log/transcript.txt"
+mk "$R2/20261105_0900/.meetap/meetap.log" 11
 # G：新会话转录失败时故意留在 .meetap/ 的原始结果
 mk "$R2/20261104_0900/meeting_20261104_090005.m4a"; mk "$R2/20261104_0900/.meetap/transcribe-raw.json" 512
 # recording_dir 以外的目录（比如 ~/Record-2）
@@ -159,18 +162,20 @@ tidy() { OUT=$(cd "$TMP" && "$MEETAP" tidy "$@" </dev/null 2>&1); RC=$?; }
 before=$(snap)
 tidy
 [[ $RC -eq 0 && "$(snap)" == "$before" ]] && pass "tidy 默认只列清单，什么都没改" || fail "清单模式改了文件 (rc=$RC)"
-[[ "$OUT" == *"【有音频】"*"20261101_0900：transcribe-raw.json（2 KB），诊断文件 3 个挪进 .meetap/"* \
+[[ "$OUT" == *"【有音频】"*"20261101_0900：transcribe-raw.json（2 KB），诊断文件 2 个挪进 .meetap/"* \
    && "$OUT" == *"2026-07/temp/20260723_1055：transcribe-raw.json（5 KB），诊断文件 1 个"* ]] \
     && pass "有音频的一组：第一层和更深的子文件夹都扫到了" || fail "有音频的一组: $OUT"
 [[ "$OUT" == *"【没有音频】transcribe-raw.json 是逐词时间唯一的来源，默认留着"*"2026-04/0417_1216：transcribe-raw.json（4 KB）"* \
-   && "$OUT" == *"2026-10/20261008_1046：transcribe-raw.json（3 KB），诊断文件 1 个"* ]] \
+   && "$OUT" == *"2026-10/20261008_1046：transcribe-raw.json（3 KB）"* && "$OUT" != *"2026-10/20261008_1046：transcribe-raw.json（3 KB），"* ]] \
     && pass "没有音频的一组单独列出（月份文件夹、老版本布局都在）" || fail "没有音频的一组: $OUT"
 [[ "$OUT" == *"【没有转录文本】"*"20261102_0900：transcribe-raw.json（1 KB）"* ]] && pass "没有转录文本的单独列出" || fail "没转录的: $OUT"
 [[ "$OUT" == *"有音频的会话：2 场，删掉 transcribe-raw.json 能腾出 7 KB"* \
    && "$OUT" == *"没有音频的会话：2 场，transcribe-raw.json 合计 7 KB，默认不删"* ]] \
     && pass "最后两行写明两组各能腾出多少" || fail "汇总: $OUT"
-[[ "$OUT" == *"挪进 .meetap/ 的诊断文件：5 个"* && "$OUT" == *"1 个诊断文件在 .meetap/ 里已有同名文件"* && "$OUT" == *"tidy --yes"* ]] \
-    && pass "写明要挪几个、冲突几个，并提示确认后加 --yes" || fail "挪动汇总: $OUT"
+[[ "$OUT" == *"挪进 .meetap/ 的诊断文件：3 个"* && "$OUT" == *"1 个诊断文件在 .meetap/ 里已有同名文件"* && "$OUT" == *"tidy --yes"* ]] \
+    && pass "写明要挪几个、冲突几个，并提示确认后加 --yes（meetap.log 不挪）" || fail "挪动汇总: $OUT"
+[[ "$OUT" == *"20261105_0900：meetap.log 挪回 log/"* && "$OUT" == *"挪回 log/ 的 meetap.log：1 个"* ]] \
+    && pass "以前挪进 .meetap/ 的 meetap.log 列为挪回 log/" || fail "挪回: $OUT"
 [[ "$OUT" != *"Record-2"* && "$OUT" != *"20261104_0900"* ]] && pass "不碰 recording_dir 以外的目录，也不碰 .meetap/ 里留下的原始结果" || fail "扫到了不该扫的: $OUT"
 
 # 5b. --yes：有音频的删 JSON；没有音频的、没有转录的留着；诊断文件挪进 .meetap/
@@ -182,9 +187,11 @@ tidy --yes
 [[ -f "$R2/2026-10/20261008_1046/log/transcribe-raw.json" && -f "$R2/2026-04/0417_1216/transcribe-raw.json" ]] \
     && pass "--yes：没有音频的会话不加 --include-no-audio 时 JSON 留着" || fail "没有音频的 JSON 被删了"
 [[ -f "$R2/20261102_0900/log/transcribe-raw.json" ]] && pass "--yes：没有转录文本的 JSON 留着" || fail "没转录的 JSON 被删了"
-[[ "$(ls -A "$R2/20261101_0900/log")" == "transcript.txt" && $(ls -A "$R2/20261101_0900/.meetap" | wc -l) -eq 3 ]] \
-    && pass "--yes：log/ 只剩 transcript.txt，三个诊断文件进了 .meetap/" || fail "挪动不对: $(ls -A "$R2/20261101_0900/log")"
-[[ -f "$R2/20261103_0900/log/meetap.log" && $(wc -c < "$R2/20261103_0900/.meetap/meetap.log") -eq 9 ]] \
+[[ "$(ls -A "$R2/20261101_0900/log" | tr '\n' ' ')" == "meetap.log transcript.txt " && "$(ls -A "$R2/20261101_0900/.meetap" | tr '\n' ' ')" == "audio-tap.log speaker-stats.txt " ]] \
+    && pass "--yes：log/ 里是 transcript.txt 和 meetap.log，另外两个诊断文件进了 .meetap/" || fail "挪动不对: $(ls -A "$R2/20261101_0900/log")"
+[[ -f "$R2/20261105_0900/log/meetap.log" && ! -e "$R2/20261105_0900/.meetap/meetap.log" && $(wc -c < "$R2/20261105_0900/log/meetap.log") -eq 11 ]] \
+    && pass "--yes：以前挪进 .meetap/ 的 meetap.log 挪回了 log/" || fail "没挪回 log/"
+[[ -f "$R2/20261103_0900/log/speaker-stats.txt" && $(wc -c < "$R2/20261103_0900/.meetap/speaker-stats.txt") -eq 9 ]] \
     && pass "--yes：.meetap/ 里已有同名文件的没挪、没覆盖" || fail "冲突处理不对"
 [[ -f "$R2/20261104_0900/.meetap/transcribe-raw.json" ]] && pass "--yes：转录失败时留下的原始结果没动" || fail ".meetap/ 里的原始结果被删了"
 keep_after=$(cd "$TMP" && find rec2 -type f \( -name '*.m4a' -o -name '*.md' -o -path '*/materials/*' -o -name 'transcript.txt' \) -exec md5 -r {} + | sort)

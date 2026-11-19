@@ -117,7 +117,7 @@ no_leftovers && pass "无残留 tap/ffmpeg" || fail "残留进程: $(pgrep -fl "
 M4A=$(find "$TMP/rec" -name '*.m4a' -path '*ctrlc*' | head -1)
 DUR=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$M4A" 2>/dev/null)
 [[ -n "$DUR" ]] && pass "m4a 可读（${DUR}s）" || fail "m4a 不可读: $M4A"
-[[ -s "$(dirname "$M4A")/.meetap/meetap.log" ]] && pass "已启动转录" || fail "未启动转录"
+[[ -s "$(dirname "$M4A")/log/meetap.log" ]] && pass "已启动转录" || fail "未启动转录"
 [[ ! -e "$MEETAP_STATE_DIR/sleepwatch.pid" ]] && ! pgrep -f "$PREFIX/audio-multi-output sleep-watch" >/dev/null \
     && pass "sleep-watch 已结束" || fail "sleep-watch 残留"
 
@@ -172,7 +172,7 @@ no_leftovers && pass "无残留 tap/ffmpeg" || fail "残留进程: $(pgrep -fl "
 M4A=$(find "$TMP/rec" -name '*.m4a' -newer "$TMP/bare.marker" | head -1)
 DUR=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$M4A" 2>/dev/null)
 [[ -n "$DUR" ]] && pass "m4a 可读（${DUR}s）" || fail "m4a 不可读: ${M4A:-没有新录音}"
-[[ -n "$M4A" && -s "$(dirname "$M4A")/.meetap/meetap.log" ]] && pass "已启动转录" || fail "未启动转录"
+[[ -n "$M4A" && -s "$(dirname "$M4A")/log/meetap.log" ]] && pass "已启动转录" || fail "未启动转录"
 
 echo ""
 if (( FAIL )); then echo "❌ 有用例失败"; exit 1; else echo "✅ 全部通过"; fi
