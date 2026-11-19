@@ -176,7 +176,7 @@ meetap config show      # 查看当前所有配置项
 | `zero_alert_ignore` | `com.amazon.workspaces` | 静音报警时不算"在放声音"的 App（逗号分隔的 bundle ID 或命令行程序名），见下 |
 | `calendar` | `on` | 停止录音后读系统日历补充会议信息（`on` / `off`），`off` 时完全不碰日历，见「日历里的会议信息」 |
 
-**`zero_alert_ignore` 是干什么的**：录音期间如果有 App 在放声音、录到的却全是零（多半是系统录音授权失效，或系统采集中途出了故障），meetap 会在 30 秒内弹通知，写明是哪个 App 在放。有的 App 一直开着音频输出、其实放的是静音（比如 Amazon WorkSpaces 客户端），会被误当成"在放声音"，每次提前开录都误报，所以要排除掉。**什么时候往里加**：收到这条通知、但当时其实没有任何声音在放，就把通知里那个 App 后面**括号里那一串**加进来——通知写的是"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"，要加的是 `com.google.Chrome.helper`；命令行程序没有括号，直接加程序名。多个用逗号隔开。名单里的 App 只是不再触发报警，会话的 `log/audio-tap.log` 里照样记（`ignored=`）。
+**`zero_alert_ignore` 是干什么的**：录音期间如果有 App 在放声音、录到的却全是零（多半是系统录音授权失效，或系统采集中途出了故障），meetap 会在 30 秒内弹通知，写明是哪个 App 在放。有的 App 一直开着音频输出、其实放的是静音（比如 Amazon WorkSpaces 客户端），会被误当成"在放声音"，每次提前开录都误报，所以要排除掉。**什么时候往里加**：收到这条通知、但当时其实没有任何声音在放，就把通知里那个 App 后面**括号里那一串**加进来——通知写的是"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"，要加的是 `com.google.Chrome.helper`；命令行程序没有括号，直接加程序名。多个用逗号隔开。名单里的 App 只是不再触发报警，会话的 `.meetap/audio-tap.log` 里照样记（`ignored=`）。
 
 重置为默认：`rm ~/.config/meetap/config` 后再跑任意 `meetap` 命令。
 
@@ -240,7 +240,7 @@ $ meetap start -m -d 150
 - **你正常开会**，音频照常从原来的扬声器 / 耳机里播放（Process Tap 不切换输出设备，录音中途切换输出设备也不影响采集）
 - **终端底部**会显示音量电平 + 时长（`-m` 时只跟电脑声音走）
 - 指定了 `-d` 时，到达时长上限会自动停止；否则一直录到你手动 `stop`
-- **有声音在放、却录成静音时当场提醒**：整场录音期间，只要有 App 在放声音、录到的却全是零，30 秒内弹系统通知，写明是哪个 App 在放（"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"）。开会前提前开录、什么都没在放时不会提醒。每段变零、恢复的墙钟时间都记在会话的 `log/audio-tap.log` 里（`TAP_ZERO_START` / `TAP_ZERO_END`），开着麦克风的场次也记
+- **有声音在放、却录成静音时当场提醒**：整场录音期间，只要有 App 在放声音、录到的却全是零，30 秒内弹系统通知，写明是哪个 App 在放（"显示名（bundle ID）"，比如"Google Chrome（com.google.Chrome.helper）"）。开会前提前开录、什么都没在放时不会提醒。每段变零、恢复的墙钟时间都记在会话的 `.meetap/audio-tap.log` 里（`TAP_ZERO_START` / `TAP_ZERO_END`），开着麦克风的场次也记
 - **Mac 休眠（合盖等）时自动结束本场录音**：只把音频文件收尾，不在休眠前上传转录；唤醒后会弹通知，按提示运行 `meetap again <会话名>` 生成纪要（`meetap status` 也会显示这条待办）。锁屏、显示器休眠不受影响
 
 ### 停止 + 自动生成纪要
@@ -263,7 +263,7 @@ $ meetap stop
 - **写什么**：标题、起止时间、组织者、参会人、地点、会议说明。开头写明"来自系统日历，是会前的安排，实际讨论以录音为准"——议程不等于会上真讲了什么。
 - **不写什么**：会议链接、会议号、密码、拨入电话这类入会信息会删掉，不进纪要和邮件；参会人超过 30 位时只列组织者和前 20 位，并写明总人数；文件里不出现邮箱。
 - **当标签建议**：日历标题存进 `meta.json`。`meetap <文件夹>` 会显示"日历：标题（12:00–13:00）"；`meetap -g` 列标签时，标题还不是这场的标签就提示"要贴的话：meetap -g 标题"——只提示，标签照旧由你自己贴。
-- **查不到不出声**：没授权、日历没同步、没找到对应的会、查询超时（上限 10 秒），都直接跳过，不影响转录和纪要，只在会话的 `log/meetap.log` 里记一行 📅。
+- **查不到不出声**：没授权、日历没同步、没找到对应的会、查询超时（上限 10 秒），都直接跳过，不影响转录和纪要，只在会话的 `.meetap/meetap.log` 里记一行 📅。
 - **补查**：休眠自动结束的那场，唤醒后跑 `meetap again` 时会补查；`meetap again` 遇到还没有 `calendar.md` 的老会议也会补查。已经有 `calendar.md`（查过、或你自己放的）就不再查、不覆盖；想重查就先删掉它。
 - **不想用**：配置里写 `calendar = off`，完全不碰日历。
 
@@ -329,23 +329,43 @@ meetap 20261118_1201                   # 显示这场会的时间、时长、纪
 
 ```
 ~/Record/20260731_1430/
-├── meeting-notes.md       ← 结构化纪要（主要看这个）
-├── meeting-notes.html     ← 排版后的 HTML 版
-├── meeting-notes.pdf      ← 用于邮件附件的 PDF（若配了邮件）
-├── materials/             ← （可选）放参考资料，重新生成时注入；calendar.md 是从日历查到的这场会
-├── meta.json              ← （贴过标签或查到日历才有）会议标签、日历标题等元信息
-└── log/
-    ├── transcript.txt     ← 带说话人标签的转录
-    ├── speaker-stats.txt  ← 每人发言时长占比
-    ├── transcribe-raw.json ← Transcribe 原始 JSON
-    └── meetap.log         ← 每一步时间戳（调试用）
+├── 2026-07-31_1430_<主题>.md    ← 结构化纪要（主要看这个）
+├── 2026-07-31_1430_<主题>.html  ← 排版后的 HTML 版
+├── meeting_20260731_143005.m4a ← 录音（audio_persist = false 时转录成功后删掉）
+├── materials/                   ← （可选）放参考资料，重新生成时注入；calendar.md 是从日历查到的这场会
+├── meta.json                    ← （贴过标签或查到日历才有）会议标签、日历标题等元信息
+├── log/
+│   └── transcript.txt           ← 带说话人标签的转录
+└── .meetap/                     ← 隐藏文件夹（Finder 里按 Cmd+Shift+. 显示，或 ls -a）
+    ├── meetap.log               ← 每一步的时间和报错（排错用）
+    ├── speaker-stats.txt        ← 每人发言时长占比（重新生成纪要时用）
+    └── audio-tap.log            ← 录音诊断（采样率、变零 / 恢复的时间）
 ```
+
+Transcribe 返回的原始结果 `transcribe-raw.json`（平均 700 多 KB）在转录文本和发言统计写出来以后就删掉了。**它是唯一带逐词时间的文件，删了以后想找回时间，只能从音频重新转录**（删掉 `log/transcript.txt` 再跑 `meetap again`）。转录没成功时它会留在 `.meetap/` 里。
+
+### 🧹 整理老会话（meetap tidy）
+
+以前录的会，`log/` 里还留着 `transcribe-raw.json` 和几个诊断文件。`meetap tidy` 把它们整理成和新会话一样：
+
+```bash
+meetap tidy                            # 只列清单：每场会要删什么、挪什么，两组各能腾出多少；不改任何文件
+meetap tidy --yes                      # 看过清单、确认后执行
+meetap tidy --yes --include-no-audio   # 连没有音频的会话的 transcribe-raw.json 也删
+```
+
+- **会话里还有音频的**：删掉 `transcribe-raw.json`。以后要逐词时间，可以从音频重新转录。
+- **会话里已经没有音频的**：`transcribe-raw.json` 是逐词时间唯一的来源，删了就找不回来，所以默认不删，在清单里单独列出场数和合计大小；确定不要了再加 `--include-no-audio`。
+- **没有转录文本的**：`transcribe-raw.json` 留着。
+- `meetap.log`、`audio-tap.log`、`speaker-stats.txt` 挪进隐藏的 `.meetap/`；那边已有同名文件的不挪，会在清单里列出来。
+- 音频、纪要、`materials/`、`archive/`、转录文本一概不动。扫的是 `recording_dir`（默认 `~/Record`）下的所有会话，含月份文件夹、更深的子文件夹和老版本的文件布局。
 
 ### 其他常用命令
 
 ```bash
 meetap status       # 查看当前是否在音频采集
 meetap <文件夹>     # 显示某场会的时间、时长、纪要标题和标签
+meetap tidy         # 整理老会话：先列清单，加 --yes 才执行（见「整理老会话」）
 meetap config       # 编辑配置
 meetap config show  # 查看当前配置值
 meetap version      # 显示版本号
@@ -445,11 +465,11 @@ sequenceDiagram
 | 录出 **0 字节音频** / 转录报 `input file empty`（短会议偶发） | macOS Process Tap 的 IO 回调偶发不启动（`AudioDeviceStart` 成功但静默不喂数据），ffmpeg 收不到 PCM。**注意点阵波形读的是麦克风电平，此时仍会跳动，不代表在正常录音**。录音过程中 audio-tap 会自己盯着：有声音在放、tap 却一直没数据，就在进程内重建 tap，录音不中断。`start` 时 audio-tap 或 ffmpeg 起不来，会自动重试最多 3 次，仍失败则明确报错，按提示重跑 `meetap setup` 查授权或重新 `start` 即可 |
 | 转录失败：`AWS credentials not configured` | 跑 `aws configure` 或检查 `AWS_PROFILE` |
 | 转录失败：`AccessDenied` / `ValidationException` | 确认账号已开通 Bedrock Model access，且 IAM 有 `bedrock:InvokeModelWithResponseStream` 权限 |
-| 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../log/meetap.log` 查看具体 AWS 报错 |
+| 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../.meetap/meetap.log` 查看具体 AWS 报错（`.meetap/` 是隐藏文件夹：Finder 里按 Cmd+Shift+. 显示，或在终端里 `ls -a`） |
 | 音频采集有回声 | 戴耳机采集；外放会把扬声器声音二次采入 |
 | 系统通知没弹出 | 系统设置 → 通知 → 允许 "终端" 或 "Script Editor" 发送通知 |
-| 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零。先看通知里写的是哪个 App：它当时其实没出声（一直开着输出流的 App），就把通知里括号里那一串（bundle ID）加进配置 `zero_alert_ignore`；确实在开会，就跑 `meetap setup` 检查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间在会话的 `log/audio-tap.log` 里（`TAP_ZERO_*`） |
-| `materials/` 里没有 `calendar.md` / 纪要里没用上日历 | 看会话的 `log/meetap.log` 里那一行 📅：写着"没有读取权限"，就在你开录的那个终端里跑一次 `meetap setup`（只有「写入」权限要在 系统设置 › 隐私与安全性 › 日历 改成「完全访问」，改完可能要重开终端）；写着"没有对应的会"，检查 系统设置 › 互联网账户 里的日历是否已同步，或这场录音和日历里的会是否重叠不到 5 分钟；配置里 `calendar = off` 时不会查 |
+| 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零。先看通知里写的是哪个 App：它当时其实没出声（一直开着输出流的 App），就把通知里括号里那一串（bundle ID）加进配置 `zero_alert_ignore`；确实在开会，就跑 `meetap setup` 检查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间在会话的 `.meetap/audio-tap.log` 里（`TAP_ZERO_*`） |
+| `materials/` 里没有 `calendar.md` / 纪要里没用上日历 | 看会话的 `.meetap/meetap.log` 里那一行 📅：写着"没有读取权限"，就在你开录的那个终端里跑一次 `meetap setup`（只有「写入」权限要在 系统设置 › 隐私与安全性 › 日历 改成「完全访问」，改完可能要重开终端）；写着"没有对应的会"，检查 系统设置 › 互联网账户 里的日历是否已同步，或这场录音和日历里的会是否重叠不到 5 分钟；配置里 `calendar = off` 时不会查 |
 | 从 1.x 升级后听不到声音 | 系统输出或会议 App 的扬声器还指着 BlackHole 2ch。跑一次 `meetap setup`，或在 系统设置 › 声音 › 输出、会议 App 的音频设置里改回扬声器 / 耳机 |
 
 ---
