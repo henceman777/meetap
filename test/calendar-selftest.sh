@@ -1,7 +1,7 @@
 #!/bin/bash
 # 日历匹配规则自检（不读日历）：audio-multi-output selftest-calendar 用合成事件验证——
-# 按重叠最长取这场会、并列取开始最近的、门槛 5 分钟（短录音按一半）、全天/取消/我已拒绝不算、
-# 候选最多 5 个、--start/--end 认 epoch 和 ISO 8601。
+# 按时间分（重叠时长 ÷ 录音和会合起来的总时长）排候选、分数一样取开始最近的、门槛 5 分钟（短录音按一半）、
+# 全天/取消/我已拒绝不算、候选最多 5 个、时间完全一样的两场都收、--start/--end 认 epoch 和 ISO 8601。
 #
 # 用法: test/calendar-selftest.sh
 set -euo pipefail
