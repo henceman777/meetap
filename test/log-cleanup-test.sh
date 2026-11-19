@@ -128,6 +128,9 @@ S2b=$(new_session 20261119_1030 20261119_103005)
 # ── 2c. 一个词都没识别出来：日志和通知写明，不生成纪要，不报 Traceback ──
 cp "$TMP/raw-empty.json" "$TMP/raw.json"
 S2c=$(new_session 20261119_1052 20261119_105258)
+# 停止录音时收下了日历候选，还在等转录完认（pending）
+mkdir -p "$S2c/.meetap"
+echo '{"schema": 1, "session": "20261119_1052", "tags": [], "calendar": {"candidates": [{"title": "编的分享会", "start": "2026-11-19T11:00:00+08:00", "end": "2026-11-19T12:00:00+08:00", "time_score": 0.1}], "matched_by": "pending"}}' > "$S2c/.meetap/meta.json"
 rm -f "$TMP/notify.log"
 OUT=$(cd "$TMP" && "$MEETAP" again "$S2c" </dev/null 2>&1)
 L="$S2c/log/meetap.log"
@@ -136,6 +139,20 @@ grep -q '录音里没有识别出说话内容，不生成纪要' "$L" && ! grep 
     && pass "没识别出说话内容：日志写明，不生成纪要、不写转录稿，音频留着，没有 Traceback" || fail "没识别出内容: $(tail -6 "$L")"
 grep -q '录音里没有识别出说话内容，没有生成纪要' "$TMP/notify.log" && ! grep -q '转录完成' "$TMP/notify.log" \
     && pass "没识别出说话内容：弹通知写明，不弹「转录完成」" || fail "通知: $(cat "$TMP/notify.log" 2>/dev/null)"
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); c=d["calendar"]; assert d["no_speech"] is True and c["matched_by"] == "no_speech" and len(c["candidates"]) == 1 and c["looked_up_at"]' "$S2c/.meetap/meta.json" \
+    && pass "没识别出说话内容：meta.json 里日历不再停在 pending，定成 no_speech，候选留着" || fail "meta.json: $(cat "$S2c/.meetap/meta.json")"
+OUT=$(cd "$TMP" && "$MEETAP" 20261119_1052 </dev/null 2>&1)
+[[ "$OUT" == *"  纪要：没有（录音里没有说话内容）"* && "$OUT" == *"  日历：录音里没有说话内容，没认日历"* && "$OUT" != *"转录完按内容认"* ]] \
+    && pass "meetap <文件夹>：纪要一行写「没有（录音里没有说话内容）」，日历一行写「录音里没有说话内容，没认日历」" || fail "信息页: $OUT"
+# 以前没有 meta.json 的会话：也记下来；后来又转出了内容（比如换了音频再 again）就把记号去掉
+S2d=$(new_session 20261119_1053 20261119_105305)
+(cd "$TMP" && "$MEETAP" again "$S2d" </dev/null >/dev/null 2>&1)
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["no_speech"] is True and "calendar" not in d' "$S2d/.meetap/meta.json" \
+    && pass "没有 meta.json 的会话没识别出内容：新建一份记下 no_speech" || fail "没有新建 meta.json: $(ls -A "$S2d/.meetap" 2>/dev/null)"
+cp "$TMP/raw-good.json" "$TMP/raw.json"
+(cd "$TMP" && "$MEETAP" again "$S2d" </dev/null >/dev/null 2>&1)
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "no_speech" not in d' "$S2d/.meetap/meta.json" && [[ -s "$S2d/log/transcript.txt" ]] \
+    && pass "后来又转出了内容：去掉 no_speech 记号" || fail "记号没去掉: $(cat "$S2d/.meetap/meta.json")"
 
 # ── 3. again 只重跑纪要（已有转录）：日志追加到 log/meetap.log ──
 before=$(wc -l < "$S1/log/meetap.log")

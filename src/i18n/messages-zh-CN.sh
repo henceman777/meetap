@@ -232,6 +232,7 @@ MSG_INFO_CALENDAR_CONTENT="  日历：%s（%s，同一时间有几场，按内�
 MSG_INFO_CALENDAR_TIME="  日历：%s（%s，按时间认出）"
 MSG_INFO_CALENDAR_NONE="  日历：同时段有 %s 场会，按内容判断都不是这场"
 MSG_INFO_CALENDAR_PENDING="  日历：候选 %s 场，转录完按内容认"
+MSG_INFO_CALENDAR_NO_SPEECH="  日历：录音里没有说话内容，没认日历"
 MSG_TAGLIST_CAL_SUGGEST="日历标题：%s，要贴的话：%s"
 
 # ── meetap tidy（整理老会话）──
@@ -306,6 +307,7 @@ MSG_INFO_DURATION="  时长：%s"
 MSG_INFO_DURATION_RECORDING="  时长：已录 %s"
 MSG_INFO_NOTES="  纪要：%s"
 MSG_INFO_NO_NOTES="  纪要：还没有"
+MSG_INFO_NO_NOTES_NO_SPEECH="  纪要：没有（录音里没有说话内容）"
 MSG_INFO_TAGS="  标签：%s"
 MSG_INFO_STATE_RECORDING="  状态：正在录"
 MSG_INFO_STATE_ENDED="  状态：已结束"

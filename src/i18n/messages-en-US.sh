@@ -231,6 +231,7 @@ MSG_INFO_CALENDAR_CONTENT="  Calendar: %s (%s, several at the same time, picked 
 MSG_INFO_CALENDAR_TIME="  Calendar: %s (%s, picked by time)"
 MSG_INFO_CALENDAR_NONE="  Calendar: %s meeting(s) in this time range, none matches the content"
 MSG_INFO_CALENDAR_PENDING="  Calendar: %s candidate(s), will check against the content after transcription"
+MSG_INFO_CALENDAR_NO_SPEECH="  Calendar: no speech in the recording; calendar not matched"
 MSG_TAGLIST_CAL_SUGGEST="Calendar title: %s; to tag it: %s"
 
 # ── meetap tidy (clean up older sessions) ──
@@ -305,6 +306,7 @@ MSG_INFO_DURATION="  Duration: %s"
 MSG_INFO_DURATION_RECORDING="  Duration: %s so far"
 MSG_INFO_NOTES="  Notes:    %s"
 MSG_INFO_NO_NOTES="  Notes:    none yet"
+MSG_INFO_NO_NOTES_NO_SPEECH="  Notes:    none (no speech in the recording)"
 MSG_INFO_TAGS="  Tags:     %s"
 MSG_INFO_STATE_RECORDING="  Status:   recording"
 MSG_INFO_STATE_ENDED="  Status:   finished"

@@ -767,7 +767,9 @@ PYEOF
     rm -f "$JOB_FILE"
 
     if (( tx_rc == 3 )); then
-        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 .meetap/ 里备查
+        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 .meetap/ 里备查。
+        # meta.json 记下来，等着认的日历也定成 no_speech，meetap <文件夹> 照这个显示
+        _meta no-speech "$SESSION_DIR" on >/dev/null 2>&1
         echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_NO_SPEECH "$AUDIO_FILE")"
         osascript -e "display notification \"$(_tn NOTIFY_NO_SPEECH)\" with title \"MeeTap\"" 2>/dev/null
         return 0
@@ -776,6 +778,7 @@ PYEOF
         osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
         return 1
     fi
+    _meta no-speech "$SESSION_DIR" off >/dev/null 2>&1
 
     # 发言统计。没有说话人标签时整段算 spk_0，时长取第一个词到最后一个词
     python3 - "$SESSION_DIR" <<'PYEOF'
@@ -2686,6 +2689,27 @@ def cmd_calendar_clear(session_dir):
         write(session_dir, data)
     out("ok")
 
+# 录音里有没有说话内容：一个词都没识别出来时记 no_speech；等着认的日历（pending）也定下来，
+# 不再停在 pending。后来又转出了内容（again）就把记号去掉
+def cmd_no_speech(session_dir, flag):
+    data = load(session_dir)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    if flag == "on":
+        if not data:
+            data = {"schema": 1, "session": os.path.basename(session_dir)}
+        data["no_speech"] = True
+        cal = data.get("calendar")
+        if isinstance(cal, dict) and cal.get("matched_by") == "pending":
+            cal["matched_by"] = "no_speech"
+            cal["looked_up_at"] = now
+        data["updated_at"] = now
+        write(session_dir, data)
+    elif data.get("no_speech"):
+        del data["no_speech"]
+        data["updated_at"] = now
+        write(session_dir, data)
+    out("ok")
+
 def main(argv):
     cmd = argv[1]
     try:
@@ -2699,12 +2723,16 @@ def main(argv):
                 title = cal.get("title") if isinstance(cal.get("title"), str) else ""
                 by = cal.get("matched_by") or ("legacy" if title.strip() else "")
                 n = len(cal.get("candidates") or []) if isinstance(cal.get("candidates"), list) else 0
-                if title.strip() or by in ("none", "pending"):
+                if title.strip() or by in ("none", "pending", "no_speech"):
                     out("calendar", *[one_line(v) or "-" for v in (title, cal.get("start", ""), cal.get("end", ""), by, n)])
+            if data.get("no_speech"):
+                out("no_speech")
         elif cmd == "calendar-set":
             cmd_calendar_set(argv[2], argv[3])
         elif cmd == "calendar-clear":
             cmd_calendar_clear(argv[2])
+        elif cmd == "no-speech":
+            cmd_no_speech(argv[2], argv[3])
         elif cmd == "update":
             rest = argv[4:]
             cmd_update(argv[2], argv[3], list(zip(rest[0::2], rest[1::2])))
@@ -2733,16 +2761,17 @@ _meta() {
     "$py" -I -c "$(_meta_py)" "$@" </dev/null
 }
 
-# 读一场会的标签到 SESSION_TAGS 数组，日历到 SESSION_CAL_TITLE / _START / _END / _BY（怎么认的）/ _N（候选场数）；
-# meta.json 读不了时返回 1
+# 读一场会的标签到 SESSION_TAGS 数组，日历到 SESSION_CAL_TITLE / _START / _END / _BY（怎么认的）/ _N（候选场数），
+# 录音里没识别出说话内容时 SESSION_NO_SPEECH=1；meta.json 读不了时返回 1
 _read_tags() {
     local line f ok=1 i
     SESSION_TAGS=()
-    SESSION_CAL_TITLE=""; SESSION_CAL_START=""; SESSION_CAL_END=""; SESSION_CAL_BY=""; SESSION_CAL_N=0
+    SESSION_CAL_TITLE=""; SESSION_CAL_START=""; SESSION_CAL_END=""; SESSION_CAL_BY=""; SESSION_CAL_N=0; SESSION_NO_SPEECH=""
     while IFS= read -r line; do
         IFS=$'\t' read -r -a f <<< "$line"
         case "${f[0]}" in
             tags) SESSION_TAGS=("${f[@]:1}"); ok=0 ;;
+            no_speech) SESSION_NO_SPEECH=1 ;;
             calendar)
                 for i in 1 2 3 4; do [[ "${f[$i]:-}" == "-" ]] && f[$i]=""; done
                 SESSION_CAL_TITLE="${f[1]:-}"; SESSION_CAL_START="${f[2]:-}"; SESSION_CAL_END="${f[3]:-}"
@@ -3002,13 +3031,17 @@ _session_info() {
     else
         _t INFO_DURATION "$(_fmt_minutes "$(_session_minutes "$dir" false)")"
     fi
-    if [[ -n "$title" ]]; then _t INFO_NOTES "$title"; else _t INFO_NO_NOTES; fi
+    if [[ -n "$title" ]]; then _t INFO_NOTES "$title"
+    elif [[ -n "$SESSION_NO_SPEECH" ]]; then _t INFO_NO_NOTES_NO_SPEECH
+    else _t INFO_NO_NOTES
+    fi
     _t INFO_TAGS "$tags"
     case "$SESSION_CAL_BY" in
         content) _t INFO_CALENDAR_CONTENT "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
         time)    _t INFO_CALENDAR_TIME "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
         none)    _t INFO_CALENDAR_NONE "$SESSION_CAL_N" ;;
         pending) _t INFO_CALENDAR_PENDING "$SESSION_CAL_N" ;;
+        no_speech) _t INFO_CALENDAR_NO_SPEECH ;;
         *)       [[ -n "$SESSION_CAL_TITLE" ]] && _t INFO_CALENDAR "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
     esac
     if [[ "$recording" == true ]]; then _t INFO_STATE_RECORDING; else _t INFO_STATE_ENDED; fi
