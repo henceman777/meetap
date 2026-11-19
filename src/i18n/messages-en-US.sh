@@ -181,7 +181,14 @@ MSG_WARN_OLD_CAPTURE_CONFIG="ℹ️  BlackHole is no longer used as of 2.0; reco
 MSG_SETUP_APPS_NOT_NEEDED="ℹ️  As of 2.0 meeting app speakers don't need configuring: recording uses Process Tap, so keep your meeting apps on the system default speakers or headphones. To check permissions and audio settings, run meetap setup"
 
 # ── Calendar (after recording stops, find the matching meeting) ──
-MSG_CAL_LOG_MATCHED="📅 Calendar: this meeting is \"%s\" (overlaps the recording by %s min); wrote materials/calendar.md"
+MSG_CAL_LOG_COLLECTED="📅 Calendar: %s meeting(s) in this time range; will check against the content after transcription"
+MSG_CAL_LOG_MATCHED="📅 Calendar: this meeting is \"%s\" (closest in time, content matches: %s); wrote materials/calendar.md"
+MSG_CAL_LOG_MATCHED_CONTENT="📅 Calendar: this meeting is \"%s\" (several at the same time, picked by content: %s); wrote materials/calendar.md"
+MSG_CAL_LOG_MATCHED_UNCHECKED="📅 Calendar: taking \"%s\" by time; content not checked (the model call failed: %s); wrote materials/calendar.md"
+MSG_CAL_LOG_MATCHED_NONE="📅 Calendar: by content, none of the %s meeting(s) in this time range is this one (%s); calendar not used"
+MSG_CAL_LOG_UNDECIDED="📅 Calendar: %s meetings at exactly the same time and the model call failed (%s); cannot tell which, calendar not used"
+MSG_CAL_LOG_LLM_FAILED="📅 Calendar: the model gave no usable answer (%s)"
+MSG_CAL_LOG_KEEP_EDITED="📅 Calendar: materials/calendar.md was not written by meetap or has been edited; kept as is, not looked up again"
 MSG_CAL_LOG_NONE="📅 Calendar: no matching meeting in this time range; skipped"
 MSG_CAL_LOG_NOT_AUTHORIZED="📅 Calendar: no read access (%s); skipped. To enable it, run %s setup once in this terminal app"
 MSG_CAL_LOG_TIMEOUT="📅 Calendar: query timed out; skipped"
@@ -201,6 +208,10 @@ MSG_SETUP_CAL_UNKNOWN="ℹ️  Calendar authorization status is %s; skipped"
 MSG_TERMINAL_APPLE="Terminal"
 MSG_TERMINAL_UNKNOWN="your terminal app"
 MSG_INFO_CALENDAR="  Calendar: %s (%s)"
+MSG_INFO_CALENDAR_CONTENT="  Calendar: %s (%s, several at the same time, picked by content)"
+MSG_INFO_CALENDAR_TIME="  Calendar: %s (%s, picked by time)"
+MSG_INFO_CALENDAR_NONE="  Calendar: %s meeting(s) in this time range, none matches the content"
+MSG_INFO_CALENDAR_PENDING="  Calendar: %s candidate(s), will check against the content after transcription"
 MSG_TAGLIST_CAL_SUGGEST="Calendar title: %s; to tag it: %s"
 
 # ── meetap tidy (clean up older sessions) ──

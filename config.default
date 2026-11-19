@@ -37,11 +37,16 @@ audio_persist = true
 zero_alert_ignore = com.amazon.workspaces
 
 # ── Calendar ──────────────────────────────────────────────────
-# After a recording stops, read the matching meeting from the macOS Calendar (title,
-# organizer, attendees, agenda) into the session's materials/calendar.md for the notes.
-# Join links, meeting IDs, passwords and dial-in numbers are removed. Requires calendar
+# After a recording stops, collect the meetings that overlap it from the macOS Calendar.
+# After transcription, the meeting closest in start/end time is checked against the
+# content by one extra call to the same AI backend as the notes (several meetings at exactly
+# the same time: picked by content; content clearly unrelated: calendar not used). The
+# picked meeting (title, organizer, attendees, agenda) goes into materials/calendar.md for
+# the notes, and one line at the end of the notes says which meeting and why.
+# Join links, meeting IDs, passwords and dial-in numbers are removed; the model only sees
+# the first 500 characters of the agenda and the first 20 attendees. Requires calendar
 # access granted once via `meetap setup` (per terminal app); never prompts otherwise.
-# on | off  (off = never touch the calendar)
+# on | off  (off = never touch the calendar, no extra model call)
 calendar = on
 
 # ── Auto-stop ─────────────────────────────────────────────────

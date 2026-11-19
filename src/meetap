@@ -409,8 +409,8 @@ transcribe_recording() {
         return 1
     fi
 
-    # 日历：按录音时段找对应的会，写 materials/calendar.md（查不到就跳过，最多十几秒）
-    calendar_lookup_for_session "$SESSION_DIR"
+    # 日历：按录音时段收候选（查不到就跳过，最多十几秒）；转录完、生成纪要之前再按内容认
+    calendar_collect_for_session "$SESSION_DIR"
 
     if ! command -v aws &>/dev/null; then
         _t ERR_AWS_CLI_MISSING
@@ -1222,6 +1222,9 @@ summarize_transcript() {
         return 1
     fi
 
+    # 日历候选按内容认是哪一场，认出来才写 materials/calendar.md（build_prompt 会读它）
+    calendar_recognize "$SESSION_DIR"
+
     echo "[$(date '+%H:%M:%S')] $(_tn GENERATING_NOTES "$CFG_AI_BACKEND")"
 
     # build_prompt 失败（模板缺失/损坏）时中止：删掉已被截断的空 prompt 文件，
@@ -1254,6 +1257,8 @@ summarize_transcript() {
         # smart_name_notes 把 meeting-notes.md 重命名为智能名,返回最终路径
         local FINAL_OUTPUT
         FINAL_OUTPUT=$(smart_name_notes "$OUTPUT" "$SESSION_DIR")
+        # 纪要末尾（签名前）加一行：对应日历里的哪场、怎么认的；邮件里的 html 由这份 md 生成
+        calendar_footer_insert "$FINAL_OUTPUT"
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$FINAL_OUTPUT")"
         osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE)\" with title \"MeeTap\"" 2>/dev/null
         send_meeting_notes "$FINAL_OUTPUT" "$SESSION_DIR"
@@ -1541,7 +1546,7 @@ again_session() {
         _t AGAIN_FROM_NOTES
         {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
-            calendar_lookup_for_session "$SESSION_DIR"
+            calendar_collect_for_session "$SESSION_DIR"
             summarize_transcript "$SESSION_DIR"
         } 2>&1 | tee -a "$LOG_DIR/meetap.log"
     else
@@ -1674,18 +1679,19 @@ PYEOF
     rm -f "$PROMPT_FILE" "$LLM_OUT"
 }
 
-# ── 日历：停止录音后按录音时段找对应的会（第三批）──
-# 匹配在 audio-multi-output calendar-query 里做（它只在已经完全授权时读、绝不请求授权）；
-# 这里负责：去掉入会信息、截断参会人、写 materials/calendar.md、把摘要写进 meta.json。
-# 查不到——没授权、没同步、没匹配到、超时、出错——都跳过，不写文件、不报错，只记一行日志，
-# 不耽误转录和生成纪要。calendar.md 是给模型看的资料，和纪要一样固定用中文写。
+# ── 日历：先按时间收候选，转录完再按内容认是哪一场（2.0）──
+# 停止录音（转录开始前）：audio-multi-output calendar-query 按录音时段收候选——过门槛、按时间分排好，
+#   最多 5 场；这里去掉入会信息，存进 .meetap/calendar-candidates.json，还不写 materials/calendar.md。
+# 转录完、生成纪要之前：有候选就调一次模型（和纪要同一个后端、同一个模型），按内容认是哪一场，
+#   都对不上就不用日历；认出来才写 calendar.md。meetap 自己往纪要签名前加一行，写明认的是哪场、凭什么。
+# 查不到——没授权、没同步、没候选、超时、出错——都跳过，不报错，只在 log/meetap.log 记一行。
+# 只在已经完全授权时读日历，绝不请求授权。calendar.md 是给模型看的资料，和纪要一样固定用中文写。
 CALENDAR_TIMEOUT=10
+CAL_LLM_TIMEOUT="${MEETAP_CAL_LLM_TIMEOUT:-30}"   # 认会那次模型调用的上限（秒）；环境变量只给测试用
 
-# 处理 calendar-query 的 JSON（stdin）。argv：会话目录、录音开始 / 结束（epoch 秒）。
-# 输出 TSV：result\t状态\t…（给日志用），匹配到时再输出 meta\t<calendar 字段的 JSON>
 _calendar_py() {
     cat <<'CALPY'
-import json, os, re, sys, tempfile
+import hashlib, json, os, re, sys, tempfile
 from datetime import datetime
 
 # ── 去掉入会信息：会议链接、会议号、密码、电话拨入。各家邀请模板五花八门，宁可多删 ──
@@ -1693,21 +1699,19 @@ URL_RE = re.compile(r'<?\b(?:https?|ftp)://[^\s<>"]+>?', re.I)
 BARE_URL_RE = re.compile(r'\b(?:[\w-]+\.)*(?:chime\.aws|zoom\.(?:us|com)|teams\.(?:microsoft|live)\.com|'
                          r'meet\.google\.com|webex\.com|meeting\.tencent\.com|voovmeeting\.com|feishu\.cn|'
                          r'larksuite\.com|dingtalk\.com)(?:/\S*)?', re.I)
-# 有这些词的整行删掉
 STRONG_RE = re.compile(r'(?i)(meeting\s*(id|number|code)|webinar\s*id|会议\s*(号|id|码|密码)|conference\s*id|'
                        r'access\s*code|pass\s*code|password|\bpwd\b|密码|口令|\bpin\b|\bdial\b|dial[- ]?in|拨入|'
                        r'one[- ]tap|tap to join|join by phone|电话入会|拨号|一键入会|local number|international numbers|toll[- ]free)')
-# 「入会」类的词，配上链接或会议平台名才删（免得把「请大家准时参加」这类议程删掉）
 JOIN_RE = re.compile(r'(?i)(\bjoin\b|入会|加入会议|会议链接|meeting link|click here)')
 PLATFORM_RE = re.compile(r'(?i)(chime|zoom|teams|webex|google meet|腾讯会议|voov|飞书|lark|钉钉|meeting|会议|web|computer|mobile|phone|电话)')
-# 像电话号码 / 会议号的数字串：+ 开头的号码、3-4-4 分组的 9 位以上数字、连续 9 位以上数字、,,123# 拨号串
 NUMBER_RE = re.compile(r'(\+\d[\d\s().-]{6,}\d|\b\d{3}[\s-]?\d{3,4}[\s-]?\d{3,4}\b|\b\d{9,}\b|,,\d+#?)')
 # Teams 等：两条长下划线分隔线之间是整段入会信息。只认下划线——议程里用 ---- / ==== 分节的，
 # 两条一配对就会把中间的议程整段删掉
 SEP_RE = re.compile(r'^\s*_{20,}\s*$')
 PUNCT = ' \t:：-–—|·•,，;；()（）[]【】<>'
-# 正文里写着的邮箱只留 @ 前面那段（会进纪要和邮件）
 EMAIL_RE = re.compile(r'(?:mailto:)?([\w.+-]+)@[\w-]+(?:\.[\w-]+)+', re.I)
+EXCERPT = 500        # 交给模型的会议说明只截前 500 字
+PROMPT_ATTENDEES = 20
 
 def scrub(text):
     lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -1715,7 +1719,7 @@ def scrub(text):
     drop = set(seps)
     for a, b in zip(seps[0::2], seps[1::2]):
         drop.update(range(a, b + 1))
-    out = []
+    out_lines = []
     for i, l in enumerate(lines):
         if i in drop:
             continue
@@ -1727,9 +1731,9 @@ def scrub(text):
         rest = BARE_URL_RE.sub("", URL_RE.sub("", l)).rstrip()
         if had_url and not rest.strip(PUNCT):
             continue
-        out.append(EMAIL_RE.sub(lambda e: e.group(1), rest))
+        out_lines.append(EMAIL_RE.sub(lambda e: e.group(1), rest))
     res = []
-    for l in out:                       # 连续空行合并成一行，首尾空行去掉
+    for l in out_lines:
         if not l.strip():
             if res and res[-1] == "":
                 continue
@@ -1748,7 +1752,7 @@ def scrub_location(loc):
     return "; ".join(x for x in parts if x)
 
 def name_of(p):
-    # 没有名字时只用邮箱 @ 前面那段，calendar.md 里不出现完整邮箱
+    # 没有名字时只用邮箱 @ 前面那段，文件里不出现完整邮箱
     return ((p or {}).get("name") or "").strip() or ((p or {}).get("email") or "").split("@")[0].strip()
 
 def parse_time(iso):
@@ -1757,11 +1761,54 @@ def parse_time(iso):
     except (TypeError, ValueError):
         return None
 
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
 def out(*fields):
     print("\t".join(str(f).replace("\t", " ").replace("\n", " ") for f in fields))
 
-def main():
-    session_dir, rec_start, rec_end = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+def atomic_write(path, text):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".cal.", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+def cand_path(session_dir):
+    return os.path.join(session_dir, ".meetap", "calendar-candidates.json")
+
+def cal_md_path(session_dir):
+    return os.path.join(session_dir, "materials", "calendar.md")
+
+def load_meta(session_dir):
+    for p in (os.path.join(session_dir, ".meetap", "meta.json"), os.path.join(session_dir, "meta.json")):
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                return d if isinstance(d, dict) else {}
+            except (OSError, ValueError):
+                return {}
+    return {}
+
+def sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+def brief(c):
+    return {"title": c["title"], "start": c.get("start", ""), "end": c.get("end", ""), "time_score": c.get("time_score", 0)}
+
+# collect：处理 calendar-query 的 JSON（stdin），去掉入会信息，存候选
+def cmd_collect(session_dir, rec_start, rec_end):
     raw = sys.stdin.read()
     if not raw.strip():
         out("result", "error", "no output")
@@ -1781,70 +1828,286 @@ def main():
     if status != "ok":
         out("result", status if status in ("timeout", "error") else "error", d.get("message", ""))
         return
-    m = d.get("match")
-    if not isinstance(m, dict) or not (m.get("title") or "").strip():
+    cands = []
+    for c in d.get("candidates") or []:
+        if not isinstance(c, dict) or not (c.get("title") or "").strip():
+            continue
+        org = c.get("organizer") or {}
+        org_name, org_email = name_of(org), (org.get("email") or "").lower()
+        people = [a for a in c.get("attendees") or [] if a.get("type", "person") not in ("room", "resource")]
+        def is_org(a):
+            return bool(org_email and (a.get("email") or "").lower() == org_email) or bool(org_name and name_of(a) == org_name)
+        rank = {"chair": 0, "required": 1, "unknown": 2, "optional": 3, "nonParticipant": 4}
+        others = sorted([a for a in people if not is_org(a)], key=lambda a: rank.get(a.get("role"), 2))
+        notes = scrub(c.get("notes"))
+        cands.append({
+            "title": c["title"].strip(), "start": c.get("start", ""), "end": c.get("end", ""),
+            "time_score": c.get("time_score", 0), "overlap_sec": c.get("overlap_sec", 0),
+            "organizer": org_name,
+            "attendees": [n for n in (name_of(a) for a in others) if n],
+            "attendee_count": len(others) + (1 if org_name else 0),
+            "location": scrub_location(c.get("location")),
+            "notes": notes, "notes_excerpt": notes[:EXCERPT],
+        })
+    cp = cand_path(session_dir)
+    if state_of(session_dir) == "own":
+        os.remove(cal_md_path(session_dir))
+    if not cands:
+        if os.path.exists(cp):
+            os.remove(cp)
+        out("clear")
         out("result", "none")
         return
+    atomic_write(cp, json.dumps({"window": d.get("window", {}), "recording": [rec_start, rec_end],
+                                  "collected_at": now_iso(), "candidates": cands}, ensure_ascii=False, indent=2) + "\n")
+    out("meta", json.dumps({"candidates": [brief(c) for c in cands], "matched_by": "pending",
+                            "collected_at": now_iso()}, ensure_ascii=False))
+    out("result", "collected", len(cands))
 
-    title = m["title"].strip()
-    org = m.get("organizer") or {}
-    org_name, org_email = name_of(org), (org.get("email") or "").lower()
-    # 只列人：会议室、设备这类资源不算参会人；组织者单独一行，不在参会人里重复
-    people = [a for a in m.get("attendees") or [] if a.get("type", "person") not in ("room", "resource")]
-    def is_org(a):
-        return bool(org_email and (a.get("email") or "").lower() == org_email) or bool(org_name and name_of(a) == org_name)
-    rank = {"chair": 0, "required": 1, "unknown": 2, "optional": 3, "nonParticipant": 4}
-    others = sorted([a for a in people if not is_org(a)], key=lambda a: rank.get(a.get("role"), 2))
-    total = len(others) + (1 if org_name else 0)
-    names = [n for n in (name_of(a) for a in others) if n]
+# 转录稿截一段给模型：开头 4000 字 + 结尾 1000 字（开场多半是议题，结尾常有总结和下一步）
+HEAD_CHARS, TAIL_CHARS = 4000, 1000
 
-    st, en = parse_time(m.get("start")), parse_time(m.get("end"))
-    rs, rend = datetime.fromtimestamp(rec_start).astimezone(), datetime.fromtimestamp(rec_end).astimezone()
+def transcript_excerpt(session_dir):
+    try:
+        with open(os.path.join(session_dir, "log", "transcript.txt"), encoding="utf-8") as f:
+            t = f.read()
+    except OSError:
+        return ""
+    if len(t) <= HEAD_CHARS + TAIL_CHARS:
+        return t
+    return t[:HEAD_CHARS] + "\n……（中间省略 %d 字）……\n" % (len(t) - HEAD_CHARS - TAIL_CHARS) + t[-TAIL_CHARS:]
+
+# 时间优先：时间分最高的那场，加上和它起止时间完全一样的几场。只有这几场交给模型——
+# 一场时让模型核对内容对不对得上；几场时间完全一样时按内容选。
+def top_group(cands):
+    def key(c):
+        s, e = parse_time(c.get("start")), parse_time(c.get("end"))
+        return (s.timestamp() if s else c.get("start"), e.timestamp() if e else c.get("end"))
+    k0 = key(cands[0])
+    return [c for c in cands if key(c) == k0]
+
+def hm(epoch):
+    return datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d %H:%M")
+
+def cmd_prompt(session_dir, template):
+    cand = load_cand(session_dir)
+    cands = top_group(cand["candidates"])
+    rs, re_ = cand.get("recording", [0, 0])
+    with open(template, encoding="utf-8") as f:
+        tpl = f.read()
+    mdir = os.path.join(session_dir, "materials")
+    try:
+        names = sorted(n for n in os.listdir(mdir) if not n.startswith(".") and n != "calendar.md")
+    except OSError:
+        names = []
+    blocks = []
+    for i, c in enumerate(cands, 1):
+        st, en = parse_time(c["start"]), parse_time(c["end"])
+        when = "%s–%s" % (st.strftime("%Y-%m-%d %H:%M"), en.strftime("%H:%M")) if st and en else "?"
+        att = c["attendees"][:PROMPT_ATTENDEES]
+        lines = ["[%d] 标题：%s" % (i, c["title"]), "    时间：" + when]
+        if c.get("organizer"):
+            lines.append("    组织者：" + c["organizer"])
+        if att:
+            lines.append("    参会人（共 %d 人，列前 %d 位）：%s" % (c.get("attendee_count", len(att)), len(att), "、".join(att)))
+        if c.get("notes_excerpt"):
+            lines.append("    会议说明（摘录）：" + c["notes_excerpt"].replace("\n", " "))
+        blocks.append("\n".join(lines))
+    text = (tpl.replace("${recording}", "%s–%s" % (hm(rs), datetime.fromtimestamp(float(re_)).strftime("%H:%M")))
+               .replace("${candidate_count}", str(len(cands)))
+               .replace("${candidates}", "\n\n".join(blocks))
+               .replace("${materials_list}", "、".join(names) if names else "（无）")
+               .replace("${transcript_excerpt}", transcript_excerpt(session_dir)))
+    sys.stdout.write(text)
+
+ERR_ZH = {"timeout": "超时", "failed": "调用失败", "empty": "没有回答", "bad_json": "回的不是 JSON",
+          "no_pick": "回的 JSON 里没有 pick", "bad_pick": "回的序号不在候选里"}
+
+# 模型的回答：{"pick": 序号或 null, "reason": "…"}；前后多了文字也认，只取第一个 {…}
+def parse_pick(path, n):
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None, "empty"
+    if not text.strip():
+        return None, "empty"
+    m = re.search(r"\{.*?\}", text, re.S)
+    try:
+        d = json.loads(m.group(0)) if m else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return None, "bad_json"
+    if "pick" not in d:
+        return None, "no_pick"
+    p, reason = d.get("pick"), " ".join(str(d.get("reason") or "").split())
+    if p is None:
+        return ("null", reason), None
+    if isinstance(p, str) and p.strip().isdigit():
+        p = int(p.strip())
+    if isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= n:
+        return None, "bad_pick"
+    return (p, reason), None
+
+def write_calendar_md(session_dir, c, how):
+    st, en = parse_time(c.get("start")), parse_time(c.get("end"))
+    cand = load_cand(session_dir)
+    rs, re_ = (cand or {}).get("recording", [None, None])
     lines = ["# 日历里的这场会", "",
              "> 来自系统日历，是会前的安排，实际讨论以录音为准。入会链接、会议号、密码、拨入电话已去掉。", "",
-             "- 标题：" + title]
+             "- 标题：" + c["title"]]
     if st and en:
         end_fmt = "%H:%M" if en.date() == st.date() else "%Y-%m-%d %H:%M"
-        lines.append("- 时间：%s–%s（录音 %s–%s）" % (st.strftime("%Y-%m-%d %H:%M"), en.strftime(end_fmt),
-                                                  rs.strftime("%H:%M"), rend.strftime("%H:%M")))
-    if org_name:
-        lines.append("- 组织者：" + org_name)
+        rec = ""
+        if rs and re_:
+            rec = "（录音 %s–%s）" % (datetime.fromtimestamp(float(rs)).strftime("%H:%M"),
+                                    datetime.fromtimestamp(float(re_)).strftime("%H:%M"))
+        lines.append("- 时间：%s–%s%s" % (st.strftime("%Y-%m-%d %H:%M"), en.strftime(end_fmt), rec))
+    lines.append("- 怎么认出来的：" + how)
+    if c.get("organizer"):
+        lines.append("- 组织者：" + c["organizer"])
+    names, total = c.get("attendees") or [], c.get("attendee_count", 0)
     if total > 30:
         lines.append("- 参会人：共 %d 人，下面只列组织者和前 20 位：%s" % (total, "、".join(names[:20])))
     elif names:
         lines.append("- 参会人（%d 人）：%s" % (total, "、".join(names)))
-    loc = scrub_location(m.get("location"))
-    if loc:
-        lines.append("- 地点：" + loc)
-    notes = scrub(m.get("notes"))
-    if notes:
-        lines += ["", "## 会议说明", "", notes]
-    text = "\n".join(lines) + "\n"
+    if c.get("location"):
+        lines.append("- 地点：" + c["location"])
+    if c.get("notes"):
+        lines += ["", "## 会议说明", "", c["notes"]]
+    path = cal_md_path(session_dir)
+    atomic_write(path, "\n".join(lines) + "\n")
+    return sha256(path)
 
-    mdir = os.path.join(session_dir, "materials")
-    os.makedirs(mdir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".calendar.", suffix=".tmp", dir=mdir)
+def load_cand(session_dir):
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, os.path.join(mdir, "calendar.md"))
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+        with open(cand_path(session_dir), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
-    cal = {"title": title, "start": m.get("start", ""), "end": m.get("end", ""),
-           "organizer": org_name, "attendee_count": total,
-           "candidates": [c.get("title", "") for c in d.get("candidates") or [] if isinstance(c, dict) and c.get("title")],
-           "looked_up_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+# decide：时间优先，模型核对内容（几场时间完全一样时按内容选），写 calendar.md、meta、纪要末尾那一行
+def cmd_decide(session_dir, llm_out, llm_status):
+    cand = load_cand(session_dir)
+    if not cand or not cand.get("candidates"):
+        out("result", "none")
+        return
+    cands = cand["candidates"]
+    group = top_group(cands)
+    k = len(group)
+    if llm_status == "ok":
+        res, err = parse_pick(llm_out, k)
+    else:
+        res, err = None, ("timeout" if llm_status == "timeout" else "failed")
+    picked, kind, reason = None, "none", ""
+    if res is not None:
+        p, reason = res
+        if p != "null":
+            picked, kind = group[p - 1], ("content" if k > 1 else "time")
+    elif k == 1:
+        # 模型没回上来：时间最接近的只有一场，照时间定
+        picked, kind = group[0], "time"
+    why = reason or "没有给理由"
+    others = [c["title"] for c in cands if c is not picked]
+    tail = "；同时段还有：" + "、".join(others) if others and picked else ""
+    if picked and kind == "content":
+        how = "按内容：同一时间有 %d 场，%s" % (k, why)
+        footer = "📅 对应日历：%s（同一时间有 %d 场，按内容认出：%s）%s" % (picked["title"], k, why, tail)
+        result = ("matched_content", picked["title"], why)
+    elif picked and res is not None:
+        how = "按时间：和录音时间最接近；内容也对得上：" + why
+        footer = "📅 对应日历：%s（时间最接近，内容也对得上：%s）%s" % (picked["title"], why, tail)
+        result = ("matched_time", picked["title"], why)
+    elif picked:
+        reason = "认会的模型%s，内容没核对" % ERR_ZH[err]
+        how = "按时间：和录音时间最接近（%s）" % reason
+        footer = "📅 对应日历：%s（按时间认出；%s）%s" % (picked["title"], reason, tail)
+        result = ("matched_time_unchecked", picked["title"], err)
+    elif res is not None:
+        footer = "📅 同时段日历里有 %s，按内容判断都不是这场（%s）" % ("、".join(c["title"] for c in cands), why)
+        result = ("matched_none", len(cands), why)
+    else:
+        reason = "认会的模型%s" % ERR_ZH[err]
+        footer = "📅 同时段日历里有 %s，其中 %d 场时间完全一样，%s，没能按内容认出是哪一场，没有用日历" % (
+            "、".join(c["title"] for c in cands), k, reason)
+        result = ("undecided", k, err)
+    cal = {"candidates": [brief(c) for c in cands], "matched_by": kind, "reason": reason, "looked_up_at": now_iso()}
+    path = cal_md_path(session_dir)
+    if picked:
+        cal.update({"title": picked["title"], "start": picked.get("start", ""), "end": picked.get("end", ""),
+                    "organizer": picked.get("organizer", ""), "attendee_count": picked.get("attendee_count", 0),
+                    "fingerprint": write_calendar_md(session_dir, picked, how)})
+    elif os.path.exists(path):
+        os.remove(path)   # 调用方已确认这份是 meetap 自己写的、没被改过（见 state）
     out("meta", json.dumps(cal, ensure_ascii=False))
-    out("result", "matched", title, int(m.get("overlap_sec", 0)) // 60)
+    out("footer", footer)
+    out("result", *result)
+
+# state：materials/calendar.md 是不是 meetap 自己写的、没被人改过
+#   none：没有这个文件；own：是 meetap 写的、没改过；edited：被改过，或者分辨不出
+def state_of(session_dir):
+    path = cal_md_path(session_dir)
+    if not os.path.exists(path):
+        return "none"
+    cal = load_meta(session_dir).get("calendar") or {}
+    fp = cal.get("fingerprint")
+    if fp:
+        return "own" if sha256(path) == fp else "edited"
+    # 没有指纹的老文件（2.0 之前写的）：修改时间和 looked_up_at 相差 60 秒以内，就当是 meetap 写的
+    t = parse_time(cal.get("looked_up_at"))
+    return "own" if t and abs(os.path.getmtime(path) - t.timestamp()) <= 60 else "edited"
+
+def cmd_state(session_dir):
+    print(state_of(session_dir))
+
+# footer-insert：把那一行插在纪要签名的分割线前面；找不到签名就加在最后
+def cmd_footer_insert(md, line):
+    with open(md, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    sig = None
+    for i in range(len(lines) - 1, -1, -1):
+        plain = re.sub(r"<[^>]+>", "", lines[i])
+        if "github.com/henceman777/meetap" in lines[i] or "audio notes generator" in plain:
+            sig = i
+            break
+    if sig is None:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += ["", line, "", ""]
+    else:
+        at, j = sig, sig - 1
+        while j >= 0 and not lines[j].strip():
+            j -= 1
+        if j >= 0 and lines[j].strip() == "---":
+            at = j          # 签名前的分割线；没有分割线就插在签名那行前面
+        ins = [line, ""]
+        if at > 0 and lines[at - 1].strip():
+            ins.insert(0, "")
+        lines[at:at] = ins
+    atomic_write(md, "\n".join(lines))
+
+def main():
+    cmd = sys.argv[1]
+    if cmd == "collect":
+        cmd_collect(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))
+    elif cmd == "prompt":
+        cmd_prompt(sys.argv[2], sys.argv[3])
+    elif cmd == "decide":
+        cmd_decide(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif cmd == "state":
+        cmd_state(sys.argv[2])
+    elif cmd == "footer-insert":
+        cmd_footer_insert(sys.argv[2], sys.argv[3])
 
 main()
 CALPY
+}
+
+_calendar_python() {
+    local py="$VENV_PYTHON"
+    [[ -x "$py" ]] || py="$(command -v python3)"
+    printf '%s' "$py"
 }
 
 # _run_with_timeout <秒> <命令…>：命令在自己的进程组里跑，到时连同子进程一起杀掉（退出码 124）
@@ -1861,22 +2124,39 @@ _run_with_timeout() {
     ' "$@"
 }
 
-# calendar_lookup <会话目录> <录音开始 epoch> <录音结束 epoch>：结果只输出一行日志
-calendar_lookup() {
-    local dir="$1" start="$2" end="$3" out py kind a b c msg
+# 认会用的提示词模板（单独一个文件，纪要的提示词不动）
+_calendar_match_template() {
+    local cand
+    for cand in "$SCRIPT_DIR/../share/meetap/prompts/calendar-match.md" "$SCRIPT_DIR/share/meetap/prompts/calendar-match.md"; do
+        [[ -f "$cand" ]] && grep -qF '${candidates}' "$cand" && { printf '%s' "$cand"; return 0; }
+    done
+    return 1
+}
+
+# _calendar_state <会话目录>：none / own / edited（见 _calendar_py 的 state_of）
+_calendar_state() {
+    local py
+    py=$(_calendar_python)
+    [[ -n "$py" ]] || { echo edited; return; }
+    "$py" -I -c "$(_calendar_py)" state "$1" 2>/dev/null || echo edited
+}
+
+# calendar_collect <会话目录> <录音开始 epoch> <录音结束 epoch>：收候选，结果只输出一行日志
+calendar_collect() {
+    local dir="$1" start="$2" end="$3" out py kind a b c msg=""
     [[ "$CFG_CALENDAR" == "on" && -x "$TOOL" ]] || return 0
-    py="$VENV_PYTHON"; [[ -x "$py" ]] || py="$(command -v python3)"
+    py=$(_calendar_python)
     [[ -n "$py" ]] || return 0
-    # 查询程序自己 10 秒超时；万一卡死，外面 12 秒强杀。放进单独的进程组、超时杀整个组：
-    # 只杀它本身的话，它要是起了子进程，子进程还占着输出管道，这里就得一直等下去
+    # 查询程序自己 10 秒超时；万一卡死，外面 12 秒连子进程一起强杀
     out=$(_run_with_timeout $((CALENDAR_TIMEOUT + 2)) \
         "$TOOL" calendar-query --start "$start" --end "$end" --timeout "$CALENDAR_TIMEOUT" </dev/null 2>/dev/null)
     while IFS=$'\t' read -r kind a b c; do
         case "$kind" in
-            meta) _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
+            meta)  _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
+            clear) _meta calendar-clear "$dir" >/dev/null 2>&1 ;;
             result)
                 case "$a" in
-                    matched)        msg=$(_tn CAL_LOG_MATCHED "$b" "$c") ;;
+                    collected)      msg=$(_tn CAL_LOG_COLLECTED "$b") ;;
                     none)           msg=$(_tn CAL_LOG_NONE) ;;
                     not_authorized) msg=$(_tn CAL_LOG_NOT_AUTHORIZED "$b" "$(basename "$0")") ;;
                     timeout)        msg=$(_tn CAL_LOG_TIMEOUT) ;;
@@ -1885,17 +2165,19 @@ calendar_lookup() {
                 echo "[$(date '+%H:%M:%S')] $msg"
                 ;;
         esac
-    done < <(printf '%s' "$out" | "$py" -I -c "$(_calendar_py)" "$dir" "$start" "$end" 2>/dev/null)
+    done < <(printf '%s' "$out" | "$py" -I -c "$(_calendar_py)" collect "$dir" "$start" "$end" 2>/dev/null)
     return 0
 }
 
-# 按会话里的音频算录音时段（开始 = 文件名 meeting_YYYYMMDD_HHMMSS，结束 = 开始 + 音频时长）再查。
-# 转录开始前（stop 的后台流程、again 从转录重跑）和 again 只重跑纪要时调用；
-# materials/calendar.md 已经有了（查过，或用户自己放的）就不再查、不覆盖。
-calendar_lookup_for_session() {
+# 按会话里的音频算录音时段（开始 = 文件名 meeting_YYYYMMDD_HHMMSS，结束 = 开始 + 音频时长）再收候选。
+# materials/calendar.md 被人改过（或者是自己放的）就不动：不重新收、不重新认，提示一句。
+calendar_collect_for_session() {
     local dir="$1" audio base start dur
     [[ "$CFG_CALENDAR" == "on" ]] || return 0
-    [[ -e "$dir/materials/calendar.md" ]] && return 0
+    if [[ "$(_calendar_state "$dir")" == edited ]]; then
+        echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_KEEP_EDITED)"
+        return 0
+    fi
     audio=$(find "$dir" -maxdepth 1 -name "meeting_*.m4a" | sort | tail -1)
     base="${audio##*/}"
     [[ "$base" =~ ^meeting_([0-9]{8}_[0-9]{6})\.m4a$ ]] || return 0
@@ -1903,7 +2185,87 @@ calendar_lookup_for_session() {
     dur=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$audio" </dev/null 2>/dev/null)
     dur="${dur%%.*}"
     [[ "$dur" =~ ^[0-9]+$ && "$dur" -gt 0 ]] || return 0
-    calendar_lookup "$dir" "$start" "$((start + dur))"
+    calendar_collect "$dir" "$start" "$((start + dur))"
+}
+
+# 认会那次模型调用：和纪要同一个后端、同一个模型。只要一行 JSON，不走纪要那套签名检查和重试。
+# calendar_llm_call <提示词文件> <输出文件>；失败时把出错原因写到 stderr
+calendar_llm_call() {
+    local prompt="$1" out="$2"
+    if [[ "$CFG_AI_BACKEND" == claude-code ]] && command -v claude &>/dev/null; then
+        claude -p "$(cat "$prompt")" > "$out" </dev/null && [[ -s "$out" ]] && return 0
+    fi
+    [[ -x "$VENV_PYTHON" ]] || { echo "no venv: $VENV_PYTHON" >&2; return 1; }
+    "$VENV_PYTHON" - "$prompt" "$out" "$CFG_REGION" "$CFG_MODEL" <<'PYEOF'
+import sys, boto3
+from botocore.config import Config
+prompt_path, out_path, region, model_id = sys.argv[1:5]
+with open(prompt_path, encoding="utf-8") as f:
+    prompt = f.read()
+client = boto3.client("bedrock-runtime", region_name=region,
+                      config=Config(read_timeout=25, connect_timeout=10, retries={"max_attempts": 0}))
+r = client.converse(modelId=model_id, messages=[{"role": "user", "content": [{"text": prompt}]}],
+                    inferenceConfig={"maxTokens": 400},
+                    additionalModelRequestFields={"thinking": {"type": "disabled"}})
+text = "".join(b.get("text", "") for b in r["output"]["message"]["content"])
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(text)
+PYEOF
+}
+
+# calendar_recognize <会话目录>：转录完、生成纪要之前，核对内容、定是哪一场（时间优先，
+# 起止时间完全一样的几场按内容选）。结果写进 meta.json；纪要末尾要加的那一行放进 CAL_FOOTER。
+CAL_FOOTER=""
+calendar_recognize() {
+    local dir="$1" py tpl tmpdir prompt llm rc status="ok" kind a b c msg="" err
+    CAL_FOOTER=""
+    [[ "$CFG_CALENDAR" == "on" ]] || return 0
+    [[ -f "$dir/.meetap/calendar-candidates.json" && -s "$dir/log/transcript.txt" ]] || return 0
+    [[ "$(_calendar_state "$dir")" == edited ]] && return 0
+    py=$(_calendar_python)
+    [[ -n "$py" ]] || return 0
+    tmpdir=$(mktemp -d) || return 0
+    prompt="$tmpdir/prompt.md"; llm="$tmpdir/answer.txt"
+    if tpl=$(_calendar_match_template) && "$py" -I -c "$(_calendar_py)" prompt "$dir" "$tpl" > "$prompt" 2>/dev/null && [[ -s "$prompt" ]]; then
+        # 放进单独的进程组，超时连子进程一起杀
+        _run_with_timeout "$CAL_LLM_TIMEOUT" "$0" _calendar-llm "$prompt" "$llm" </dev/null >/dev/null 2>"$tmpdir/err"; rc=$?
+        if (( rc == 124 )); then status="timeout"; elif (( rc != 0 )) || [[ ! -s "$llm" ]]; then status="failed"; fi
+        if [[ "$status" != ok ]]; then
+            err=$(grep -v '^[[:space:]]*$' "$tmpdir/err" 2>/dev/null | tail -1 | cut -c1-200)
+            echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_LLM_FAILED "$status${err:+: $err}")"
+        fi
+    else
+        status="failed"
+        echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_LLM_FAILED "prompt")"
+    fi
+    while IFS=$'\t' read -r kind a b c; do
+        case "$kind" in
+            meta)   _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
+            footer) CAL_FOOTER="$a" ;;
+            result)
+                case "$a" in
+                    matched_time)           msg=$(_tn CAL_LOG_MATCHED "$b" "$c") ;;
+                    matched_content)        msg=$(_tn CAL_LOG_MATCHED_CONTENT "$b" "$c") ;;
+                    matched_time_unchecked) msg=$(_tn CAL_LOG_MATCHED_UNCHECKED "$b" "$c") ;;
+                    matched_none)           msg=$(_tn CAL_LOG_MATCHED_NONE "$b" "$c") ;;
+                    undecided)              msg=$(_tn CAL_LOG_UNDECIDED "$b" "$c") ;;
+                    *)                      msg="" ;;
+                esac
+                [[ -n "$msg" ]] && echo "[$(date '+%H:%M:%S')] $msg"
+                ;;
+        esac
+    done < <("$py" -I -c "$(_calendar_py)" decide "$dir" "$llm" "$status" 2>/dev/null)
+    rm -rf "$tmpdir"
+    return 0
+}
+
+# 纪要生成好以后，把日历那一行插在签名分割线前面（不经过模型）
+calendar_footer_insert() {
+    local md="$1" py
+    [[ -n "$CAL_FOOTER" && -f "$md" ]] || return 0
+    py=$(_calendar_python)
+    [[ -n "$py" ]] && "$py" -I -c "$(_calendar_py)" footer-insert "$md" "$CAL_FOOTER" 2>/dev/null
+    return 0
 }
 
 # ── 会议标签（meta.json）与会话信息 ──
@@ -2072,6 +2434,15 @@ def cmd_calendar_set(session_dir, cal_json):
     write(session_dir, data)
     out("ok")
 
+# 这个时段日历里没有候选了：去掉 calendar 字段；没有 meta.json 时不为这个新建一个
+def cmd_calendar_clear(session_dir):
+    data = load(session_dir)
+    if "calendar" in data:
+        del data["calendar"]
+        data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        write(session_dir, data)
+    out("ok")
+
 def main(argv):
     cmd = argv[1]
     try:
@@ -2079,10 +2450,18 @@ def main(argv):
             data = load(argv[2])
             out("tags", *data.get("tags", []))
             cal = data.get("calendar")
-            if isinstance(cal, dict) and isinstance(cal.get("title"), str) and cal["title"].strip():
-                out("calendar", one_line(cal["title"]), one_line(cal.get("start", "")), one_line(cal.get("end", "")))
+            # calendar <标题> <开始> <结束> <怎么认的> <候选场数>；空的写 -（bash 按制表符拆时会吞掉空字段）
+            # 怎么认的：content / time / none / pending；2.0 之前写的没有这个字段，记 legacy
+            if isinstance(cal, dict):
+                title = cal.get("title") if isinstance(cal.get("title"), str) else ""
+                by = cal.get("matched_by") or ("legacy" if title.strip() else "")
+                n = len(cal.get("candidates") or []) if isinstance(cal.get("candidates"), list) else 0
+                if title.strip() or by in ("none", "pending"):
+                    out("calendar", *[one_line(v) or "-" for v in (title, cal.get("start", ""), cal.get("end", ""), by, n)])
         elif cmd == "calendar-set":
             cmd_calendar_set(argv[2], argv[3])
+        elif cmd == "calendar-clear":
+            cmd_calendar_clear(argv[2])
         elif cmd == "update":
             rest = argv[4:]
             cmd_update(argv[2], argv[3], list(zip(rest[0::2], rest[1::2])))
@@ -2111,17 +2490,21 @@ _meta() {
     "$py" -I -c "$(_meta_py)" "$@" </dev/null
 }
 
-# 读一场会的标签到 SESSION_TAGS 数组，日历标题到 SESSION_CAL_TITLE / _START / _END；
+# 读一场会的标签到 SESSION_TAGS 数组，日历到 SESSION_CAL_TITLE / _START / _END / _BY（怎么认的）/ _N（候选场数）；
 # meta.json 读不了时返回 1
 _read_tags() {
-    local line f ok=1
+    local line f ok=1 i
     SESSION_TAGS=()
-    SESSION_CAL_TITLE=""; SESSION_CAL_START=""; SESSION_CAL_END=""
+    SESSION_CAL_TITLE=""; SESSION_CAL_START=""; SESSION_CAL_END=""; SESSION_CAL_BY=""; SESSION_CAL_N=0
     while IFS= read -r line; do
         IFS=$'\t' read -r -a f <<< "$line"
         case "${f[0]}" in
             tags) SESSION_TAGS=("${f[@]:1}"); ok=0 ;;
-            calendar) SESSION_CAL_TITLE="${f[1]}"; SESSION_CAL_START="${f[2]:-}"; SESSION_CAL_END="${f[3]:-}" ;;
+            calendar)
+                for i in 1 2 3 4; do [[ "${f[$i]:-}" == "-" ]] && f[$i]=""; done
+                SESSION_CAL_TITLE="${f[1]:-}"; SESSION_CAL_START="${f[2]:-}"; SESSION_CAL_END="${f[3]:-}"
+                SESSION_CAL_BY="${f[4]:-legacy}"; SESSION_CAL_N="${f[5]:-0}"
+                ;;
         esac
     done < <(_meta get "$1")
     return $ok
@@ -2378,7 +2761,13 @@ _session_info() {
     fi
     if [[ -n "$title" ]]; then _t INFO_NOTES "$title"; else _t INFO_NO_NOTES; fi
     _t INFO_TAGS "$tags"
-    [[ -n "$SESSION_CAL_TITLE" ]] && _t INFO_CALENDAR "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")"
+    case "$SESSION_CAL_BY" in
+        content) _t INFO_CALENDAR_CONTENT "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
+        time)    _t INFO_CALENDAR_TIME "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
+        none)    _t INFO_CALENDAR_NONE "$SESSION_CAL_N" ;;
+        pending) _t INFO_CALENDAR_PENDING "$SESSION_CAL_N" ;;
+        *)       [[ -n "$SESSION_CAL_TITLE" ]] && _t INFO_CALENDAR "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")" ;;
+    esac
     if [[ "$recording" == true ]]; then _t INFO_STATE_RECORDING; else _t INFO_STATE_ENDED; fi
 }
 
@@ -3304,9 +3693,18 @@ case "${1:-}" in
     _wake-notify)
         wake_notify
         ;;
-    _calendar-lookup)
-        # 内部：meetap _calendar-lookup <会话目录> [<开始 epoch> <结束 epoch>]（测试、排查用）
-        if [[ -n "${3:-}" ]]; then calendar_lookup "${2:-}" "$3" "${4:-$3}"; else calendar_lookup_for_session "${2:-}"; fi
+    _calendar-collect)
+        # 内部：meetap _calendar-collect <会话目录> [<开始 epoch> <结束 epoch>]（测试、排查用）
+        if [[ -n "${3:-}" ]]; then calendar_collect "${2:-}" "$3" "${4:-$3}"; else calendar_collect_for_session "${2:-}"; fi
+        ;;
+    _calendar-recognize)
+        # 内部：meetap _calendar-recognize <会话目录>：按内容认，打印纪要末尾要加的那一行（测试、排查用）
+        calendar_recognize "${2:-}"
+        [[ -n "$CAL_FOOTER" ]] && printf 'footer: %s\n' "$CAL_FOOTER"
+        ;;
+    _calendar-llm)
+        # 内部：认会那次模型调用，calendar_recognize 放进单独的进程组里跑
+        calendar_llm_call "${2:-}" "${3:-}"
         ;;
     mark)
         highlight_notes "${2:-}"

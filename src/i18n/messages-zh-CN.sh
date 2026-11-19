@@ -182,7 +182,14 @@ MSG_WARN_OLD_CAPTURE_CONFIG="ℹ️  2.0 起已不用 BlackHole，录音照样�
 MSG_SETUP_APPS_NOT_NEEDED="ℹ️  2.0 起不需要配置会议 App 的扬声器：录音走 Process Tap，会议 App 用系统默认的扬声器或耳机就行。要检查授权和音频设置，请运行 meetap setup"
 
 # ── 日历（停止录音后按录音时段找对应的会）──
-MSG_CAL_LOG_MATCHED="📅 日历：这场会是「%s」（和录音重叠 %s 分钟），已写 materials/calendar.md"
+MSG_CAL_LOG_COLLECTED="📅 日历：这个时段有 %s 场会，转录完核对内容再定是哪一场"
+MSG_CAL_LOG_MATCHED="📅 日历：这场会是「%s」（时间最接近，内容也对得上：%s），已写 materials/calendar.md"
+MSG_CAL_LOG_MATCHED_CONTENT="📅 日历：这场会是「%s」（同一时间有几场，按内容认出：%s），已写 materials/calendar.md"
+MSG_CAL_LOG_MATCHED_UNCHECKED="📅 日历：这场会按时间认作「%s」，内容没核对（认会的模型出错：%s），已写 materials/calendar.md"
+MSG_CAL_LOG_MATCHED_NONE="📅 日历：同时段的 %s 场会按内容判断都不是这场（%s），不用日历"
+MSG_CAL_LOG_UNDECIDED="📅 日历：%s 场会时间完全一样，认会的模型出错（%s），分不出是哪一场，不用日历"
+MSG_CAL_LOG_LLM_FAILED="📅 日历：认会的模型没给出可用的回答（%s）"
+MSG_CAL_LOG_KEEP_EDITED="📅 日历：materials/calendar.md 不是 meetap 写的，或者被改过，原样留着，不重新查"
 MSG_CAL_LOG_NONE="📅 日历：这个时段没有对应的会，跳过"
 MSG_CAL_LOG_NOT_AUTHORIZED="📅 日历：没有读取权限（%s），跳过。要用的话在这个终端 App 里跑一次 %s setup"
 MSG_CAL_LOG_TIMEOUT="📅 日历：查询超时，跳过"
@@ -202,6 +209,10 @@ MSG_SETUP_CAL_UNKNOWN="ℹ️  日历授权状态是 %s，这次跳过"
 MSG_TERMINAL_APPLE="终端"
 MSG_TERMINAL_UNKNOWN="你的终端 App"
 MSG_INFO_CALENDAR="  日历：%s（%s）"
+MSG_INFO_CALENDAR_CONTENT="  日历：%s（%s，同一时间有几场，按内容认出）"
+MSG_INFO_CALENDAR_TIME="  日历：%s（%s，按时间认出）"
+MSG_INFO_CALENDAR_NONE="  日历：同时段有 %s 场会，按内容判断都不是这场"
+MSG_INFO_CALENDAR_PENDING="  日历：候选 %s 场，转录完按内容认"
 MSG_TAGLIST_CAL_SUGGEST="日历标题：%s，要贴的话：%s"
 
 # ── meetap tidy（整理老会话）──
