@@ -49,6 +49,16 @@ cat > "$TMP/raw-good.json" <<'EOF'
 }}
 EOF
 echo 'not json {' > "$TMP/raw-bad.json"
+# 没有说话人标签（录音只有几秒时 Transcribe 给的 speaker_labels 是 null）
+cat > "$TMP/raw-nolabels.json" <<'EOF2'
+{"results": {"speaker_labels": null, "items": [
+    {"type": "pronunciation", "start_time": "0.5", "end_time": "0.9", "alternatives": [{"content": "大家好"}]},
+    {"type": "punctuation", "alternatives": [{"content": "。"}]},
+    {"type": "pronunciation", "start_time": "2.0", "end_time": "2.6", "alternatives": [{"content": "开始吧"}]}
+]}}
+EOF2
+# 一个词都没识别出来（11-19 10:52 那场就是这样）
+echo '{"results": {"language_code": "zh-CN", "transcripts": [{"transcript": ""}], "speaker_labels": null, "items": [], "audio_segments": []}}' > "$TMP/raw-empty.json"
 
 # 假 aws：每次调用记进 aws.log；下载那一步把 $TMP/raw.json 拷到目标位置
 cat > "$FAKEBIN/aws" <<EOF
@@ -62,7 +72,8 @@ case "\$1 \$2" in
 esac
 exit 0
 EOF
-for c in osascript open afplay; do printf '#!/bin/bash\nexit 0\n' > "$FAKEBIN/$c"; done
+for c in open afplay; do printf '#!/bin/bash\nexit 0\n' > "$FAKEBIN/$c"; done
+printf '#!/bin/bash\necho "$*" >> "%s/notify.log"\nexit 0\n' "$TMP" > "$FAKEBIN/osascript"
 chmod +x "$FAKEBIN"/*
 export PATH="$FAKEBIN:$PATH"
 [[ "$(command -v aws)" == "$FAKEBIN/aws" ]] || { echo "ABORT: aws 不是假的"; exit 1; }
@@ -102,6 +113,29 @@ S2=$(new_session 20261119_1000 20261119_100005)
 (cd "$TMP" && "$MEETAP" again "$S2" </dev/null >/dev/null 2>&1)
 [[ -f "$S2/.meetap/transcribe-raw.json" && ! -s "$S2/log/transcript.txt" ]] \
     && pass "生成不出转录时，transcribe-raw.json 留在 .meetap/" || fail "失败时原始结果没留下: $(ls -A "$S2/.meetap" 2>/dev/null)"
+! grep -q 'Traceback' "$S2/log/meetap.log" && grep -q 'Transcription failed: transcript' "$S2/log/meetap.log" && ! grep -q 'Generating meeting notes' "$S2/log/meetap.log" \
+    && pass "原始结果坏了：日志只记一行原因，没有 Traceback，不去生成纪要" || fail "坏结果的日志: $(tail -5 "$S2/log/meetap.log")"
+
+# ── 2b. 没有说话人标签：全部当作 spk_0，发言统计照常 ──
+cp "$TMP/raw-nolabels.json" "$TMP/raw.json"
+S2b=$(new_session 20261119_1030 20261119_103005)
+(cd "$TMP" && "$MEETAP" again "$S2b" </dev/null >/dev/null 2>&1)
+[[ "$(cat "$S2b/log/transcript.txt" 2>/dev/null)" == "spk_0: 大家好。 开始吧" ]] && ! grep -q 'Traceback' "$S2b/log/meetap.log" \
+    && pass "没有说话人标签：转录稿全部记在 spk_0 名下，不崩" || fail "没有标签时: $(cat "$S2b/log/transcript.txt" 2>/dev/null) / $(grep -A3 Traceback "$S2b/log/meetap.log")"
+[[ "$(cat "$S2b/.meetap/speaker-stats.txt" 2>/dev/null)" == $'spk_0: 0m02s (100.0%)\ntotal: 0m02s' && ! -e "$S2b/.meetap/transcribe-raw.json" ]] \
+    && pass "没有说话人标签：发言统计按第一个词到最后一个词算，原始结果照常删掉" || fail "发言统计: $(cat "$S2b/.meetap/speaker-stats.txt" 2>/dev/null)"
+
+# ── 2c. 一个词都没识别出来：日志和通知写明，不生成纪要，不报 Traceback ──
+cp "$TMP/raw-empty.json" "$TMP/raw.json"
+S2c=$(new_session 20261119_1052 20261119_105258)
+rm -f "$TMP/notify.log"
+OUT=$(cd "$TMP" && "$MEETAP" again "$S2c" </dev/null 2>&1)
+L="$S2c/log/meetap.log"
+grep -q '录音里没有识别出说话内容，不生成纪要' "$L" && ! grep -q 'Traceback' "$L" && ! grep -q 'Generating meeting notes' "$L" \
+    && [[ ! -e "$S2c/log/transcript.txt" && -f "$S2c/meeting_20261119_105258.m4a" && -z "$(ls "$S2c"/*.md 2>/dev/null)" ]] \
+    && pass "没识别出说话内容：日志写明，不生成纪要、不写转录稿，音频留着，没有 Traceback" || fail "没识别出内容: $(tail -6 "$L")"
+grep -q '录音里没有识别出说话内容，没有生成纪要' "$TMP/notify.log" && ! grep -q '转录完成' "$TMP/notify.log" \
+    && pass "没识别出说话内容：弹通知写明，不弹「转录完成」" || fail "通知: $(cat "$TMP/notify.log" 2>/dev/null)"
 
 # ── 3. again 只重跑纪要（已有转录）：日志追加到 log/meetap.log ──
 before=$(wc -l < "$S1/log/meetap.log")

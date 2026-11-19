@@ -695,7 +695,9 @@ transcribe_recording() {
         return 1
     fi
 
-    # Extract transcript with speaker labels
+    # 生成转录稿。没有说话人标签（录音只有几秒、或者只有一个人时，Transcribe 给的 speaker_labels 是空的）
+    # 就全部当作 spk_0；一个词都没识别出来时退出码 3，不写转录稿
+    local tx_rc
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 
@@ -704,43 +706,54 @@ log_dir = os.path.join(session_dir, "log")
 raw_json = os.path.join(session_dir, ".meetap", "transcribe-raw.json")
 output_txt = os.path.join(log_dir, "transcript.txt")
 
-with open(raw_json) as f:
-    data = json.load(f)
-
-items = data["results"]["items"]
-segments = data["results"]["speaker_labels"]["segments"]
+try:
+    with open(raw_json) as f:
+        data = json.load(f)
+    results = data.get("results") or {}
+    items = results.get("items") or []
+    segments = (results.get("speaker_labels") or {}).get("segments") or []
+except (OSError, ValueError, AttributeError) as e:
+    print(f"Transcript failed: cannot read {raw_json}: {e}", file=sys.stderr)
+    sys.exit(1)
 
 time_speaker = {}
 for seg in segments:
-    for si in seg["items"]:
-        time_speaker[si["start_time"]] = si["speaker_label"]
+    for si in seg.get("items") or []:
+        if "start_time" in si and si.get("speaker_label"):
+            time_speaker[si["start_time"]] = si["speaker_label"]
 
 lines = []
 current_speaker = None
 current_words = []
 
 for item in items:
-    if item["type"] == "pronunciation":
-        speaker = time_speaker.get(item["start_time"], current_speaker)
-        word = item["alternatives"][0]["content"]
+    alts = item.get("alternatives") or [{}]
+    word = alts[0].get("content", "")
+    if item.get("type") == "pronunciation" and word:
+        speaker = time_speaker.get(item.get("start_time"), current_speaker or "spk_0")
         if speaker != current_speaker:
             if current_speaker and current_words:
                 lines.append(f"{current_speaker}: {' '.join(current_words)}")
             current_speaker = speaker
             current_words = []
         current_words.append(word)
-    elif item["type"] == "punctuation":
+    elif item.get("type") == "punctuation":
         if current_words:
-            current_words[-1] += item["alternatives"][0]["content"]
+            current_words[-1] += word
 
 if current_speaker and current_words:
     lines.append(f"{current_speaker}: {' '.join(current_words)}")
+
+if not lines:
+    print("No speech recognized")
+    sys.exit(3)
 
 with open(output_txt, "w") as f:
     f.write("\n\n".join(lines) + "\n")
 
 print(f"Transcript saved: {len(lines)} speaker turns")
 PYEOF
+    tx_rc=$?
 
     # 本地音频要等转录文本落盘后再删：上传后立刻删的话，转录中途休眠/断网，
     # transcript 没出来、音频也没了，meetap again 无从重跑
@@ -753,7 +766,18 @@ PYEOF
     _transcribe_cleanup "$BUCKET" "$AUDIO_KEY" "$JOB_NAME" "$AWS_REGION"
     rm -f "$JOB_FILE"
 
-    # Extract speaker stats from raw JSON
+    if (( tx_rc == 3 )); then
+        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 .meetap/ 里备查
+        echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_NO_SPEECH "$AUDIO_FILE")"
+        osascript -e "display notification \"$(_tn NOTIFY_NO_SPEECH)\" with title \"MeeTap\"" 2>/dev/null
+        return 0
+    elif (( tx_rc != 0 )); then
+        _t ERR_TRANSCRIBE_FAILED "transcript"
+        osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
+    fi
+
+    # 发言统计。没有说话人标签时整段算 spk_0，时长取第一个词到最后一个词
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 session_dir = sys.argv[1]
@@ -762,12 +786,18 @@ raw_json = os.path.join(diag_dir, "transcribe-raw.json")
 stats_file = os.path.join(diag_dir, "speaker-stats.txt")
 with open(raw_json) as f:
     data = json.load(f)
-segments = data["results"]["speaker_labels"]["segments"]
+results = data.get("results") or {}
+segments = (results.get("speaker_labels") or {}).get("segments") or []
 speakers = {}
 for seg in segments:
     spk = seg["speaker_label"]
     dur = float(seg["end_time"]) - float(seg["start_time"])
     speakers[spk] = speakers.get(spk, 0) + dur
+if not speakers:
+    times = [(float(i["start_time"]), float(i["end_time"])) for i in results.get("items") or []
+             if i.get("type") == "pronunciation" and "start_time" in i and "end_time" in i]
+    if times:
+        speakers["spk_0"] = max(e for _, e in times) - min(st for st, _ in times)
 total = sum(speakers.values())
 lines = []
 for spk in sorted(speakers):

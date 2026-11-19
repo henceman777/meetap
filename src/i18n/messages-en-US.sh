@@ -30,6 +30,8 @@ MSG_START_JOB="Starting transcription job: %s"
 MSG_STATUS_LINE="Status: %s"
 MSG_ERR_TRANSCRIBE_FAILED="❌ Transcription failed: %s"
 MSG_NOTIFY_TRANSCRIBE_FAILED="Transcription failed, check the log"
+MSG_TRANSCRIBE_NO_SPEECH="🔇 No speech was recognized in the recording; no notes generated (audio kept at: %s)"
+MSG_NOTIFY_NO_SPEECH="No speech was recognized in the recording; no notes generated"
 # Expired credentials / network drops: each step waits for recovery (up to 15 min); only two notifications
 MSG_STEP_STS="Checking AWS credentials"
 MSG_STEP_BUCKET="Preparing the S3 bucket"

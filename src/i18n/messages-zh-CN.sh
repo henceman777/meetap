@@ -31,6 +31,8 @@ MSG_START_JOB="Starting transcription job: %s"
 MSG_STATUS_LINE="Status: %s"
 MSG_ERR_TRANSCRIBE_FAILED="❌ Transcription failed: %s"
 MSG_NOTIFY_TRANSCRIBE_FAILED="转录失败，请查看日志"
+MSG_TRANSCRIBE_NO_SPEECH="🔇 录音里没有识别出说话内容，不生成纪要（音频还在：%s）"
+MSG_NOTIFY_NO_SPEECH="录音里没有识别出说话内容，没有生成纪要"
 # 凭证过期、网络断了：每一步等着恢复（最多 15 分钟），通知只弹两次
 MSG_STEP_STS="检查 AWS 凭证"
 MSG_STEP_BUCKET="准备 S3 存储桶"
