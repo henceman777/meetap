@@ -22,7 +22,7 @@ mkdir -p "$PREFIX/i18n" "$PREFIX/lib"
 cp "$REPO_ROOT/src/meetap" "$PREFIX/"
 cp "$REPO_ROOT/src/i18n/"*.sh "$PREFIX/i18n/"
 cp "$REPO_ROOT/src/lib/ui.sh" "$PREFIX/lib/"
-cp "$REPO_ROOT/build/audio-tap" "$REPO_ROOT/build/audio-multi-output" "$REPO_ROOT/build/audio-monitor" "$PREFIX/"
+cp "$REPO_ROOT/build/audio-tap" "$REPO_ROOT/build/audio-multi-output" "$PREFIX/"
 codesign --force --sign - "$PREFIX/audio-tap"   # cp 会破坏 ad-hoc 签名
 
 if ! "$PREFIX/audio-tap" tap-supported >/dev/null 2>&1; then

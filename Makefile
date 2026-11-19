@@ -7,15 +7,11 @@ BUILD_ID  := $(if $(GIT_SHA),$(shell git rev-parse --abbrev-ref HEAD)@$(GIT_SHA)
 
 .PHONY: all install clean
 
-all: $(BUILD)/audio-multi-output $(BUILD)/audio-monitor $(BUILD)/audio-tap
+all: $(BUILD)/audio-multi-output $(BUILD)/audio-tap
 
 $(BUILD)/audio-multi-output: src/audio-multi-output.swift
 	mkdir -p $(BUILD)
 	swiftc -O -framework CoreAudio -framework AudioToolbox -framework IOKit $< -o $@
-
-$(BUILD)/audio-monitor: src/audio-monitor.swift
-	mkdir -p $(BUILD)
-	swiftc -O -framework CoreAudio -framework AudioToolbox $< -o $@
 
 # audio-tap 必须嵌入 Info.plist（NSAudioCaptureUsageDescription），
 # 否则 TCC 不弹授权框、静默拒绝，Process Tap 输出全零静音。
@@ -32,7 +28,8 @@ install: all
 	cp src/meetap $(PREFIX)/meetap
 	sed -i '' 's|^BUILD_ID=""|BUILD_ID="$(BUILD_ID)"|' $(PREFIX)/meetap
 	cp $(BUILD)/audio-multi-output $(PREFIX)/audio-multi-output
-	cp $(BUILD)/audio-monitor $(PREFIX)/audio-monitor
+	# 2.0 起不再有 audio-monitor（只给 BlackHole 用），顺手清掉 1.x 装过的旧文件
+	rm -f $(PREFIX)/audio-monitor
 	cp $(BUILD)/audio-tap $(PREFIX)/audio-tap
 	# cp 会破坏 ad-hoc 签名（带 __info_plist 段尤甚），TCC 判定签名无效后
 	# 内核会在创建 Process Tap 时 SIGKILL 进程（tap-format/tap-start 表现为

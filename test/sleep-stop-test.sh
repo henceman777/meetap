@@ -79,13 +79,15 @@ alive "$FAKE_WATCH" && fail "sleep-watch 未被停止" || pass "sleep-watch 已�
 [[ -s "$SESSION/log/meetap.log" ]] && pass "已启动后台转录" || fail "未启动转录"
 [[ ! -e "$MEETAP_STATE_DIR/sleepwatch.pid" ]] && pass "sleepwatch.pid 已清理" || fail "sleepwatch.pid 残留"
 
-echo "== 用例 3: 无 ffmpeg PID、但 monitor 已起（启动阶段被打断）→ 照常收尾 =="
-sleep 300 & FAKE_MON=$!
-echo "$FAKE_MON" > "$MEETAP_STATE_DIR/monitor.pid"
+echo "== 用例 3: 无 ffmpeg PID、但 tap 已起（启动阶段被打断）→ 照常收尾 =="
+# 2.0 起没有 audio-monitor；启动阶段被打断时留下的是 tap（start 先起 tap 写 tap.pid，再起 ffmpeg）
+sleep 300 & FAKE_TAP=$!
+echo "$FAKE_TAP" > "$MEETAP_STATE_DIR/tap.pid"
 "$MEETAP" stop > "$TMP/out3.txt" 2>&1; rc=$?
 sleep 1
-alive "$FAKE_MON" && fail "monitor 未被停止" || pass "monitor 已停止"
+alive "$FAKE_TAP" && fail "tap 未被停止" || pass "tap 已停止"
 [[ $rc -eq 0 ]] && pass "exit 0" || fail "exit $rc"
+[[ ! -e "$MEETAP_STATE_DIR/tap.pid" ]] && pass "tap.pid 已清理" || fail "tap.pid 残留"
 
 echo "== 用例 4: 什么都没有 → 报无录音、exit 1（回归） =="
 "$MEETAP" stop > "$TMP/out4.txt" 2>&1; rc=$?

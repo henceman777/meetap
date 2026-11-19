@@ -18,7 +18,9 @@ CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
 CFG_VISUALIZER="dot"
 CFG_AUDIO_PERSIST=true
-CFG_AUDIO_CAPTURE="auto"
+CFG_AUDIO_CAPTURE="auto"   # 2.0 起只用 Process Tap；留着这一项只为认出老配置并提示删掉
+# 静音报警不算「有声音在放」的进程：这些 App 一直开着输出流、放的却是静音（实测 WorkSpaces）
+CFG_ZERO_ALERT_IGNORE="com.amazon.workspaces"
 CFG_EMAIL=""
 CFG_EMAIL_SENDER=""
 
@@ -79,6 +81,7 @@ load_config() {
             visualizer)            CFG_VISUALIZER="$val" ;;
             audio_persist)         CFG_AUDIO_PERSIST="$val" ;;
             audio_capture)         CFG_AUDIO_CAPTURE="$val" ;;
+            zero_alert_ignore)     CFG_ZERO_ALERT_IGNORE="$val" ;;
             email)                 CFG_EMAIL="$val" ;;
             email_sender)          CFG_EMAIL_SENDER="$val" ;;
         esac
@@ -192,7 +195,6 @@ if ! declare -F ui_confirm >/dev/null; then
 fi
 
 TOOL="$SCRIPT_DIR/audio-multi-output"
-MONITOR="$SCRIPT_DIR/audio-monitor"
 VENV_PYTHON="$SCRIPT_DIR/meetap-venv/bin/python3"
 RECORDING_DIR="$CFG_RECORDING_DIR"
 STATE_DIR="${MEETAP_STATE_DIR:-/tmp/meeting-record}"   # 测试可用 MEETAP_STATE_DIR 隔离
@@ -201,7 +203,6 @@ mkdir -p "$RECORDING_DIR" "$STATE_DIR"
 
 # 状态文件
 PID_FILE="$STATE_DIR/ffmpeg.pid"
-MONITOR_PID_FILE="$STATE_DIR/monitor.pid"
 TAP_PID_FILE="$STATE_DIR/tap.pid"
 ORIGINAL_UID_FILE="$STATE_DIR/original-output.uid"
 ORIGINAL_NAME_FILE="$STATE_DIR/original-output.name"
@@ -270,41 +271,29 @@ start_visualizer() {
     local ROWS
     ROWS=$(tput lines 2>/dev/null < "$tty_dev" || echo 24)
 
-    # 电平来源双模式：
-    # - tap 模式：系统音读 tap-level（audio-tap 写）；麦克风读 mic-level
-    #   （录制 ffmpeg 的 astats 滤镜写，0.4s 窗口追加）。两个都是文件读取，
-    #   零额外设备占用（严禁并发开第二个 ffmpeg 采 :default，会抢占输入设备）。
-    #   麦克风超过人声门限(-40dB)才参与合成，取两路较大者。
-    # - BlackHole 模式：ffmpeg 采样混录信号（本身已含系统音+麦克风）。
+    # 电平来源：系统音读 tap-level、麦克风读 mic-level（都由 audio-tap 写）。
+    # 都是文件读取，零额外设备占用（严禁并发开第二个 ffmpeg 采 :default，会抢占输入设备）。
+    # 麦克风超过人声门限(-40dB)才参与合成，取两路较大者。
     local LEVEL_FILE="$STATE_DIR/tap-level"
     local MIC_LEVEL_FILE="$STATE_DIR/mic-level"
     while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
         local max_vol
-        # tap 模式判定用 TAP_PID_FILE（start 先写、必定存在），绝不能用
-        # tap-level 文件存在性——启动后 0.4s 内文件未生成会误走 ffmpeg 回退，
-        # 该 ffmpeg 与录制 ffmpeg 的 avfoundation 初始化撞车 → 录制卡死。
-        if [[ -f "$TAP_PID_FILE" ]]; then
-            # 电平文件两列 "峰值 RMS"（audio-tap 写，0.4s 原子替换）。
-            # 波形显示用 RMS（第2列）——峰值连续讲话时恒定顶格无起伏，
-            # RMS 跟随音节/停顿自然波动；门限判定仍用峰值（第1列，标定基于峰值）。
-            local sys_line mic_line sys_vol mic_peak mic_vol
-            sys_line=$(cat "$LEVEL_FILE" 2>/dev/null)
-            mic_line=$(cat "$MIC_LEVEL_FILE" 2>/dev/null)
-            sys_vol="${sys_line##* }"          # 系统音 RMS
-            mic_peak="${mic_line%% *}"         # 麦克风峰值（过门限用）
-            mic_vol="${mic_line##* }"          # 麦克风 RMS（显示用）
-            sleep 0.4
-            max_vol="${sys_vol:--91}"
-            # 波形的麦克风门限 -40dB：只有 speaker 正常讲话音量（实测峰值
-            # -30~-36）才纳入波形，轻微环境声（-40 以下）不搅动波形。
-            if [[ -n "$mic_peak" && "$mic_peak" != "-inf" ]] && (( ${mic_peak%%.*} > -40 )); then
-                local s=${max_vol%%.*}
-                [[ ${mic_vol%%.*} -gt ${s:--91} ]] && max_vol="$mic_vol"
-            fi
-        else
-            max_vol=$(ffmpeg -nostdin -f avfoundation -i ":BlackHole 2ch" -t 0.4 \
-                -af volumedetect -f null /dev/null 2>&1 \
-                | sed -n 's/.*max_volume: \([-0-9.]*\).*/\1/p')
+        # 电平文件两列 "峰值 RMS"（audio-tap 写，0.4s 原子替换）。
+        # 波形显示用 RMS（第2列）——峰值连续讲话时恒定顶格无起伏，
+        # RMS 跟随音节/停顿自然波动；门限判定仍用峰值（第1列，标定基于峰值）。
+        local sys_line mic_line sys_vol mic_peak mic_vol
+        sys_line=$(cat "$LEVEL_FILE" 2>/dev/null)
+        mic_line=$(cat "$MIC_LEVEL_FILE" 2>/dev/null)
+        sys_vol="${sys_line##* }"          # 系统音 RMS
+        mic_peak="${mic_line%% *}"         # 麦克风峰值（过门限用）
+        mic_vol="${mic_line##* }"          # 麦克风 RMS（显示用）
+        sleep 0.4
+        max_vol="${sys_vol:--91}"
+        # 波形的麦克风门限 -40dB：只有 speaker 正常讲话音量（实测峰值
+        # -30~-36）才纳入波形，轻微环境声（-40 以下）不搅动波形。
+        if [[ -n "$mic_peak" && "$mic_peak" != "-inf" ]] && (( ${mic_peak%%.*} > -40 )); then
+            local s=${max_vol%%.*}
+            [[ ${mic_vol%%.*} -gt ${s:--91} ]] && max_vol="$mic_vol"
         fi
         [[ -z "$max_vol" ]] && max_vol="-91"
 
@@ -1987,7 +1976,7 @@ _on_start_interrupt() {
     # $! 此时已是它的 PID：未出现在任何 PID 文件里就直接清掉
     local last=$!
     if [[ -n "$last" ]] && kill -0 "$last" 2>/dev/null \
-        && ! cat "$PID_FILE" "$TAP_PID_FILE" "$MONITOR_PID_FILE" "$AUTOSTOP_PID_FILE" \
+        && ! cat "$PID_FILE" "$TAP_PID_FILE" "$AUTOSTOP_PID_FILE" \
                  "$SLEEPWATCH_PID_FILE" 2>/dev/null | grep -qx "$last"; then
         kill "$last" 2>/dev/null; sleep 0.3; kill -9 "$last" 2>/dev/null
     fi
@@ -2043,7 +2032,99 @@ foreground_wait() {
     fi
 }
 
+# ── 系统版本门槛与 2.0 升级迁移检查（start、setup 共用）──
+MIN_MACOS_MAJOR=14
+MIN_MACOS_MINOR=4
+
+# macOS 低于 14.4 → 报错，返回 1。sw_vers 走 PATH（测试里放假的 sw_vers 伪造版本号）；
+# 读不到版本号时不拦，交给 audio-tap tap-supported 兜底。
+_require_macos() {
+    local v ma mi
+    v=$(sw_vers -productVersion 2>/dev/null)
+    [[ "$v" =~ ^([0-9]+)(\.([0-9]+))? ]] || return 0
+    ma=${BASH_REMATCH[1]}; mi=${BASH_REMATCH[3]:-0}
+    if (( ma > MIN_MACOS_MAJOR || (ma == MIN_MACOS_MAJOR && mi >= MIN_MACOS_MINOR) )); then
+        return 0
+    fi
+    _t ERR_MACOS_TOO_OLD "$v" "$MIN_MACOS_MAJOR.$MIN_MACOS_MINOR"
+    return 1
+}
+
+# 系统输出还停在 BlackHole 上：1.x 崩溃后没恢复，或者是用户有意切过去的（给别的软件用）。
+# 只有 1.x 留下的 original-output.* 状态文件在、原设备也找得到时才自动切回；
+# 否则有终端时让用户选（第一个、也是默认选项是「保持不变」），没终端只提示。
+# 不拦录音：Tap 照样录得到，只是用户自己听不见。
+_migrate_output_device() {
+    [[ -x "$TOOL" ]] || return 0
+    local cur orig_uid orig_name id line dev_uid choice keep i
+    cur=$("$TOOL" default-output-name 2>/dev/null) || return 0
+    if [[ "$cur" != *BlackHole* ]]; then
+        rm -f "$ORIGINAL_UID_FILE" "$ORIGINAL_NAME_FILE"   # 不在 BlackHole 上，旧状态文件已无用
+        return 0
+    fi
+
+    if [[ -f "$ORIGINAL_UID_FILE" ]]; then
+        orig_uid=$(cat "$ORIGINAL_UID_FILE")
+        orig_name=$(cat "$ORIGINAL_NAME_FILE" 2>/dev/null)
+        if id=$("$TOOL" find-uid "$orig_uid" 2>/dev/null) && "$TOOL" set-default "$id" >/dev/null 2>&1; then
+            rm -f "$ORIGINAL_UID_FILE" "$ORIGINAL_NAME_FILE"
+            _t MIGRATE_OUTPUT_RESTORED "$cur" "${orig_name:-$orig_uid}"
+            return 0
+        fi
+    fi
+
+    if [[ ! -t 0 ]]; then
+        _t MIGRATE_OUTPUT_ON_BH "$cur"
+        return 0
+    fi
+    local names=() ids=()
+    while IFS='|' read -r line dev_uid id; do
+        [[ -n "$line" && "$line" != *BlackHole* && "$id" =~ ^[0-9]+$ ]] || continue
+        names+=("$line"); ids+=("$id")
+    done < <("$TOOL" list 2>/dev/null)
+    _t MIGRATE_OUTPUT_ASK "$cur"
+    keep=$(_tn MIGRATE_OUTPUT_KEEP)
+    choice=$(ui_choose "$keep" "${names[@]}")
+    for (( i = 0; i < ${#names[@]}; i++ )); do
+        if [[ "${names[$i]}" == "$choice" ]]; then
+            if "$TOOL" set-default "${ids[$i]}" >/dev/null 2>&1; then
+                _t MIGRATE_OUTPUT_SWITCHED "$choice"
+            else
+                _t MIGRATE_OUTPUT_SWITCH_FAILED "$choice"
+            fi
+            return 0
+        fi
+    done
+    _t MIGRATE_OUTPUT_KEPT "$cur"
+}
+
+# 老配置 audio_capture = blackhole：2.0 起只有 Tap，照样走 Tap，提示删掉这一行。
+# auto / tap 不提示（旧模板默认就写了 auto，几乎人人都有）。
+_warn_old_capture_config() {
+    [[ "$CFG_AUDIO_CAPTURE" == "blackhole" ]] && _t WARN_OLD_CAPTURE_CONFIG "$CONFIG_FILE"
+    return 0
+}
+
+# setup：会议 App 的扬声器是不是还指着 BlackHole（只读，不改任何 App 的配置）。
+# Zoom 的设置在 viper.ini 里（设备名的十六进制）读得出来；Teams、腾讯会议读不到配置，
+# 系统里还装着 BlackHole 时提示一句怎么检查。
+_check_meeting_apps() {
+    local ini="$HOME/Library/Application Support/zoom.us/data/viper.ini" k v name zoom_bh=""
+    if [[ -f "$ini" ]]; then
+        for k in AECSPK AECBSSPK; do
+            v=$(grep "^$k=" "$ini" | head -1 | cut -d= -f2)
+            name=$(printf '%s' "$v" | xxd -r -p 2>/dev/null)
+            [[ "$name" == *BlackHole* ]] && zoom_bh="$name"
+        done
+        [[ -n "$zoom_bh" ]] && _t MIGRATE_ZOOM_ON_BH "$zoom_bh"
+    fi
+    if [[ -x "$TOOL" ]] && "$TOOL" list 2>/dev/null | grep -q 'BlackHole'; then
+        _t MIGRATE_APPS_BH_HINT
+    fi
+}
+
 start_recording() {
+    _require_macos || exit 1
     local VERBOSE=false
     local MAX_DURATION_MIN=""   # 会议时长上限（分钟，可选）
     local MUTE_MIC=false        # 只录系统音（录网页直播时屏蔽现场环境声）
@@ -2094,6 +2175,9 @@ start_recording() {
         _t HINT_STOP_FIRST "$0"
         exit 1
     fi
+    # 必须在「已在录制」检查之后：录音进行中不能去动系统输出设备
+    _migrate_output_device
+    _warn_old_capture_config
     # 前台模式：有 TTY 且未加 -b。start 不退出、跑波形，Ctrl-C / 关窗口 ≡ meetap stop。
     # trap 必须在拉起任何子进程之前装：子进程在独立进程组里收不到 Ctrl-C，装晚了，
     # 启动阶段的 Ctrl-C 只会杀掉 start 自己，留下孤儿录音。
@@ -2109,15 +2193,11 @@ start_recording() {
     # ffmpeg；tap 依赖 EPIPE 自杀，但 IO 回调停摆时永不触发）。孤儿会占住
     # 音频链路，让新 ffmpeg 打不开麦克风输入 → 卡死 → 录音全丢，必须先清扫。
     pkill -f "audio-tap tap-start" 2>/dev/null && sleep 0.5
-    rm -f "$PID_FILE" "$MONITOR_PID_FILE" "$TAP_PID_FILE" "$MAX_DURATION_FILE"
+    rm -f "$PID_FILE" "$TAP_PID_FILE" "$MAX_DURATION_FILE"
 
     # 检查依赖
     if [[ ! -x "$TOOL" ]]; then
         _t ERR_TOOL_MISSING "$TOOL"
-        exit 1
-    fi
-    if [[ ! -x "$MONITOR" ]]; then
-        _t ERR_MONITOR_MISSING "$MONITOR"
         exit 1
     fi
     if ! command -v ffmpeg &>/dev/null; then
@@ -2125,20 +2205,18 @@ start_recording() {
         exit 1
     fi
 
-    # --- 音频捕获方式选择 ---
+    # --- 音频采集：只有 Process Tap 一条路（2.0 起） ---
     local TAP_TOOL="$SCRIPT_DIR/audio-tap"
-    local use_tap=false
-    if [[ "$CFG_AUDIO_CAPTURE" == "tap" ]] || [[ "$CFG_AUDIO_CAPTURE" == "auto" ]]; then
-        if [[ -x "$TAP_TOOL" ]] && "$TAP_TOOL" tap-supported &>/dev/null; then
-            use_tap=true
-            # 授权自检由 meetap setup 负责（探测 + 引导 + 盖章）。start 只尊重结果：
-            # 若尚未确认过授权（无持久标记），录制前提醒跑一次 setup，但不探测、不播音、
-            # 不阻断——避免每次开录都做 2 秒实测 / 播提示音，保持 start 的轻量与静默。
-            [[ -f "$TAP_AUTH_MARKER" ]] || _t START_TAP_UNVERIFIED "$0"
-        fi
+    if [[ ! -x "$TAP_TOOL" ]] || ! "$TAP_TOOL" tap-supported &>/dev/null; then
+        _t ERR_TAP_UNSUPPORTED "$TAP_TOOL"
+        exit 1
     fi
+    # 授权自检由 meetap setup 负责（探测 + 引导 + 盖章）。start 只尊重结果：
+    # 若尚未确认过授权（无持久标记），录制前提醒跑一次 setup，但不探测、不播音、
+    # 不阻断——避免每次开录都做 2 秒实测 / 播提示音，保持 start 的轻量与静默。
+    [[ -f "$TAP_AUTH_MARKER" ]] || _t START_TAP_UNVERIFIED "$0"
 
-    # 会话目录 + 录音文件名（两个捕获分支共用，必须在分支前生成）
+    # 会话目录 + 录音文件名
     local session_base
     session_base="$(date +"%Y%m%d_%H%M")"
     if [[ -n "$MEETING_NAME" ]]; then
@@ -2158,233 +2236,125 @@ start_recording() {
         echo $(( $(date +%s) + MAX_DURATION_MIN * 60 )) > "$MAX_DURATION_FILE"
     fi
 
-    if [[ "$use_tap" == "true" ]]; then
-        # --- Process Tap 分支 ---
-        # 不切设备、不需要 BlackHole/audio-monitor,用户听到原声
-        # 采样率：由这里定、同一个值同时传给 audio-tap --output-rate 和 ffmpeg -ar。
-        # audio-tap 把 tap、麦克风各自重采样到该率再混音，与设备实际采样率无关。
-        # 不再开录前探测 tap 采样率：蓝牙耳机一开麦就切通话模式（输出 48k→24k、
-        # 麦克风 24k），探测时与录制时的设备状态不同，探到的值不可信；而麦克风
-        # 与 tap 不同率时不重采样会让整段录音 2 倍速 + 升调（AirPods Pro 实录事故）。
-        local TAP_RATE=48000
+    # 不切设备，用户照常从原来的扬声器 / 耳机听到声音
+    # 采样率：由这里定、同一个值同时传给 audio-tap --output-rate 和 ffmpeg -ar。
+    # audio-tap 把 tap、麦克风各自重采样到该率再混音，与设备实际采样率无关。
+    # 不再开录前探测 tap 采样率：蓝牙耳机一开麦就切通话模式（输出 48k→24k、
+    # 麦克风 24k），探测时与录制时的设备状态不同，探到的值不可信；而麦克风
+    # 与 tap 不同率时不重采样会让整段录音 2 倍速 + 升调（AirPods Pro 实录事故）。
+    local TAP_RATE=48000
 
-        ORIG_NAME=$("$TOOL" default-output-name 2>/dev/null || echo "Unknown")
-        MIC_NAME=$("$TOOL" default-input-name 2>/dev/null || echo "default")
+    ORIG_NAME=$("$TOOL" default-output-name 2>/dev/null || echo "Unknown")
+    MIC_NAME=$("$TOOL" default-input-name 2>/dev/null || echo "default")
 
-        # audio-tap tap-start 输出 Float32 LE mono PCM 到 stdout
-        # ffmpeg 从 stdin 读系统音 + avfoundation 读麦克风,混录输出
-        # 注意1：ffmpeg 的 stdin(pipe:0) 就是 audio-tap 的 PCM 数据管道，
-        # 绝不能加 < /dev/null（会覆盖管道 → tap 收 EPIPE 秒退 → 录音全空）。
-        # 注意2：avfoundation 自带挂钟时间戳而 pipe 从 0 开始，两路直接 amix
-        # 会因时间轴永不对齐而输出 0 字节——必须先 asetpts=PTS-STARTPTS 归零。
-        # 注意3：麦克风电平由本 ffmpeg 的 astats 滤镜写 mic-level 文件——
-        # 绝不能开第二个 ffmpeg 并发采样 :default（输入设备被抢占会导致
-        # 录制输入卡死、SIGINT 失效、录音全丢）。波形/静音检测只读该文件。
-        # 用 FIFO 替代匿名管道：tap 与 ffmpeg 分开启动，两个 PID 都记录在案。
-        # stop 时显式杀 tap，不再依赖「ffmpeg 退出 → EPIPE → tap 自杀」链条
-        # （该链条在 ffmpeg 卡死时断裂，留下孤儿 tap 占住音频链路，
-        # 导致下一次录制 ffmpeg 打不开输入 → 恶性循环）。
-        # meetily 架构：audio-tap 进程内采系统音(tap) + 麦克风(CoreAudio 输入
-        # IO proc)，ring buffer 混音后输出单路 PCM；ffmpeg 只做编码、零设备
-        # 访问——彻底消灭 avfoundation 与 tap 的设备竞态（用户环境必现卡死）。
-        # 电平双文件由 audio-tap 内部输出（tap-level 系统音 / mic-level 麦克风）。
-        # audio-tap 的输出自带时钟：系统没播放、也没麦克风时按时补零，stdout
-        # 不断流。所以 --mute-microphone 直接不开麦克风（不传 --with-mic）。
-        local TAP_FIFO="$STATE_DIR/tap.fifo"
+    # audio-tap tap-start 输出 Float32 LE mono PCM 到 stdout
+    # ffmpeg 从 stdin 读系统音 + avfoundation 读麦克风,混录输出
+    # 注意1：ffmpeg 的 stdin(pipe:0) 就是 audio-tap 的 PCM 数据管道，
+    # 绝不能加 < /dev/null（会覆盖管道 → tap 收 EPIPE 秒退 → 录音全空）。
+    # 注意2：avfoundation 自带挂钟时间戳而 pipe 从 0 开始，两路直接 amix
+    # 会因时间轴永不对齐而输出 0 字节——必须先 asetpts=PTS-STARTPTS 归零。
+    # 注意3：麦克风电平由本 ffmpeg 的 astats 滤镜写 mic-level 文件——
+    # 绝不能开第二个 ffmpeg 并发采样 :default（输入设备被抢占会导致
+    # 录制输入卡死、SIGINT 失效、录音全丢）。波形/静音检测只读该文件。
+    # 用 FIFO 替代匿名管道：tap 与 ffmpeg 分开启动，两个 PID 都记录在案。
+    # stop 时显式杀 tap，不再依赖「ffmpeg 退出 → EPIPE → tap 自杀」链条
+    # （该链条在 ffmpeg 卡死时断裂，留下孤儿 tap 占住音频链路，
+    # 导致下一次录制 ffmpeg 打不开输入 → 恶性循环）。
+    # meetily 架构：audio-tap 进程内采系统音(tap) + 麦克风(CoreAudio 输入
+    # IO proc)，ring buffer 混音后输出单路 PCM；ffmpeg 只做编码、零设备
+    # 访问——彻底消灭 avfoundation 与 tap 的设备竞态（用户环境必现卡死）。
+    # 电平双文件由 audio-tap 内部输出（tap-level 系统音 / mic-level 麦克风）。
+    # audio-tap 的输出自带时钟：系统没播放、也没麦克风时按时补零，stdout
+    # 不断流。所以 --mute-microphone 直接不开麦克风（不传 --with-mic）。
+    local TAP_FIFO="$STATE_DIR/tap.fifo"
 
-        # tap+ffmpeg 启动 + 自愈重启：启动后探测 ffmpeg 是否真在收数据（见
-        # _tap_audio_flowing），没收到就杀掉重启，最多 3 次；仍失败则明确报错，
-        # 绝不留下静默空录。Process Tap 回调偶发不启动的问题由 audio-tap 进程内
-        # 的看门狗处理（有声音在放但 tap 没回调就重建 tap），这里管的是
-        # audio-tap / ffmpeg 本身没起来。
-        local TAP_MAX_TRIES=3
-        local tap_try=1
-        local tap_ok=false
-        while (( tap_try <= TAP_MAX_TRIES )); do
-            rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO" "$STATE_DIR/ffmpeg.log"
-            mkfifo "$TAP_FIFO"
+    # tap+ffmpeg 启动 + 自愈重启：启动后探测 ffmpeg 是否真在收数据（见
+    # _tap_audio_flowing），没收到就杀掉重启，最多 3 次；仍失败则明确报错，
+    # 绝不留下静默空录。Process Tap 回调偶发不启动的问题由 audio-tap 进程内
+    # 的看门狗处理（有声音在放但 tap 没回调就重建 tap），这里管的是
+    # audio-tap / ffmpeg 本身没起来。
+    local TAP_MAX_TRIES=3
+    local tap_try=1
+    local tap_ok=false
+    while (( tap_try <= TAP_MAX_TRIES )); do
+        rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO" "$STATE_DIR/ffmpeg.log"
+        mkfifo "$TAP_FIFO"
 
-            local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level")
-            $MUTE_MIC && mic_args=()
-            _jobctl_on
-            "$TAP_TOOL" tap-start --output-rate "$TAP_RATE" "${mic_args[@]}" \
-                --level-file "$STATE_DIR/tap-level" \
-                < /dev/null > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
-            TAP_PID=$!
-            _jobctl_off
-            echo $TAP_PID > "$TAP_PID_FILE"
-            disown $TAP_PID
+        local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level")
+        $MUTE_MIC && mic_args=()
+        _jobctl_on
+        # --zero-alert-text：有声音在放、tap 交出的却全是零时，audio-tap 弹的通知文案
+        # （{apps} 换成在放声音的 App，每个写成「显示名（bundle ID）」，写法和分隔符按当前语言传入；整场都查，零段起止记进 tap.log，stop 时随 audio-tap.log
+        # 存进会话）。--zero-alert-ignore：不算「有声音在放」的进程（配置 zero_alert_ignore）
+        "$TAP_TOOL" tap-start --output-rate "$TAP_RATE" "${mic_args[@]}" \
+            --level-file "$STATE_DIR/tap-level" \
+            --zero-alert-text "$(_tn NOTIFY_TAP_ZERO)" \
+            --zero-alert-ignore "$CFG_ZERO_ALERT_IGNORE" \
+            --zero-alert-app-format "$(_tn TAP_ZERO_APP_FORMAT)" \
+            --zero-alert-app-sep "$(_tn TAP_ZERO_APP_SEP)" \
+            < /dev/null > "$TAP_FIFO" 2>"$STATE_DIR/tap.log" &
+        TAP_PID=$!
+        _jobctl_off
+        echo $TAP_PID > "$TAP_PID_FILE"
+        disown $TAP_PID
 
-            # -y：覆盖已存在的输出文件。会话目录名精确到分钟，同一分钟内重跑
-            # start 会撞上同名 m4a；缺 -y 时 ffmpeg 弹交互式 Overwrite?[y/N]，
-            # stdin=/dev/null 读到 EOF 判为 N 而秒退 → time= 不推进 → 健康探测
-            # 误判「tap 无数据」触发自愈，3 次全撞同一文件 → 假报“反复无数据”。
-            _jobctl_on
-            ffmpeg -y -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
-                -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
-                -movflags frag_keyframe+empty_moov \
-                "$OUTPUT_FILE" \
-                < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
+        # -y：覆盖已存在的输出文件。会话目录名精确到分钟，同一分钟内重跑
+        # start 会撞上同名 m4a；缺 -y 时 ffmpeg 弹交互式 Overwrite?[y/N]，
+        # stdin=/dev/null 读到 EOF 判为 N 而秒退 → time= 不推进 → 健康探测
+        # 误判「tap 无数据」触发自愈，3 次全撞同一文件 → 假报“反复无数据”。
+        _jobctl_on
+        ffmpeg -y -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
+            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
+            -movflags frag_keyframe+empty_moov \
+            "$OUTPUT_FILE" \
+            < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
 
-            FFMPEG_PID=$!
-            _jobctl_off
-            echo $FFMPEG_PID > "$PID_FILE"
-            disown $FFMPEG_PID
+        FFMPEG_PID=$!
+        _jobctl_off
+        echo $FFMPEG_PID > "$PID_FILE"
+        disown $FFMPEG_PID
 
-            # 健康探测：等最多 ~3s 观察 ffmpeg 是否开始推进 time=（即 tap 真在喂数据）。
-            # 正常情况下首帧在 1s 内到达；给足 3s 覆盖设备初始化抖动。
-            local waited=0
-            while (( waited < 30 )); do
-                sleep 0.1
-                waited=$((waited + 1))
-                kill -0 $FFMPEG_PID 2>/dev/null || break
-                if _tap_audio_flowing "$STATE_DIR/ffmpeg.log"; then
-                    tap_ok=true
-                    break
-                fi
-            done
-            $tap_ok && break
-
-            # 未流动：杀掉本轮 tap+ffmpeg，清理孤儿后重试
-            kill -9 $FFMPEG_PID 2>/dev/null
-            kill $TAP_PID 2>/dev/null; sleep 0.3; kill -9 $TAP_PID 2>/dev/null
-            pkill -f "audio-tap tap-start" 2>/dev/null
-            rm -f "$PID_FILE" "$TAP_PID_FILE"
-            if (( tap_try < TAP_MAX_TRIES )); then
-                _t TAP_STALL_RETRY "$tap_try" "$TAP_MAX_TRIES"
-                sleep 0.5
+        # 健康探测：等最多 ~3s 观察 ffmpeg 是否开始推进 time=（即 tap 真在喂数据）。
+        # 正常情况下首帧在 1s 内到达；给足 3s 覆盖设备初始化抖动。
+        local waited=0
+        while (( waited < 30 )); do
+            sleep 0.1
+            waited=$((waited + 1))
+            kill -0 $FFMPEG_PID 2>/dev/null || break
+            if _tap_audio_flowing "$STATE_DIR/ffmpeg.log"; then
+                tap_ok=true
+                break
             fi
-            tap_try=$((tap_try + 1))
         done
+        $tap_ok && break
 
-        if ! $tap_ok; then
-            rm -f "$STATE_DIR/tap.fifo" "$STATE_DIR/tap-level" "$STATE_DIR/mic-level"
-            rm -f "$OUTPUT_FILE_MARKER" "$STATE_DIR/session-dir"
-            # 清理本次未成功录音留下的空 session 目录（只有 0 字节 m4a + 空
-            # materials），避免残留误导后续 meetap again / 列表。仅当目录里没有
-            # 任何非空文件时才删，绝不误删已有内容。
-            rm -f "$OUTPUT_FILE"
-            [[ -d "$SESSION_DIR" ]] && rmdir "$SESSION_DIR/materials" "$SESSION_DIR" 2>/dev/null
-            _t ERR_TAP_STALL "$0"
-            exit 1
+        # 未流动：杀掉本轮 tap+ffmpeg，清理孤儿后重试
+        kill -9 $FFMPEG_PID 2>/dev/null
+        kill $TAP_PID 2>/dev/null; sleep 0.3; kill -9 $TAP_PID 2>/dev/null
+        pkill -f "audio-tap tap-start" 2>/dev/null
+        rm -f "$PID_FILE" "$TAP_PID_FILE"
+        if (( tap_try < TAP_MAX_TRIES )); then
+            _t TAP_STALL_RETRY "$tap_try" "$TAP_MAX_TRIES"
+            sleep 0.5
         fi
+        tap_try=$((tap_try + 1))
+    done
 
-        if kill -0 $FFMPEG_PID 2>/dev/null; then
-            # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护，到点自动结束。
-            # 无 -d 则不自动结束，需手动 stop（静默自停特性已废止）。
-            if [[ -n "$MAX_DURATION_MIN" ]]; then
-                _jobctl_on; autostop_daemon < /dev/null &
-                AUTOSTOP_PID=$!
-                _jobctl_off
-                echo $AUTOSTOP_PID > "$AUTOSTOP_PID_FILE"
-                disown $AUTOSTOP_PID
-            fi
-
-            echo ""
-            _t RECORDING_STARTED
-            $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
-            _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
-            $MUTE_MIC && _t FIELD_MIC_MUTED
-            if $FOREGROUND; then _t FIELD_STOP_CTRL_C "$0"; else _t FIELD_STOP_CMD "$0"; fi
-            if [[ -n "$MAX_DURATION_MIN" ]]; then
-                _t FIELD_MAX_DURATION "$MAX_DURATION_MIN" "$(date -v+"${MAX_DURATION_MIN}"M +%H:%M)"
-            else
-                _t FIELD_STOP_MANUAL
-            fi
-            echo ""
-        else
-            _t ERR_FFMPEG_FAIL
-            cat "$STATE_DIR/ffmpeg.log"
-            exit 1
-        fi
-    else
-
-    # --- BlackHole 分支(原有逻辑,一字不动) ---
-    # 检查 BlackHole
-    BH_UID=$("$TOOL" blackhole-uid 2>/dev/null)
-    if [[ -z "$BH_UID" ]]; then
-        _t ERR_BLACKHOLE_MISSING
-        _t HINT_INSTALL_BLACKHOLE
+    if ! $tap_ok; then
+        rm -f "$STATE_DIR/tap.fifo" "$STATE_DIR/tap-level" "$STATE_DIR/mic-level"
+        rm -f "$OUTPUT_FILE_MARKER" "$STATE_DIR/session-dir"
+        # 清理本次未成功录音留下的空 session 目录（只有 0 字节 m4a + 空
+        # materials），避免残留误导后续 meetap again / 列表。仅当目录里没有
+        # 任何非空文件时才删，绝不误删已有内容。
+        rm -f "$OUTPUT_FILE"
+        [[ -d "$SESSION_DIR" ]] && rmdir "$SESSION_DIR/materials" "$SESSION_DIR" 2>/dev/null
+        _t ERR_TAP_STALL "$0"
         exit 1
     fi
 
-    # 记住当前输出设备
-    ORIG_UID=$("$TOOL" default-output-uid)
-    ORIG_NAME=$("$TOOL" default-output-name)
-
-    # 如果当前输出已是 BlackHole，从状态文件恢复真实设备
-    if [[ "$ORIG_UID" == "$BH_UID" ]]; then
-        if [[ -f "$ORIGINAL_UID_FILE" ]]; then
-            ORIG_UID=$(cat "$ORIGINAL_UID_FILE")
-            ORIG_NAME=$(cat "$ORIGINAL_NAME_FILE" 2>/dev/null || echo "$ORIG_UID")
-            $VERBOSE && _t CUR_OUTPUT_BH "$ORIG_NAME"
-        else
-            _t ERR_OUTPUT_IS_BH
-            exit 1
-        fi
-    else
-        $VERBOSE && _t CUR_OUTPUT "$ORIG_NAME"
-    fi
-
-    echo "$ORIG_UID" > "$ORIGINAL_UID_FILE"
-    echo "$ORIG_NAME" > "$ORIGINAL_NAME_FILE"
-
-    # 切换系统输出到 BlackHole
-    $VERBOSE && _t SWITCHING_TO_BH
-    if ! SwitchAudioSource -s "BlackHole 2ch" -t output &>/dev/null; then
-        _t ERR_CANT_SWITCH_BH
-        exit 1
-    fi
-    $VERBOSE && _t SWITCHED_TO_BH
-
-    # 启动 audio-monitor：BlackHole → 原始设备（实时转发，用户能听到）
-    $VERBOSE && _t STARTING_MONITOR "$ORIG_NAME"
-    _jobctl_on
-    "$MONITOR" "$BH_UID" "$ORIG_UID" < /dev/null > "$STATE_DIR/monitor.log" 2>&1 &
-    MONITOR_PID=$!
-    _jobctl_off
-    echo $MONITOR_PID > "$MONITOR_PID_FILE"
-    disown $MONITOR_PID
-    sleep 1
-
-    if ! kill -0 $MONITOR_PID 2>/dev/null; then
-        _t ERR_MONITOR_FAIL
-        cat "$STATE_DIR/monitor.log"
-        SwitchAudioSource -s "$ORIG_NAME" -t output &>/dev/null
-        rm -f "$MONITOR_PID_FILE"
-        exit 1
-    fi
-    $VERBOSE && _t MONITOR_STARTED "$ORIG_NAME"
-
-    # 开始录制（系统音频 + 麦克风混录；--mute-microphone 时只录系统音）
-    # 会话目录与 OUTPUT_FILE 已在捕获方式分支前生成（两分支共用）
-    # 静音时用 volume=0.5 代替 amix：amix 两路输入各压一半，去掉后音量会
-    # 高 6dB，响的地方还会削顶。保持和混录时一样的电平。
-    local mic_args=(-af volume=0.5)
-    if ! $MUTE_MIC; then
-        local MIC_NAME
-        MIC_NAME=$("$TOOL" default-input-name 2>/dev/null)
-        $VERBOSE && _t MIC_DEVICE "$MIC_NAME"
-        mic_args=(-f avfoundation -i ":default" -filter_complex amix=inputs=2:duration=longest)
-    fi
-    # -y：覆盖已存在的输出文件（同一分钟内重跑 start 会撞同名 m4a，缺 -y 会
-    # 弹交互式 Overwrite? 而秒退，详见 tap 分支说明）。
-    _jobctl_on
-    ffmpeg -y -f avfoundation -i ":BlackHole 2ch" \
-        "${mic_args[@]}" \
-        -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
-        -movflags frag_keyframe+empty_moov \
-        "$OUTPUT_FILE" \
-        < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &
-
-    FFMPEG_PID=$!
-    _jobctl_off
-    echo $FFMPEG_PID > "$PID_FILE"
-    disown $FFMPEG_PID
-
-    sleep 1
     if kill -0 $FFMPEG_PID 2>/dev/null; then
-        # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护（静默自停已废止）
+        # 时长上限自停：仅当 meetap start -d N 指定时长时启动守护，到点自动结束。
+        # 无 -d 则不自动结束，需手动 stop（静默自停特性已废止）。
         if [[ -n "$MAX_DURATION_MIN" ]]; then
             _jobctl_on; autostop_daemon < /dev/null &
             AUTOSTOP_PID=$!
@@ -2395,29 +2365,25 @@ start_recording() {
 
         echo ""
         _t RECORDING_STARTED
+        # 故障注入开关开着：醒目提示，免得忘了关、把正式会议录成静音
+        [[ -n "${MEETAP_TAP_FAULT_ZERO_AFTER:-}" ]] && _t WARN_FAULT_INJECT "$MEETAP_TAP_FAULT_ZERO_AFTER"
         $VERBOSE && _t FIELD_FILE "$OUTPUT_FILE"
-        _t FIELD_PLAYBACK "$ORIG_NAME"
+        _t FIELD_PLAYBACK "$ORIG_NAME (Process Tap)"
         $MUTE_MIC && _t FIELD_MIC_MUTED
+        if $FOREGROUND; then _t FIELD_STOP_CTRL_C "$0"; else _t FIELD_STOP_CMD "$0"; fi
         if [[ -n "$MAX_DURATION_MIN" ]]; then
             _t FIELD_MAX_DURATION "$MAX_DURATION_MIN" "$(date -v+"${MAX_DURATION_MIN}"M +%H:%M)"
         else
             _t FIELD_STOP_MANUAL
         fi
-        if $FOREGROUND; then _t FIELD_STOP_CTRL_C "$0"; else _t FIELD_STOP_CMD "$0"; fi
         echo ""
     else
         _t ERR_FFMPEG_FAIL
         cat "$STATE_DIR/ffmpeg.log"
-        # 回滚
-        kill $MONITOR_PID 2>/dev/null
-        SwitchAudioSource -s "$ORIG_NAME" -t output &>/dev/null
-        rm -f "$PID_FILE" "$MONITOR_PID_FILE" "$OUTPUT_FILE_MARKER"
         exit 1
     fi
 
-    fi  # 闭合 if use_tap / else (BlackHole 分支结束)
-
-    # 走到这里说明录音已成功启动（两个分支失败时都已 exit）
+    # 走到这里说明录音已成功启动（失败时都已 exit）
     start_sleepwatch
     if $FOREGROUND; then
         foreground_wait
@@ -2454,9 +2420,8 @@ stop_recording() {
     $SLEEP_MODE || _kill_sleepwatch
 
     # 没有 ffmpeg PID 也可能有残留要收拾：start 启动阶段被 Ctrl-C 打断时，
-    # tap / monitor 已起、输出设备已切到 BlackHole，但 ffmpeg 还没写 PID
-    if [[ ! -f "$PID_FILE" && ! -f "$TAP_PID_FILE" && ! -f "$MONITOR_PID_FILE" \
-          && ! -f "$ORIGINAL_NAME_FILE" ]]; then
+    # tap 已起，但 ffmpeg 还没写 PID
+    if [[ ! -f "$PID_FILE" && ! -f "$TAP_PID_FILE" ]]; then
         _t ERR_NO_ACTIVE_RECORDING
         exit 1
     fi
@@ -2481,13 +2446,6 @@ stop_recording() {
         rm -f "$PID_FILE"
     fi
 
-    # 停止 audio-monitor
-    if [[ -f "$MONITOR_PID_FILE" ]]; then
-        MONITOR_PID=$(cat "$MONITOR_PID_FILE")
-        kill "$MONITOR_PID" 2>/dev/null
-        rm -f "$MONITOR_PID_FILE"
-    fi
-
     # 显式停止 audio-tap（不再依赖 EPIPE 自杀——ffmpeg 卡死时该链条会断）
     if [[ -f "$TAP_PID_FILE" ]]; then
         TAP_PID=$(cat "$TAP_PID_FILE")
@@ -2501,19 +2459,6 @@ stop_recording() {
 
     # 清理 tap/mic 电平文件与 FIFO
     rm -f "$STATE_DIR/tap-level" "$STATE_DIR/tap-level.tmp" "$STATE_DIR/mic-level" "$STATE_DIR/tap.fifo"
-
-    # 恢复原始输出设备
-    if [[ -f "$ORIGINAL_NAME_FILE" ]]; then
-        ORIG_NAME=$(cat "$ORIGINAL_NAME_FILE")
-        if SwitchAudioSource -s "$ORIG_NAME" -t output &>/dev/null; then
-            _t OUTPUT_RESTORED "$ORIG_NAME"
-        elif SwitchAudioSource -s "MacBook Pro Speakers" -t output &>/dev/null; then
-            _t ORIG_DEVICE_DISCONNECTED_FALLBACK "$ORIG_NAME"
-        else
-            _t ORIG_DEVICE_DISCONNECTED_MANUAL "$ORIG_NAME"
-        fi
-        rm -f "$ORIGINAL_UID_FILE" "$ORIGINAL_NAME_FILE"
-    fi
 
     # 显示文件信息
     if [[ -f "$OUTPUT_FILE_MARKER" ]]; then
@@ -2604,12 +2549,8 @@ show_status() {
         local status_lines=()
         status_lines+=("$(_tn STATUS_RECORDING "$elapsed")")
         [[ -f "$OUTPUT_FILE_MARKER" ]] && status_lines+=("$(_tn STATUS_FILE "$(cat "$OUTPUT_FILE_MARKER")")")
-        [[ -f "$ORIGINAL_NAME_FILE" ]] && status_lines+=("$(_tn STATUS_PLAYBACK "$(cat "$ORIGINAL_NAME_FILE")")")
         if [[ -f "$AUTOSTOP_PID_FILE" ]] && kill -0 "$(cat "$AUTOSTOP_PID_FILE")" 2>/dev/null; then
             status_lines+=("$(_tn STATUS_AUTOSTOP_ON)")
-        fi
-        if [[ -f "$MONITOR_PID_FILE" ]] && kill -0 "$(cat "$MONITOR_PID_FILE")" 2>/dev/null; then
-            status_lines+=("$(_tn STATUS_MONITOR_RUN)")
         fi
         if [[ -f "$VISUALIZER_PID_FILE" ]] && kill -0 "$(cat "$VISUALIZER_PID_FILE")" 2>/dev/null; then
             status_lines+=("$(_tn STATUS_VISUALIZER_RUN)")
@@ -2622,118 +2563,6 @@ show_status() {
         ui_card "${idle_lines[@]}"
         rm -f "$PID_FILE"
     fi
-}
-
-setup_zoom() {
-    local VIPER_INI="$HOME/Library/Application Support/zoom.us/data/viper.ini"
-    local SYSTEM_HEX="53616d652061732053797374656d"  # "Same as System" in hex
-
-    if [[ ! -f "$VIPER_INI" ]]; then
-        _t SETUP_ZOOM_NO_CONFIG
-        return 1
-    fi
-
-    # 检查当前设置
-    local CURRENT_SPK
-    CURRENT_SPK=$(grep "^AECSPK=" "$VIPER_INI" | cut -d= -f2)
-    if [[ "$CURRENT_SPK" == "$SYSTEM_HEX" ]]; then
-        _t SETUP_ZOOM_ALREADY_OK
-        return 0
-    fi
-
-    local CURRENT_NAME
-    CURRENT_NAME=$(echo -n "$CURRENT_SPK" | xxd -r -p 2>/dev/null)
-    _t SETUP_ZOOM_CUR_SPK "$CURRENT_NAME"
-
-    # Zoom 运行时修改会被覆盖，需要先退出
-    if pgrep -x "zoom.us" >/dev/null; then
-        _t SETUP_ZOOM_QUITTING
-        osascript -e 'tell application "zoom.us" to quit' 2>/dev/null
-        # 等待完全退出
-        for i in {1..10}; do
-            pgrep -x "zoom.us" >/dev/null || break
-            sleep 1
-        done
-        if pgrep -x "zoom.us" >/dev/null; then
-            _t SETUP_ZOOM_CANT_QUIT
-            return 1
-        fi
-        local REOPEN_ZOOM=1
-    fi
-
-    # 修改扬声器设置
-    sed -i '' "s/^AECSPK=.*/AECSPK=$SYSTEM_HEX/" "$VIPER_INI"
-
-    # 同时把「蓝牙通话时的扬声器」也改为跟随系统
-    if grep -q "^AECBSSPK=" "$VIPER_INI"; then
-        sed -i '' "s/^AECBSSPK=.*/AECBSSPK=$SYSTEM_HEX/" "$VIPER_INI"
-    fi
-
-    _t SETUP_ZOOM_DONE
-
-    # 重新打开 Zoom
-    if [[ "${REOPEN_ZOOM:-0}" == "1" ]]; then
-        _t SETUP_ZOOM_REOPENING
-        open -a "zoom.us"
-    fi
-}
-
-setup_teams() {
-    # 新架构下，录制时系统输出是 BlackHole 2ch。
-    # Teams 没有 "System Default" 选项，需要手动选择 BlackHole 2ch 作为扬声器。
-
-    BH_UID=$("$TOOL" blackhole-uid 2>/dev/null)
-    if [[ -z "$BH_UID" ]]; then
-        _t ERR_BLACKHOLE_MISSING
-        return 1
-    fi
-
-    # 打开 Teams 设备设置页面
-    if ! pgrep -f "Microsoft Teams" >/dev/null; then
-        _t SETUP_TEAMS_OPENING
-        open -a "Microsoft Teams"
-        sleep 3
-    fi
-
-    _t SETUP_TEAMS_OPEN_SETTINGS
-    open "msteams://settings/devices" 2>/dev/null
-
-    echo ""
-    _t SETUP_TEAMS_INSTRUCT_HEADER
-    _t SETUP_TEAMS_INSTRUCT_SPEAKER
-    echo ""
-    _t SETUP_ONCE_NOTE
-    echo ""
-    ui_pause "$(_tn SETUP_PRESS_ENTER)"
-    _t SETUP_TEAMS_DONE
-}
-
-setup_wemeet() {
-    # 新架构下，录制时系统输出是 BlackHole 2ch。
-    # 腾讯会议需要手动选择 BlackHole 2ch 作为扬声器。
-
-    BH_UID=$("$TOOL" blackhole-uid 2>/dev/null)
-    if [[ -z "$BH_UID" ]]; then
-        _t ERR_BLACKHOLE_MISSING
-        return 1
-    fi
-
-    # 打开腾讯会议
-    if ! pgrep -f "TencentMeeting" >/dev/null; then
-        _t SETUP_WEMEET_OPENING
-        open -a "TencentMeeting"
-        sleep 3
-    fi
-
-    echo ""
-    _t SETUP_WEMEET_INSTRUCT_HEADER
-    _t SETUP_WEMEET_STEP1
-    _t SETUP_WEMEET_STEP2
-    echo ""
-    _t SETUP_ONCE_NOTE
-    echo ""
-    ui_pause "$(_tn SETUP_PRESS_ENTER)"
-    _t SETUP_WEMEET_DONE
 }
 
 # 写入授权已通过的持久标记（顺带保证配置目录存在，覆盖模板缺失等边缘情况）。
@@ -2786,7 +2615,7 @@ tap_authorize_guide() {
 }
 
 # setup 中的 Process Tap 授权检测与引导。
-# 返回 0=Tap 可用（授权已通过），1=不可用（不支持或授权失败，需走 BlackHole）。
+# 返回 0=Tap 可用（授权已通过），1=不可用（不支持或授权失败）。
 # 通过时写持久标记 TAP_AUTH_MARKER，让后续 meetap start 直接信任、跳过自测。
 setup_tap() {
     local TAP_TOOL="$SCRIPT_DIR/audio-tap"
@@ -2794,7 +2623,7 @@ setup_tap() {
     if [[ ! -x "$TAP_TOOL" ]] || ! "$TAP_TOOL" tap-supported &>/dev/null; then
         _t SETUP_TAP_UNSUPPORTED
         rm -f "$TAP_AUTH_MARKER"
-        return 1   # 不支持 → 走 BlackHole
+        return 1
     fi
 
     _t SETUP_TAP_PROBING
@@ -2816,48 +2645,30 @@ setup_tap() {
 }
 
 setup_apps() {
+    _require_macos || exit 1
     _t SETUP_HEADER
     _t SETUP_TITLE
     _t SETUP_HEADER
     echo ""
 
-    # 判定实际采集路径决定是否需要配置会议 App 扬声器：
-    #   - 配置强制 blackhole，或 Tap 不支持/未授权 → 走 BlackHole，需逐个配置会议 App；
-    #   - 否则走 Process Tap，采集整个系统混音，与会议 App 扬声器无关，跳过这些步骤。
-    local use_blackhole=false
-    if [[ "$CFG_AUDIO_CAPTURE" == "blackhole" ]]; then
-        use_blackhole=true
+    # 2.0 升级迁移检查：放在授权自检之前——自检会往默认输出放提示音，
+    # 输出还停在 BlackHole 上的话用户听不见。录音进行中不动输出设备。
+    _t SETUP_STEP_MIGRATE
+    _t SETUP_DIVIDER
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        _t SETUP_MIGRATE_SKIP_RECORDING
     else
-        _t SETUP_STEP_TAP
-        _t SETUP_DIVIDER
-        if setup_tap; then
-            use_blackhole=false
-        else
-            use_blackhole=true
-        fi
-        echo ""
+        _migrate_output_device
     fi
+    _check_meeting_apps
+    _t SETUP_MIGRATE_DONE
+    echo ""
 
-    if [[ "$use_blackhole" == "true" ]]; then
-        _t SETUP_STEP_ZOOM
-        _t SETUP_DIVIDER
-        setup_zoom
-        echo ""
-
-        _t SETUP_STEP_TEAMS
-        _t SETUP_DIVIDER
-        setup_teams
-        echo ""
-
-        _t SETUP_STEP_WEMEET
-        _t SETUP_DIVIDER
-        setup_wemeet
-        echo ""
-    else
-        # Tap 模式：会议 App 扬声器无关，跳过 Zoom / Teams / 腾讯会议配置
-        _t SETUP_APPS_TAP_SKIP
-        echo ""
-    fi
+    _warn_old_capture_config
+    _t SETUP_STEP_TAP
+    _t SETUP_DIVIDER
+    setup_tap
+    echo ""
 
     _t SETUP_HEADER
     _t SETUP_ALL_DONE "$0"
@@ -2912,14 +2723,9 @@ case "${1:-}" in
     setup)
         setup_apps
         ;;
-    setup-zoom)
-        setup_zoom
-        ;;
-    setup-teams)
-        setup_teams
-        ;;
-    setup-wemeet)
-        setup_wemeet
+    setup-zoom|setup-teams|setup-wemeet)
+        # 1.x 时代给 BlackHole 配会议 App 扬声器的命令，2.0 起不需要了
+        _t SETUP_APPS_NOT_NEEDED
         ;;
     config)
         case "${2:-edit}" in
@@ -2945,6 +2751,7 @@ case "${1:-}" in
                     "  audio_persist         = $CFG_AUDIO_PERSIST" \
                     "  multi_language        = $CFG_MULTI_LANGUAGE" \
                     "  visualizer            = $CFG_VISUALIZER" \
+                    "  zero_alert_ignore     = ${CFG_ZERO_ALERT_IGNORE:-<none>}" \
                     "  email                 = ${CFG_EMAIL:-<not set>}" \
                     "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
                 echo ""
