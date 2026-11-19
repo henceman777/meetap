@@ -5,6 +5,7 @@ BUILD_ID=""   # make install 写入「分支@提交号」，区分本地试用�
 
 # --- Config ---
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/meetap/config"
+MEETAP_ARGV="$*"   # 这次是怎么调用的，写进日志的分隔行
 
 # Defaults
 CFG_REGION="us-east-1"
@@ -383,6 +384,168 @@ _diag_dir() {
     printf '%s' "$1/.meetap"
 }
 
+# ── AWS 调用失败时别马上放弃：凭证过期、网络断一下，恢复了接着跑（2.0）──
+# 每一步各自最多等 RETRY_LIMIT 秒（15 分钟），间隔从 10 秒起逐次翻倍、最长 2 分钟；
+# 一步成功了，下一步重新计时。通知只弹两次：一次断掉时第一次失败弹一次，最后放弃再弹一次。
+RETRY_LIMIT="${MEETAP_RETRY_LIMIT_SEC:-900}"   # 环境变量只给测试用（缩短等待），间隔按比例跟着缩
+RETRY_DOWN=""        # 正在断着：第一次失败已经记过、弹过通知
+RETRY_GAVE_UP=""     # 这一轮有一步等到上限放弃了
+RETRY_SESSION=""     # 放弃时提示 meetap again 哪一场
+RETRY_LAST_MSG=""    # 最近一次失败时 stderr 的最后一行（调用方要写出错原因时用）
+
+# _aws_error_kind <stderr 文件>：cred（取不到凭证、令牌过期）/ net（连不上、超时、限流、服务端出错）/
+# gone（要的东西没了，重试也没用）/ other
+_aws_error_kind() {
+    if grep -qiE 'Unable to locate credentials|ExpiredToken|security token included in the request is (expired|invalid)|RequestExpired|InvalidClientTokenId|UnrecognizedClient|Error when retrieving credentials|Error loading SSO|SSO session|Token has expired|token is expired|Partial credentials found|NoCredentialsError|CredentialRetrievalError|TokenRetrievalError|Unable to load credentials' "$1" 2>/dev/null; then
+        echo cred
+    elif grep -qiE "couldn.t be found|could not be found|NoSuchKey|NoSuchUpload|\(404\)|Not Found" "$1" 2>/dev/null; then
+        echo gone
+    elif grep -qiE 'Could not connect to the endpoint|EndpointConnectionError|Connection (was closed|reset|refused|aborted)|ConnectionClosedError|Connect timeout|Read timeout|timed out|Temporary failure in name resolution|nodename nor servname|Network is unreachable|Name or service not known|SSLError|SSL validation|EOF occurred|RemoteDisconnected|Throttl|TooManyRequests|SlowDown|ServiceUnavailable|InternalServerError|InternalFailure|InternalError|\(50[0-9]\)' "$1" 2>/dev/null; then
+        echo net
+    else
+        echo other
+    fi
+}
+
+_notify() {
+    osascript -e "display notification \"$1\" with title \"MeeTap\"" 2>/dev/null
+}
+
+# _retry <步骤> <策略> <命令…>：失败了按策略重试，成功返回 0，放弃时返回命令的退出码。
+# 命令的 stdout 原样透传（要取输出用 _retry_out，别放进 $(...)：子 shell 里改的状态带不回来）；
+# stderr 先存下来分辨原因，再写进日志。步骤是提示语里 STEP_<步骤> 的名字。
+#   aws：凭证、网络问题一直重试到上限；别的错误最多试 3 次
+#   once：凭证、网络问题一直重试到上限；别的错误不重试（命令自己已经重试过）
+#   cred：只有凭证问题等着恢复；别的（包括网络、超时）马上返回，调用方自己兜底
+_retry() {
+    local step="$1" policy="$2" t0=$SECONDS n=0 other=0 rc kind delay name errf
+    shift 2
+    name=$(_tn "STEP_$step")
+    errf=$(mktemp "${TMPDIR:-/tmp}/meetap-err.XXXXXX") || { "$@"; return; }
+    while true; do
+        "$@" 2>"$errf"; rc=$?
+        cat "$errf" >&2
+        RETRY_LAST_MSG=$(grep -v '^[[:space:]]*$' "$errf" | tail -1 | cut -c1-200)
+        if (( rc == 0 )); then
+            if [[ -n "$RETRY_DOWN" ]]; then
+                echo "[$(date '+%H:%M:%S')] $(_tn RETRY_RECOVERED "$name")" >&2
+                RETRY_DOWN=""
+            fi
+            rm -f "$errf"; return 0
+        fi
+        kind=$(_aws_error_kind "$errf")
+        case "$policy:$kind" in
+            aws:cred|aws:net|once:cred|once:net|cred:cred) ;;
+            aws:other) other=$((other + 1)); (( other < 3 )) || { rm -f "$errf"; return $rc; } ;;
+            *) rm -f "$errf"; return $rc ;;
+        esac
+        n=$((n + 1))
+        if (( SECONDS - t0 >= RETRY_LIMIT )); then
+            echo "[$(date '+%H:%M:%S')] $(_tn RETRY_GAVE_UP "$name" "$(( (RETRY_LIMIT + 59) / 60 ))" "$RETRY_SESSION")" >&2
+            _notify "$(_tn NOTIFY_RETRY_GAVE_UP "$name" "$RETRY_SESSION")"
+            RETRY_GAVE_UP=1; RETRY_DOWN=""
+            rm -f "$errf"; return $rc
+        fi
+        if [[ -z "$RETRY_DOWN" && "$kind" != other ]]; then
+            # 这次断掉的第一次失败：日志写明原因，弹一次通知
+            RETRY_DOWN=1
+            if [[ "$kind" == cred ]]; then
+                echo "[$(date '+%H:%M:%S')] $(_tn RETRY_CRED "$name" "$(( (RETRY_LIMIT + 59) / 60 ))")" >&2
+                _notify "$(_tn NOTIFY_RETRY_CRED "$name")"
+            else
+                echo "[$(date '+%H:%M:%S')] $(_tn RETRY_NET "$name" "$(( (RETRY_LIMIT + 59) / 60 ))")" >&2
+                _notify "$(_tn NOTIFY_RETRY_NET "$name")"
+            fi
+        fi
+        # 间隔：上限的 1/90 起（15 分钟 → 10 秒）逐次翻倍，最长上限的 1/7.5（2 分钟），不超过剩下的时间
+        delay=$(awk -v l="$RETRY_LIMIT" -v n="$n" -v e="$((SECONDS - t0))" 'BEGIN {
+            d = l / 90 * 2 ^ (n - 1); if (d > l / 7.5) d = l / 7.5; if (d > l - e) d = l - e; if (d < 0.05) d = 0.05
+            if (d >= 1) printf "%d", d + 0.5; else printf "%.2f", d }')
+        echo "[$(date '+%H:%M:%S')] $(_tn RETRY_WAIT "$name" "$n" "$delay")" >&2
+        sleep "$delay"
+    done
+}
+
+# _retry_out <变量名> <步骤> <策略> <命令…>：同 _retry，命令的输出存进变量
+_retry_out() {
+    local __var="$1" __f __rc
+    shift
+    __f=$(mktemp "${TMPDIR:-/tmp}/meetap-out.XXXXXX") || return 1
+    _retry "$@" > "$__f"; __rc=$?
+    printf -v "$__var" '%s' "$(cat "$__f")"
+    rm -f "$__f"
+    return $__rc
+}
+
+# 日志接着往后写，每次开头一行分隔：几点、哪个命令
+_log_separator() {
+    echo "===== $(date '+%Y-%m-%d %H:%M:%S') · $(basename "$0")${MEETAP_ARGV:+ $MEETAP_ARGV} ====="
+}
+
+# 桶不在就建，并锁死公共访问（兜底防止误配导致内容泄露）。
+# 只有凭证、网络问题算失败（交给 _retry 等着恢复）；别的报错照旧不管——最小权限策略里没有
+# ListBucket / CreateBucket，查不到、建不了都正常，桶多半已经在了，上传那一步自然见分晓
+_ensure_bucket() {
+    local bucket="$1" region="$2" errf kind
+    errf=$(mktemp "${TMPDIR:-/tmp}/meetap-err.XXXXXX") || return 0
+    if ! aws s3api head-bucket --bucket "$bucket" --region "$region" >/dev/null 2>&1; then
+        aws s3 mb "s3://${bucket}" --region "$region" 2>"$errf"
+    fi
+    aws s3api put-public-access-block \
+        --bucket "$bucket" \
+        --public-access-block-configuration \
+        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
+        --region "$region" 2>>"$errf"
+    kind=$(_aws_error_kind "$errf")
+    if [[ "$kind" == cred || "$kind" == net ]]; then
+        cat "$errf" >&2; rm -f "$errf"; return 1
+    fi
+    rm -f "$errf"; return 0
+}
+
+# 提交转录任务。上一次其实已经提交上去、只是回应丢了的话，再提交会报任务名已存在，算成功
+_start_transcription_job() {
+    local job="$1" bucket="$2" key="$3" region="$4" lang_flag="--identify-language" errf rc
+    [[ "$CFG_MULTI_LANGUAGE" == "true" ]] && lang_flag="--identify-multiple-languages"
+    errf=$(mktemp "${TMPDIR:-/tmp}/meetap-err.XXXXXX") || return 1
+    aws transcribe start-transcription-job \
+        --transcription-job-name "$job" \
+        $lang_flag \
+        --language-options $CFG_TRANSCRIBE_LANGUAGES \
+        --media-format "mp4" \
+        --media "{\"MediaFileUri\": \"s3://${bucket}/${key}\"}" \
+        --output-bucket-name "$bucket" \
+        --region "$region" \
+        --settings "{\"ShowSpeakerLabels\": true, \"MaxSpeakerLabels\": $CFG_MAX_SPEAKERS}" \
+        > /dev/null 2>"$errf"
+    rc=$?
+    if (( rc != 0 )) && grep -qi 'already exists' "$errf"; then rc=0; fi
+    (( rc == 0 )) || cat "$errf" >&2
+    rm -f "$errf"
+    return $rc
+}
+
+# 这一场的转录任务记在 .meetap/transcribe-job.json：again 时任务还在 AWS 上就直接接着用
+_job_file_write() {   # _job_file_write <文件> <任务名> <桶> <区域> <音频 key>
+    python3 -I -c 'import json, sys
+from datetime import datetime
+f, job, bucket, region, key = sys.argv[1:6]
+json.dump({"job": job, "bucket": bucket, "region": region, "audio_key": key,
+           "started_at": datetime.now().astimezone().isoformat(timespec="seconds")}, open(f, "w"), indent=2)' "$@"
+}
+_job_file_read() {    # 输出：任务名 \t 桶 \t 区域 \t 音频 key
+    python3 -I -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+print("\t".join(str(d.get(k) or "-") for k in ("job", "bucket", "region", "audio_key")))' "$1" 2>/dev/null
+}
+
+# 只删这一场自己的文件：所有会话共用一个桶，别把别的会还在转、或者留着等 again 的文件一起删掉
+_transcribe_cleanup() {   # _transcribe_cleanup <桶> <音频 key> <任务名> <区域>
+    aws s3 rm "s3://${1}/${2}" --region "$4" 2>/dev/null
+    aws s3 rm "s3://${1}/${3}.json" --region "$4" 2>/dev/null
+    aws transcribe delete-transcription-job --transcription-job-name "$3" --region "$4" 2>/dev/null
+}
+
 transcribe_recording() {
     local AUDIO_FILE="$1"
     local SESSION_DIR="$2"
@@ -393,9 +556,14 @@ transcribe_recording() {
     local LOG_FILE="$LOG_DIR/meetap.log"
     local AWS_REGION="$CFG_REGION"
 
+    local JOB_FILE="$DIAG_DIR/transcribe-job.json"
+    RETRY_SESSION=$(_session_ref "$SESSION_DIR")
+
     # 语音文件保留在 session 根目录原位，不再移入 log/（用户要求位置不变动）
 
-    exec > "$LOG_FILE" 2>&1
+    # 接着往后写，不冲掉上一次的日志（again 重跑时，上一次为什么失败还看得到）
+    exec >> "$LOG_FILE" 2>&1
+    _log_separator
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
 
     # 整段是数字静音（全 0 样本）就不上传转录：多半是没授权系统音频录制，
@@ -417,9 +585,9 @@ transcribe_recording() {
         return 1
     fi
 
-    local ACCOUNT_ID
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-    if [[ -z "$ACCOUNT_ID" ]]; then
+    # 凭证过期、网络断了：等着恢复（最多 15 分钟），不马上放弃
+    local ACCOUNT_ID=""
+    if ! _retry_out ACCOUNT_ID STS aws aws sts get-caller-identity --query Account --output text || [[ -z "$ACCOUNT_ID" ]]; then
         _t ERR_AWS_CREDS_MISSING
         return 1
     fi
@@ -428,86 +596,99 @@ transcribe_recording() {
     local ACCOUNT_HASH
     ACCOUNT_HASH=$(printf '%s' "$ACCOUNT_ID" | shasum -a 256 | cut -c1-12)
     local BUCKET="meetap-transcribe-${ACCOUNT_HASH}-${AWS_REGION}"
-    local AUDIO_BASENAME
-    AUDIO_BASENAME=$(basename "$AUDIO_FILE")
+    local AUDIO_KEY
+    AUDIO_KEY=$(basename "$AUDIO_FILE")
     local JOB_NAME="meetap-$(date +%Y%m%d-%H%M%S)-$$"
+    local STATUS="" REUSE=""
 
-    # Create bucket if not exists
-    aws s3 mb "s3://${BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
-
-    # 锁死公共访问，兜底防止误配导致内容泄露
-    aws s3api put-public-access-block \
-        --bucket "$BUCKET" \
-        --public-access-block-configuration \
-        BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
-        --region "$AWS_REGION" 2>/dev/null || true
-
-    # Upload
-    echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"
-    if ! aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_BASENAME}" --region "$AWS_REGION"; then
-        _t ERR_UPLOAD_FAILED
-        return 1
-    fi
-
-    # Start transcription
-    local LANG_FLAG="--identify-language"
-    if [[ "$CFG_MULTI_LANGUAGE" == "true" ]]; then
-        LANG_FLAG="--identify-multiple-languages"
-    fi
-    echo "[$(date '+%H:%M:%S')] $(_tn START_JOB "$JOB_NAME")"
-    aws transcribe start-transcription-job \
-        --transcription-job-name "$JOB_NAME" \
-        $LANG_FLAG \
-        --language-options $CFG_TRANSCRIBE_LANGUAGES \
-        --media-format "mp4" \
-        --media "{\"MediaFileUri\": \"s3://${BUCKET}/${AUDIO_BASENAME}\"}" \
-        --output-bucket-name "$BUCKET" \
-        --region "$AWS_REGION" \
-        --settings "{\"ShowSpeakerLabels\": true, \"MaxSpeakerLabels\": $CFG_MAX_SPEAKERS}" \
-        > /dev/null
-
-    # Poll for completion
-    local POLL_ERRORS=0
-    while true; do
-        local STATUS
-        STATUS=$(aws transcribe get-transcription-job \
-            --transcription-job-name "$JOB_NAME" \
-            --region "$AWS_REGION" \
-            --query 'TranscriptionJob.TranscriptionJobStatus' \
-            --output text 2>/dev/null)
-        if [[ -z "$STATUS" ]]; then
-            POLL_ERRORS=$((POLL_ERRORS + 1))
-            echo "[$(date '+%H:%M:%S')] $(_tn STATUS_QUERY_RETRY "$POLL_ERRORS")"
-            if [[ $POLL_ERRORS -ge 5 ]]; then
-                _t STATUS_QUERY_ABORT
-                break
-            fi
-            sleep 10
-            continue
+    # again：上一次的转录任务还在 AWS 上（转完了、或者还在转），直接接着用，不重新上传、不重新转录
+    if [[ -f "$JOB_FILE" ]]; then
+        local saved_job saved_bucket saved_region saved_key
+        IFS=$'\t' read -r saved_job saved_bucket saved_region saved_key < <(_job_file_read "$JOB_FILE")
+        if [[ "$saved_job" == meetap-* && "$saved_bucket" == "$BUCKET" && "$saved_region" == "$AWS_REGION" && "$saved_key" != "-" ]] \
+           && _retry_out STATUS POLL aws aws transcribe get-transcription-job --transcription-job-name "$saved_job" \
+                  --region "$AWS_REGION" --query 'TranscriptionJob.TranscriptionJobStatus' --output text; then
+            case "$STATUS" in
+                COMPLETED|IN_PROGRESS|QUEUED) REUSE=1; JOB_NAME="$saved_job"; AUDIO_KEY="$saved_key" ;;
+            esac
         fi
-        POLL_ERRORS=0
+        [[ -n "$RETRY_GAVE_UP" ]] && return 1
+        if [[ -n "$REUSE" ]]; then
+            echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_REUSE "$JOB_NAME")"
+        else
+            # 上一次的任务失败了或者没了：它留下的文件先清掉，从头转
+            [[ "$saved_job" == meetap-* && "$saved_key" != "-" ]] && _transcribe_cleanup "$saved_bucket" "$saved_key" "$saved_job" "$saved_region"
+            rm -f "$JOB_FILE"; STATUS=""
+        fi
+    fi
+
+    if [[ -z "$REUSE" ]]; then
+        if ! _retry BUCKET aws _ensure_bucket "$BUCKET" "$AWS_REGION"; then
+            _t ERR_UPLOAD_FAILED
+            return 1
+        fi
+
+        # Upload
+        echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"
+        if ! _retry UPLOAD aws aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION"; then
+            _t ERR_UPLOAD_FAILED
+            return 1
+        fi
+
+        # Start transcription
+        echo "[$(date '+%H:%M:%S')] $(_tn START_JOB "$JOB_NAME")"
+        if ! _retry START aws _start_transcription_job "$JOB_NAME" "$BUCKET" "$AUDIO_KEY" "$AWS_REGION"; then
+            _t ERR_TRANSCRIBE_FAILED "${RETRY_LAST_MSG:-start-transcription-job}"
+            # 凭证一直没恢复的话删也删不掉；别的原因提交失败，就把刚传上去的音频删掉
+            [[ -n "$RETRY_GAVE_UP" ]] || aws s3 rm "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION" 2>/dev/null
+            osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+            return 1
+        fi
+        _job_file_write "$JOB_FILE" "$JOB_NAME" "$BUCKET" "$AWS_REGION" "$AUDIO_KEY"
+    fi
+
+    # Poll for completion：每次查状态都按同一套规则重试（凭证、网络断了等着，每次各自最多 15 分钟）
+    while [[ "$STATUS" != COMPLETED && "$STATUS" != FAILED ]]; do
+        [[ -n "$STATUS" ]] && sleep 10
+        if ! _retry_out STATUS POLL aws aws transcribe get-transcription-job \
+                --transcription-job-name "$JOB_NAME" \
+                --region "$AWS_REGION" \
+                --query 'TranscriptionJob.TranscriptionJobStatus' \
+                --output text; then
+            STATUS=""
+            break
+        fi
         echo "[$(date '+%H:%M:%S')] $(_tn STATUS_LINE "$STATUS")"
-        [[ "$STATUS" != "IN_PROGRESS" ]] && break
-        sleep 10
+        [[ "$STATUS" == IN_PROGRESS || "$STATUS" == QUEUED ]] || break
     done
 
     if [[ "$STATUS" != "COMPLETED" ]]; then
+        # 等到上限放弃：AWS 上的任务和文件都留着，恢复以后 meetap again 直接接着用
+        [[ -n "$RETRY_GAVE_UP" ]] && return 1
         local REASON
         REASON=$(aws transcribe get-transcription-job \
             --transcription-job-name "$JOB_NAME" \
             --region "$AWS_REGION" \
             --query 'TranscriptionJob.FailureReason' \
             --output text 2>/dev/null)
-        _t ERR_TRANSCRIBE_FAILED "${STATUS:-empty} ${REASON:+— $REASON}"
-        aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
-        aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
+        _t ERR_TRANSCRIBE_FAILED "${STATUS:-${RETRY_LAST_MSG:-empty}} ${REASON:+— $REASON}"
+        _transcribe_cleanup "$BUCKET" "$AUDIO_KEY" "$JOB_NAME" "$AWS_REGION"
+        rm -f "$JOB_FILE"
         osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
         return 1
     fi
 
     # Download result
     echo "[$(date '+%H:%M:%S')] $(_tn DOWNLOADING)"
-    aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$DIAG_DIR/transcribe-raw.json" --region "$AWS_REGION"
+    if ! _retry DOWNLOAD aws aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$DIAG_DIR/transcribe-raw.json" --region "$AWS_REGION"; then
+        [[ -n "$RETRY_GAVE_UP" ]] && return 1
+        # 结果文件没了（不是凭证、网络问题）：任务也清掉，again 时从头转
+        _t ERR_TRANSCRIBE_FAILED "${RETRY_LAST_MSG:-download}"
+        _transcribe_cleanup "$BUCKET" "$AUDIO_KEY" "$JOB_NAME" "$AWS_REGION"
+        rm -f "$JOB_FILE"
+        osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
+    fi
 
     # Extract transcript with speaker labels
     python3 - "$SESSION_DIR" <<'PYEOF'
@@ -563,9 +744,9 @@ PYEOF
         echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
     fi
 
-    # Cleanup S3 bucket and Transcribe job
-    aws s3 rm "s3://${BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null
-    aws transcribe delete-transcription-job --transcription-job-name "$JOB_NAME" --region "$AWS_REGION" 2>/dev/null
+    # 清掉 AWS 上这一场的音频、结果和转录任务（原始结果本地已经有一份）
+    _transcribe_cleanup "$BUCKET" "$AUDIO_KEY" "$JOB_NAME" "$AWS_REGION"
+    rm -f "$JOB_FILE"
 
     # Extract speaker stats from raw JSON
     python3 - "$SESSION_DIR" <<'PYEOF'
@@ -789,6 +970,10 @@ client = boto3.client("bedrock-runtime", region_name=region, config=cfg)
 
 MAX_TRIES = 3
 last_err = None
+# 凭证问题（取不到、过期）重发也没用：马上退出，交给 meetap 外面等凭证恢复再整个重来
+CRED_RE = re.compile(r"Unable to locate credentials|ExpiredToken|security token included in the request is (expired|invalid)|"
+                     r"InvalidClientTokenId|UnrecognizedClient|Error when retrieving credentials|Token has expired|"
+                     r"NoCredentialsError|CredentialRetrievalError|TokenRetrievalError", re.I)
 
 # 纪要末尾必须出现的 Meetap 签名尾巴（footer）。模型会把签名里每个单词
 # 首字母包进 <strong> 标签拼出藏头，所以完整性判断前先剥掉 HTML 标签再比。
@@ -850,12 +1035,14 @@ for attempt in range(1, MAX_TRIES + 1):
 
     except Exception as e:
         last_err = e
+        if CRED_RE.search(f"{type(e).__name__}: {e}"):
+            break
         if attempt < MAX_TRIES:
             wait = 5 * attempt   # 递增退避：5s、10s
             print(f"Bedrock attempt {attempt}/{MAX_TRIES} failed: {e} — retrying in {wait}s")
             time.sleep(wait)
 
-print(f"Error: {last_err}")
+print(f"Error: {type(last_err).__name__}: {last_err}", file=sys.stderr)
 sys.exit(1)
 PYEOF
 }
@@ -879,30 +1066,9 @@ summarize_via_claude_code() {
     fi
 }
 
-send_meeting_notes() {
-    local NOTES_FILE="$1"
-    local SESSION_DIR="$2"
-    local recipients="$CFG_EMAIL"
-    local sender="$CFG_EMAIL_SENDER"
-
-    # venv 缺失：无法做 HTML 转换；仅在用户配了邮件时才报错提示
-    if [[ ! -x "$VENV_PYTHON" ]]; then
-        [[ -n "$recipients" ]] && echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
-        return 1
-    fi
-    # 配了收件人但缺发件人：提示后降级为只生成 HTML 文件、不发送
-    if [[ -n "$recipients" && -z "$sender" ]]; then
-        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_SENDER_MISSING)"
-        recipients=""
-    fi
-
-    local PDF_FILE="${NOTES_FILE%.md}.pdf"
-    local HTML_FILE="${NOTES_FILE%.md}.html"
-    echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_CONVERTING)"
-
-    # SCRIPT_DIR 作为 argv 传入：heredoc 运行时 sys.argv[0] 是 '-'，
-    # Python 侧无法自行定位安装目录，必须由 bash 显式传递
-    "$VENV_PYTHON" - "$NOTES_FILE" "$PDF_FILE" "$recipients" "$sender" "$CFG_REGION" "$HTML_FILE" "$SCRIPT_DIR" <<'PYEOF'
+# 转 HTML 并发一次邮件（没配收件人时只生成 HTML）；参数见 send_meeting_notes
+_send_email_once() {
+    "$VENV_PYTHON" - "$@" <<'PYEOF'
 import sys, os, re, boto3
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -1126,9 +1292,36 @@ try:
     )
     print(f"Email sent to: {', '.join(recipients)}")
 except Exception as e:
-    print(f"Email send failed: {e}")
+    print(f"Email send failed: {type(e).__name__}: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
+}
+
+send_meeting_notes() {
+    local NOTES_FILE="$1"
+    local SESSION_DIR="$2"
+    local recipients="$CFG_EMAIL"
+    local sender="$CFG_EMAIL_SENDER"
+
+    # venv 缺失：无法做 HTML 转换；仅在用户配了邮件时才报错提示
+    if [[ ! -x "$VENV_PYTHON" ]]; then
+        [[ -n "$recipients" ]] && echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_VENV_MISSING)"
+        return 1
+    fi
+    # 配了收件人但缺发件人：提示后降级为只生成 HTML 文件、不发送
+    if [[ -n "$recipients" && -z "$sender" ]]; then
+        echo "[$(date '+%H:%M:%S')] $(_tn ERR_EMAIL_SENDER_MISSING)"
+        recipients=""
+    fi
+
+    local PDF_FILE="${NOTES_FILE%.md}.pdf"
+    local HTML_FILE="${NOTES_FILE%.md}.html"
+    echo "[$(date '+%H:%M:%S')] $(_tn EMAIL_CONVERTING)"
+
+    # SCRIPT_DIR 作为 argv 传入：heredoc 运行时 sys.argv[0] 是 '-'，
+    # Python 侧无法自行定位安装目录，必须由 bash 显式传递
+    # 凭证过期、网络断了：等着恢复再发（最多 15 分钟）
+    _retry EMAIL once _send_email_once "$NOTES_FILE" "$PDF_FILE" "$recipients" "$sender" "$CFG_REGION" "$HTML_FILE" "$SCRIPT_DIR"
 
     local py_rc=$?
     if [[ -n "$recipients" ]]; then
@@ -1210,6 +1403,16 @@ smart_name_notes() {
     printf '%s' "$target"
 }
 
+# 生成一次纪要，生成出来了才算成功
+_generate_notes_once() {
+    rm -f "$2"
+    case "$CFG_AI_BACKEND" in
+        claude-code) summarize_via_claude_code "$1" "$2" ;;
+        *)           summarize_via_bedrock "$1" "$2" ;;
+    esac
+    [[ -s "$2" ]]
+}
+
 summarize_transcript() {
     local SESSION_DIR="$1"
     local LOG_DIR="$SESSION_DIR/log"
@@ -1234,19 +1437,14 @@ summarize_transcript() {
         return 1
     fi
 
-    case "$CFG_AI_BACKEND" in
-        claude-code)
-            summarize_via_claude_code "$PROMPT_FILE" "$OUTPUT"
-            ;;
-        bedrock|*)
-            if [[ ! -x "$VENV_PYTHON" ]]; then
-                echo "[$(date '+%H:%M:%S')] $(_tn ERR_VENV_MISSING "$VENV_PYTHON")"
-                rm -f "$PROMPT_FILE"
-                return 1
-            fi
-            summarize_via_bedrock "$PROMPT_FILE" "$OUTPUT"
-            ;;
-    esac
+    if [[ "$CFG_AI_BACKEND" != claude-code && ! -x "$VENV_PYTHON" ]]; then
+        echo "[$(date '+%H:%M:%S')] $(_tn ERR_VENV_MISSING "$VENV_PYTHON")"
+        rm -f "$PROMPT_FILE"
+        return 1
+    fi
+    # 凭证过期、网络断了：等着恢复再生成（最多 15 分钟）；别的错误 summarize_via_* 自己已经重试过
+    [[ -n "$RETRY_SESSION" ]] || RETRY_SESSION=$(_session_ref "$SESSION_DIR")
+    _retry NOTES once _generate_notes_once "$PROMPT_FILE" "$OUTPUT"
 
     rm -f "$PROMPT_FILE"
 
@@ -1545,7 +1743,7 @@ again_session() {
         # 追加模式保留本会话既有日志（只归档旧纪要，不清空 log）。
         _t AGAIN_FROM_NOTES
         {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
+            _log_separator
             calendar_collect_for_session "$SESSION_DIR"
             summarize_transcript "$SESSION_DIR"
         } 2>&1 | tee -a "$LOG_DIR/meetap.log"
@@ -2202,12 +2400,17 @@ from botocore.config import Config
 prompt_path, out_path, region, model_id = sys.argv[1:5]
 with open(prompt_path, encoding="utf-8") as f:
     prompt = f.read()
-client = boto3.client("bedrock-runtime", region_name=region,
-                      config=Config(read_timeout=25, connect_timeout=10, retries={"max_attempts": 0}))
-r = client.converse(modelId=model_id, messages=[{"role": "user", "content": [{"text": prompt}]}],
-                    inferenceConfig={"maxTokens": 400},
-                    additionalModelRequestFields={"thinking": {"type": "disabled"}})
-text = "".join(b.get("text", "") for b in r["output"]["message"]["content"])
+try:
+    client = boto3.client("bedrock-runtime", region_name=region,
+                          config=Config(read_timeout=25, connect_timeout=10, retries={"max_attempts": 0}))
+    r = client.converse(modelId=model_id, messages=[{"role": "user", "content": [{"text": prompt}]}],
+                        inferenceConfig={"maxTokens": 400},
+                        additionalModelRequestFields={"thinking": {"type": "disabled"}})
+    text = "".join(b.get("text", "") for b in r["output"]["message"]["content"])
+except Exception as e:
+    # 一行就够：meetap 靠这行分辨是不是凭证问题
+    print(f"{type(e).__name__}: {e}".replace("\n", " "), file=sys.stderr)
+    sys.exit(1)
 with open(out_path, "w", encoding="utf-8") as f:
     f.write(text)
 PYEOF
@@ -2227,11 +2430,13 @@ calendar_recognize() {
     tmpdir=$(mktemp -d) || return 0
     prompt="$tmpdir/prompt.md"; llm="$tmpdir/answer.txt"
     if tpl=$(_calendar_match_template) && "$py" -I -c "$(_calendar_py)" prompt "$dir" "$tpl" > "$prompt" 2>/dev/null && [[ -s "$prompt" ]]; then
-        # 放进单独的进程组，超时连子进程一起杀
-        _run_with_timeout "$CAL_LLM_TIMEOUT" "$0" _calendar-llm "$prompt" "$llm" </dev/null >/dev/null 2>"$tmpdir/err"; rc=$?
+        # 放进单独的进程组，超时连子进程一起杀。凭证问题等着恢复（反正下一步生成纪要也要用凭证）；
+        # 别的问题（超时、出错）不重试，马上按时间兜底
+        [[ -n "$RETRY_SESSION" ]] || RETRY_SESSION=$(_session_ref "$dir")
+        _retry CALENDAR cred _run_with_timeout "$CAL_LLM_TIMEOUT" "$0" _calendar-llm "$prompt" "$llm" </dev/null >/dev/null; rc=$?
         if (( rc == 124 )); then status="timeout"; elif (( rc != 0 )) || [[ ! -s "$llm" ]]; then status="failed"; fi
         if [[ "$status" != ok ]]; then
-            err=$(grep -v '^[[:space:]]*$' "$tmpdir/err" 2>/dev/null | tail -1 | cut -c1-200)
+            err="$RETRY_LAST_MSG"
             echo "[$(date '+%H:%M:%S')] $(_tn CAL_LOG_LLM_FAILED "$status${err:+: $err}")"
         fi
     else

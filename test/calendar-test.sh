@@ -561,7 +561,8 @@ if command -v ffmpeg >/dev/null; then
     grep -q -- "calendar-query --start $s4 --end $((s4 + 65)) " "$FAKE/calls.log" && [[ -f "$S4/.meetap/calendar-candidates.json" && ! -e "$S4/materials/calendar.md" ]] \
         && grep -q '这个时段有 2 场会' "$S4/log/meetap.log" && [[ ! -e "$FAKE/claude.log" ]] \
         && pass "转录开始前收候选：按音频算时段、只存候选、日志里记一行；转录没完不调模型" || fail "转录前没收候选: $(cat "$FAKE/calls.log" 2>/dev/null)"
-    [[ "$(cat "$TMP/aws.log" 2>/dev/null)" == "aws sts get-caller-identity"* && $(grep -c . "$TMP/aws.log") -eq 1 ]] \
+    # 假 aws 查凭证时报不认识的错：最多试 3 次就停（凭证、网络问题才会一直等）
+    [[ -z "$(grep -v '^aws sts get-caller-identity' "$TMP/aws.log")" && $(grep -c . "$TMP/aws.log") -le 3 ]] \
         && pass "这条测试没有上传任何东西（假 aws 只被问了凭证）" || fail "aws 调用: $(cat "$TMP/aws.log" 2>/dev/null)"
     # again 只重跑纪要（已有转录）：收候选、认会、生成纪要（假 claude），末尾那一行插在签名前
     S5="$TMP/rec/20261118_1600"; mkdir -p "$S5/materials" "$S5/log"

@@ -275,8 +275,11 @@ $ meetap stop
 `meetap again` 主要用于**从失败处续跑**：上传、转录或纪要生成任一步中断或失败时，直接续跑到完成，**音频无需重录**。它会自动判断从哪一步接续：
 
 - 已转录成功、仅纪要未生成 → 只重跑纪要生成这一步；
-- 转录也未成功 → 从上传 + 转录开始把整条链路重跑一遍；
-- 旧纪要自动归档到 `archive/`（加时间戳），不会覆盖丢失。
+- 转录也未成功 → 上一次的转录任务如果已经在 AWS 上转完（或者还在转），直接取结果，不重新上传、不重新转录；否则从上传 + 转录开始把整条链路重跑一遍；
+- 旧纪要自动归档到 `archive/`（加时间戳），不会覆盖丢失；
+- `log/meetap.log` 接着往后写，每次开头一行 `===== 时间 · 命令 =====`，上一次为什么失败还看得到。
+
+**凭证过期、网络断一下，不用马上 again**：查凭证、上传、查转录进度、下载结果、认日历、生成纪要、发邮件，每一步失败了都会等着重试，间隔从 10 秒起逐次拉长，每一步最多等 15 分钟；你刷新 AWS 凭证、网络恢复以后，它自己接着跑完。通知只弹两次：断掉时第一次失败弹一次（能分辨出是凭证问题就直接说是凭证），15 分钟还不行、放弃时再弹一次，写明用 `meetap again <会话>` 重跑。不是凭证、也不是网络的报错（比如权限不够），试 3 次就停，不空等。
 
 ```bash
 meetap again                              # 续跑 / 重新生成最近一次会议
@@ -423,7 +426,7 @@ flowchart TB
 
 ### 6.2 云端处理：客户端直连 4 个托管服务
 
-音频采集到本地后，meetap CLI 作为唯一控制面，在一次 `meetap stop` 的命令生命周期内：上传、转录、生成纪要、（可选）发邮件、清理——**没有 Lambda、没有常驻基础设施，账户里不留临时资源**。
+音频采集到本地后，meetap CLI 作为唯一控制面，在一次 `meetap stop` 的命令生命周期内：上传、转录、生成纪要、（可选）发邮件、清理——**没有 Lambda、没有常驻基础设施，账户里不留临时资源**（例外：凭证、网络一直没恢复而放弃时，这一场的音频和转录任务先留在 AWS 上，等 `meetap again` 接着用，用完再清；清的时候只删这一场自己的文件）。
 
 
 
@@ -452,7 +455,7 @@ sequenceDiagram
     U->>S3: ③ 下载结果 JSON
     U->>BR: ④ ConverseStream (prompt + transcript)
     BR-->>U: 流式返回 meeting-notes.md
-    U->>S3: ⑤ 清理桶和转录任务
+    U->>S3: ⑤ 清理这一场的音频、结果和转录任务
 ```
 
 流式返回让纪要在眼前"慢慢长出来"，而不是等 30 秒才一次性出现。
@@ -468,6 +471,7 @@ sequenceDiagram
 | 首次 `start` 提示无系统音频权限 / 录音全静音 | 运行 `meetap setup` 完成 Process Tap 授权；或在系统设置 → 隐私与安全性 → 系统音频录制 中允许 |
 | 录出 **0 字节音频** / 转录报 `input file empty`（短会议偶发） | macOS Process Tap 的 IO 回调偶发不启动（`AudioDeviceStart` 成功但静默不喂数据），ffmpeg 收不到 PCM。**注意点阵波形读的是麦克风电平，此时仍会跳动，不代表在正常录音**。录音过程中 audio-tap 会自己盯着：有声音在放、tap 却一直没数据，就在进程内重建 tap，录音不中断。`start` 时 audio-tap 或 ffmpeg 起不来，会自动重试最多 3 次，仍失败则明确报错，按提示重跑 `meetap setup` 查授权或重新 `start` 即可 |
 | 转录失败：`AWS credentials not configured` | 跑 `aws configure` 或检查 `AWS_PROFILE` |
+| 弹通知"AWS 凭证可能过期了" / 日志里"凭证取不到或者已经过期" | 刷新 AWS 凭证就行，meetap 会自己接着跑，不用 again；每一步最多等 15 分钟。放弃了（第二次通知）就在凭证恢复以后跑通知里写的 `meetap again <会话>`，AWS 上已经转完的结果会直接拿来用 |
 | 转录失败：`AccessDenied` / `ValidationException` | 确认账号已开通 Bedrock Model access，且 IAM 有 `bedrock:InvokeModelWithResponseStream` 权限 |
 | 纪要生成卡在 "Generating meeting notes..." | 检查 `~/Record/.../log/meetap.log` 查看具体 AWS 报错 |
 | 音频采集有回声 | 戴耳机采集；外放会把扬声器声音二次采入 |
