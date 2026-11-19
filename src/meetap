@@ -1493,7 +1493,8 @@ summarize_transcript() {
         # 纪要末尾（签名前）加一行：对应日历里的哪场、怎么认的；邮件里的 html 由这份 md 生成
         calendar_footer_insert "$FINAL_OUTPUT"
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_DONE "$FINAL_OUTPUT")"
-        osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE)\" with title \"MeeTap\"" 2>/dev/null
+        local notes_name="${FINAL_OUTPUT##*/}"
+        osascript -e "display notification \"$(_tn NOTIFY_NOTES_DONE "${notes_name//\"/}")\" with title \"MeeTap\"" 2>/dev/null
         send_meeting_notes "$FINAL_OUTPUT" "$SESSION_DIR"
     else
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_FAILED)"

@@ -24,7 +24,7 @@ multi_language = false
 recording_dir = ~/Record
 # Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
 audio_bitrate = 128k
-# Keep local audio file after S3 upload (true=keep, false=delete after upload)
+# Keep the local audio file after transcription (true=keep, false=delete once the transcript is saved)
 audio_persist = true
 # Audio is always captured with Process Tap (macOS 14.4+); there is no capture setting.
 # Silent-recording alert: if an app is playing sound but the capture is all zeros,
