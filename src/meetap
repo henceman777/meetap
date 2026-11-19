@@ -1323,6 +1323,7 @@ import os, shutil, sys
 
 rec, apply_, include_no_audio = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1"
 DIAG = ("audio-tap.log", "speaker-stats.txt")   # 挪进 .meetap/；meetap.log 留在 log/
+SESSION_LIKE = __import__("re").compile(r'^(20\d{6}_\d{4}|\d{4}_\d{4})')
 
 def out(*f):
     print("\t".join(str(x).replace("\t", " ").replace("\n", " ") for x in f))
@@ -1357,9 +1358,13 @@ for root, dirs, files in os.walk(rec):
         sessions.setdefault(root, {})["json"] = os.path.join(root, "transcribe-raw.json")
     if os.path.isfile(os.path.join(root, ".meetap", "meetap.log")):   # 以前被挪进 .meetap/ 的排错日志
         sessions.setdefault(root, {})["back"] = True
+    # 根目录的 meta.json（以前的版本放这里）：只认会话目录——有 log/、有音频，或者文件夹名像会话
+    if "meta.json" in files and base not in ("log", "materials", "archive") and (
+            "log" in dirs or any(f.endswith(".m4a") for f in files) or SESSION_LIKE.match(base)):
+        sessions.setdefault(root, {})["meta"] = True
 
 sums = {"del_audio": [0, 0], "keep_noaudio": [0, 0], "del_noaudio": [0, 0], "keep_notranscript": [0, 0]}
-moved = moved_back = conflicts = 0
+moved = moved_back = moved_meta = conflicts = 0
 rows = []
 for session in sorted(sessions):
     info = sessions[session]
@@ -1399,26 +1404,38 @@ for session in sorted(sessions):
             if apply_:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.move(src, dst)
+    n_meta = 0
+    if info.get("meta"):
+        src = os.path.join(session, "meta.json")
+        dst = os.path.join(session, ".meetap", "meta.json")
+        if os.path.exists(dst):
+            n_conf += 1
+        else:
+            n_meta = 1
+            if apply_:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
     if apply_ and kind in ("del_audio", "del_noaudio"):
         os.remove(j)
     moved += n_move
     moved_back += n_back
+    moved_meta += n_meta
     conflicts += n_conf
-    if kind != "none" or n_move or n_conf or n_back:
-        rows.append((kind, rel, human(size), n_move, n_conf, n_back))
+    if kind != "none" or n_move or n_conf or n_back or n_meta:
+        rows.append((kind, rel, human(size), n_move, n_conf, n_back, n_meta))
 
 order = {"del_audio": 0, "keep_noaudio": 1, "del_noaudio": 1, "keep_notranscript": 2, "none": 3}
-for kind, rel, size, n_move, n_conf, n_back in sorted(rows, key=lambda r: (order[r[0]], r[1])):
-    out("item", kind, rel, size, n_move, n_conf, n_back)
+for kind, rel, size, n_move, n_conf, n_back, n_meta in sorted(rows, key=lambda r: (order[r[0]], r[1])):
+    out("item", kind, rel, size, n_move, n_conf, n_back, n_meta)
 b = sums["keep_noaudio"] if not include_no_audio else sums["del_noaudio"]
 out("sum", sums["del_audio"][0], human(sums["del_audio"][1]), b[0], human(b[1]),
-    sums["keep_notranscript"][0], human(sums["keep_notranscript"][1]), moved, conflicts, moved_back)
+    sums["keep_notranscript"][0], human(sums["keep_notranscript"][1]), moved, conflicts, moved_back, moved_meta)
 TIDYPY
 }
 
 # meetap tidy [--yes] [--include-no-audio]
 tidy_sessions() {
-    local apply=0 include=0 arg py line kind rel size nmove nconf nback group="" suffix
+    local apply=0 include=0 arg py line kind rel size nmove nconf nback nmeta group="" suffix
     for arg in "$@"; do
         case "$arg" in
             --yes)              apply=1 ;;
@@ -1432,7 +1449,7 @@ tidy_sessions() {
     while IFS=$'\t' read -r -a f; do
         case "${f[0]}" in
             item)
-                kind="${f[1]}"; rel="${f[2]}"; size="${f[3]}"; nmove="${f[4]}"; nconf="${f[5]}"; nback="${f[6]}"
+                kind="${f[1]}"; rel="${f[2]}"; size="${f[3]}"; nmove="${f[4]}"; nconf="${f[5]}"; nback="${f[6]}"; nmeta="${f[7]}"
                 if [[ "$kind" != "$group" ]]; then
                     group="$kind"
                     echo ""
@@ -1447,6 +1464,7 @@ tidy_sessions() {
                 suffix=""
                 (( nmove > 0 )) && suffix+="$(_tn TIDY_ITEM_MOVES "$nmove")"
                 (( nback > 0 )) && suffix+="$(_tn TIDY_ITEM_BACK)"
+                (( nmeta > 0 )) && suffix+="$(_tn TIDY_ITEM_META)"
                 (( nconf > 0 )) && suffix+="$(_tn TIDY_ITEM_CONFLICTS "$nconf")"
                 if [[ "$kind" == none ]]; then
                     suffix="${suffix#，}"; suffix="${suffix#, }"   # 去掉开头的逗号（中英两种写法）
@@ -1462,6 +1480,7 @@ tidy_sessions() {
                 (( ${f[5]} > 0 )) && _t TIDY_SUM_NOTRANSCRIPT "${f[5]}" "${f[6]}"
                 _t TIDY_SUM_MOVED "${f[7]}"
                 (( ${f[9]} > 0 )) && _t TIDY_SUM_BACK "${f[9]}"
+                (( ${f[10]} > 0 )) && _t TIDY_SUM_META "${f[10]}"
                 (( ${f[8]} > 0 )) && _t TIDY_SUM_CONFLICTS "${f[8]}"
                 echo ""
                 if (( apply )); then _t TIDY_DONE; else _t TIDY_DRY_HINT "$(basename "$0")"; fi
@@ -1889,7 +1908,8 @@ calendar_lookup_for_session() {
 
 # ── 会议标签（meta.json）与会话信息 ──
 # meetap [<会话>] -g 标签 / --untag 标签 / -g（列标签） / meetap <会话>（显示信息）
-# 标签存在会话目录最外层的 meta.json，不放 materials/（那里的东西会喂给模型）。
+# 标签存在会话的隐藏目录 .meetap/ 里的 meta.json（以前的版本放在会话根目录，读的时候兜底），
+# 不放 materials/（那里的东西会喂给模型）。
 # 以后会被菜单栏 app 调用：没有终端时不交互、不阻塞、不起后台进程。
 TAG_GUARD_HOURS=12   # 没写文件夹、没在录、最新一场早于这么多小时 → 有终端先确认，没终端直接拒绝
 
@@ -1913,8 +1933,16 @@ MONTH_RE = re.compile(r'^20\d{2}-\d{2}$')
 def out(*fields):
     print("\t".join(fields))
 
+# meta.json 在会话的隐藏目录 .meetap/ 里；以前的版本放在会话根目录。读的时候新位置优先、老位置兜底
+def meta_path(session_dir):
+    new = os.path.join(session_dir, ".meetap", "meta.json")
+    old = os.path.join(session_dir, "meta.json")
+    if os.path.exists(new) or not os.path.exists(old):
+        return new
+    return old
+
 def load(session_dir):
-    path = os.path.join(session_dir, "meta.json")
+    path = meta_path(session_dir)
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as f:
@@ -1927,7 +1955,11 @@ def load(session_dir):
     return data
 
 def write(session_dir, data):
-    fd, tmp = tempfile.mkstemp(prefix=".meta.", suffix=".tmp", dir=session_dir)
+    diag = os.path.join(session_dir, ".meetap")
+    os.makedirs(diag, exist_ok=True)
+    new, old = os.path.join(diag, "meta.json"), os.path.join(session_dir, "meta.json")
+    had_new = os.path.exists(new)
+    fd, tmp = tempfile.mkstemp(prefix=".meta.", suffix=".tmp", dir=diag)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1935,13 +1967,17 @@ def write(session_dir, data):
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, 0o644)
-        os.replace(tmp, os.path.join(session_dir, "meta.json"))
+        os.replace(tmp, new)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+    # 根目录的老文件刚才已经读进来、一起写进新位置了，删掉不留两份。
+    # 两处本来都有（不是我们挪的）就不动，交给 meetap tidy 列出来
+    if not had_new and os.path.exists(old):
+        os.remove(old)
 
 def sessions(rec):
     try:
@@ -2229,11 +2265,16 @@ _tag_guard() {
     return 1
 }
 
+# 这场会的 meta.json 在哪（新位置 .meetap/ 优先，没有再看根目录的老文件；报错提示用）
+_meta_file() {
+    if [[ -f "$1/.meetap/meta.json" || ! -f "$1/meta.json" ]]; then printf '%s' "$1/.meetap/meta.json"; else printf '%s' "$1/meta.json"; fi
+}
+
 _meta_error() {
     case "$1" in
-        badjson)  _t ERR_META_BAD "$2/meta.json" ;;
+        badjson)  _t ERR_META_BAD "$(_meta_file "$2")" ;;
         nopython) _t ERR_META_NO_PYTHON ;;
-        *)        _t ERR_META_IO "$2/meta.json" "${3:-}" ;;
+        *)        _t ERR_META_IO "$(_meta_file "$2")" "${3:-}" ;;
     esac
 }
 

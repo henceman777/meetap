@@ -59,7 +59,8 @@ CAL="$S/materials/calendar.md"
 START=1794974466   # 2026-11-18 12:01:06 +08:00
 END=$((START + 51 * 60))
 lookup() { rm -f "$CAL" "$FAKE/calls.log"; OUT=$(cd "$TMP" && "$MEETAP" _calendar-lookup "$S" "$START" "$END" </dev/null 2>&1); RC=$?; }
-meta_cal() { python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("calendar"), ensure_ascii=False, sort_keys=True))' "$S/meta.json" 2>/dev/null; }
+M="$S/.meetap/meta.json"   # 第一次写以后，根目录的老 meta.json 就挪到这里
+meta_cal() { python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("calendar"), ensure_ascii=False, sort_keys=True))' "$M" 2>/dev/null; }
 
 # ── 假数据：一场 12 人的会，正文里带 Chime / Zoom / Teams / 腾讯会议四种入会信息 ──
 python3 -I - "$FAKE/query.json" "$FAKE" <<'PYEOF'
@@ -154,7 +155,8 @@ grep -q '@' "$CAL" && fail "calendar.md 里出现了邮箱" || pass "calendar.md
 
 # ── 4. meta.json：calendar 字段对，tags 和不认识的字段原样保留 ──
 cal=$(meta_cal)
-python3 -I - "$S/meta.json" <<'PYEOF' && pass "meta.json 的 calendar 字段对，tags 和不认识的字段还在" || fail "meta.json 不对: $(cat "$S/meta.json")"
+[[ -f "$M" && ! -e "$S/meta.json" ]] && pass "根目录的老 meta.json 挪进了 .meetap/，不留两份" || fail "meta.json 位置: $(ls -A "$S")"
+python3 -I - "$M" <<'PYEOF' && pass "meta.json 的 calendar 字段对，tags 和不认识的字段还在" || fail "meta.json 不对: $(cat "$M")"
 import json, sys
 d = json.load(open(sys.argv[1]))
 c = d["calendar"]
@@ -164,7 +166,7 @@ assert c["start"] == "2026-11-18T12:00:00+08:00" and c["end"] == "2026-11-18T13:
 assert c["candidates"] == ["迁移 office hour"] and c["looked_up_at"]
 PYEOF
 grep -q 'office hour' "$CAL" && fail "候选会议写进了 calendar.md" || pass "候选只进 meta.json，不进 calendar.md"
-python3 -m json.tool "$S/meta.json" >/dev/null && pass "meta.json 是合法 JSON" || fail "meta.json 坏了"
+python3 -m json.tool "$M" >/dev/null && pass "meta.json 是合法 JSON" || fail "meta.json 坏了"
 [[ -z "$(find "$S" -name '.calendar.*' -o -name '.meta.*')" ]] && pass "写完不留临时文件" || fail "有残留临时文件"
 
 # ── 5. 超过 30 人：只留组织者、前 20 位和总人数；必选在可选前面 ──
@@ -178,11 +180,11 @@ n=$(printf '%s' "${line#*：*：}" | tr '、' '\n' | grep -c .)
 cp "$FAKE/query-small.json" "$FAKE/query.json"
 
 # ── 6. 查不到：不写文件、不报错、不改 meta.json，只记一行日志 ──
-cp "$S/meta.json" "$TMP/meta.before"
+cp "$M" "$TMP/meta.before"
 scenario() {   # scenario <说明> <期望日志片段> ：$FAKE/query.json 已就位
     lookup
     if [[ $RC -eq 0 && ! -e "$CAL" && "$OUT" == *"$2"* && $(printf '%s\n' "$OUT" | grep -c .) -le 1 ]] \
-       && cmp -s "$S/meta.json" "$TMP/meta.before"; then
+       && cmp -s "$M" "$TMP/meta.before"; then
         pass "$1：不写文件、不改 meta.json、退出码 0"
     else
         fail "$1 (rc=$RC): $OUT"
@@ -261,12 +263,12 @@ OUT=$(cd "$TMP" && "$MEETAP" -g </dev/null 2>&1)
 OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 -g </dev/null 2>&1)
 [[ "$OUT" == *"日历标题：架构周会，要贴的话：meetap 20261118_1201 -g 架构周会"* ]] \
     && pass "meetap <文件夹> -g：建议的命令里带上文件夹" || fail "指定文件夹的建议: $OUT"
-python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["tags"] == ["周会"]' "$S/meta.json" \
-    && pass "只提示，没有自动贴标签" || fail "被自动贴了标签: $(cat "$S/meta.json")"
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["tags"] == ["周会"]' "$M" \
+    && pass "只提示，没有自动贴标签" || fail "被自动贴了标签: $(cat "$M")"
 (cd "$TMP" && "$MEETAP" 20261118_1201 -g 架构周会 </dev/null >/dev/null 2>&1)
 OUT=$(cd "$TMP" && "$MEETAP" 20261118_1201 -g </dev/null 2>&1)
 [[ "$OUT" != *"日历标题："* ]] && pass "日历标题已经是标签了就不再提示" || fail "还在提示: $OUT"
-python3 -I - "$S/meta.json" <<'PYEOF'
+python3 -I - "$M" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1])); d["calendar"]["title"] = "Weekly Sync"; d["tags"] = ["周会"]
 json.dump(d, open(sys.argv[1], "w"), ensure_ascii=False)

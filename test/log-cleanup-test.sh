@@ -152,6 +152,10 @@ mk "$R2/20261105_0900/meeting_20261105_090005.m4a"; mk "$R2/20261105_0900/log/tr
 mk "$R2/20261105_0900/.meetap/meetap.log" 11
 # G：新会话转录失败时故意留在 .meetap/ 的原始结果
 mk "$R2/20261104_0900/meeting_20261104_090005.m4a"; mk "$R2/20261104_0900/.meetap/transcribe-raw.json" 512
+# I：根目录还放着老的 meta.json；J：两处都有
+mk "$R2/20261106_0900/meeting_20261106_090005.m4a"; mk "$R2/20261106_0900/log/transcript.txt"
+printf '{"schema": 1, "tags": ["周会"]}\n' > "$R2/20261106_0900/meta.json"
+mk "$R2/20261107_0900/log/transcript.txt"; mk "$R2/20261107_0900/meta.json" 5; mk "$R2/20261107_0900/.meetap/meta.json" 6
 # recording_dir 以外的目录（比如 ~/Record-2）
 mk "$TMP/Record-2/20261101_0900/log/transcribe-raw.json"; mk "$TMP/Record-2/20261101_0900/log/transcript.txt"
 printf 'recording_dir = %s\nlanguage = zh-CN\ncalendar = off\n' "$R2" > "$XDG_CONFIG_HOME/meetap/config"
@@ -172,10 +176,13 @@ tidy
 [[ "$OUT" == *"有音频的会话：2 场，删掉 transcribe-raw.json 能腾出 7 KB"* \
    && "$OUT" == *"没有音频的会话：2 场，transcribe-raw.json 合计 7 KB，默认不删"* ]] \
     && pass "最后两行写明两组各能腾出多少" || fail "汇总: $OUT"
-[[ "$OUT" == *"挪进 .meetap/ 的诊断文件：3 个"* && "$OUT" == *"1 个诊断文件在 .meetap/ 里已有同名文件"* && "$OUT" == *"tidy --yes"* ]] \
+[[ "$OUT" == *"挪进 .meetap/ 的诊断文件：3 个"* && "$OUT" == *"2 个诊断文件在 .meetap/ 里已有同名文件"* && "$OUT" == *"tidy --yes"* ]] \
     && pass "写明要挪几个、冲突几个，并提示确认后加 --yes（meetap.log 不挪）" || fail "挪动汇总: $OUT"
 [[ "$OUT" == *"20261105_0900：meetap.log 挪回 log/"* && "$OUT" == *"挪回 log/ 的 meetap.log：1 个"* ]] \
     && pass "以前挪进 .meetap/ 的 meetap.log 列为挪回 log/" || fail "挪回: $OUT"
+[[ "$OUT" == *"20261106_0900：meta.json 挪进 .meetap/"* && "$OUT" == *"挪进 .meetap/ 的 meta.json：1 个"* \
+   && "$OUT" == *"20261107_0900：1 个在 .meetap/ 里已有同名文件、跳过"* ]] \
+    && pass "根目录的 meta.json 列为挪进 .meetap/；两处都有的列为跳过" || fail "meta.json 清单: $OUT"
 [[ "$OUT" != *"Record-2"* && "$OUT" != *"20261104_0900"* ]] && pass "不碰 recording_dir 以外的目录，也不碰 .meetap/ 里留下的原始结果" || fail "扫到了不该扫的: $OUT"
 
 # 5b. --yes：有音频的删 JSON；没有音频的、没有转录的留着；诊断文件挪进 .meetap/
@@ -193,6 +200,10 @@ tidy --yes
     && pass "--yes：以前挪进 .meetap/ 的 meetap.log 挪回了 log/" || fail "没挪回 log/"
 [[ -f "$R2/20261103_0900/log/speaker-stats.txt" && $(wc -c < "$R2/20261103_0900/.meetap/speaker-stats.txt") -eq 9 ]] \
     && pass "--yes：.meetap/ 里已有同名文件的没挪、没覆盖" || fail "冲突处理不对"
+[[ -f "$R2/20261106_0900/.meetap/meta.json" && ! -e "$R2/20261106_0900/meta.json" ]] \
+    && grep -q '周会' "$R2/20261106_0900/.meetap/meta.json" && pass "--yes：根目录的 meta.json 挪进 .meetap/，内容不变" || fail "meta.json 没挪"
+[[ $(wc -c < "$R2/20261107_0900/meta.json") -eq 5 && $(wc -c < "$R2/20261107_0900/.meetap/meta.json") -eq 6 ]] \
+    && pass "--yes：两处都有 meta.json 的不动、不覆盖" || fail "两处都有的被动了"
 [[ -f "$R2/20261104_0900/.meetap/transcribe-raw.json" ]] && pass "--yes：转录失败时留下的原始结果没动" || fail ".meetap/ 里的原始结果被删了"
 keep_after=$(cd "$TMP" && find rec2 -type f \( -name '*.m4a' -o -name '*.md' -o -path '*/materials/*' -o -name 'transcript.txt' \) -exec md5 -r {} + | sort)
 [[ "$keep_after" == "$keep_before" ]] && pass "--yes：音频、纪要、materials/、转录文本一个字节都没动" || fail "动了不该动的文件"
