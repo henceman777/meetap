@@ -21,6 +21,7 @@ CFG_AUDIO_PERSIST=true
 CFG_AUDIO_CAPTURE="auto"   # 2.0 起只用 Process Tap；留着这一项只为认出老配置并提示删掉
 # 静音报警不算「有声音在放」的进程：这些 App 一直开着输出流、放的却是静音（实测 WorkSpaces）
 CFG_ZERO_ALERT_IGNORE="com.amazon.workspaces"
+CFG_CALENDAR="on"   # 停止录音后读系统日历补充会议信息：on / off（off 时完全不碰日历）
 CFG_EMAIL=""
 CFG_EMAIL_SENDER=""
 
@@ -82,6 +83,7 @@ load_config() {
             audio_persist)         CFG_AUDIO_PERSIST="$val" ;;
             audio_capture)         CFG_AUDIO_CAPTURE="$val" ;;
             zero_alert_ignore)     CFG_ZERO_ALERT_IGNORE="$val" ;;
+            calendar)              CFG_CALENDAR="$val" ;;
             email)                 CFG_EMAIL="$val" ;;
             email_sender)          CFG_EMAIL_SENDER="$val" ;;
         esac
@@ -396,6 +398,9 @@ transcribe_recording() {
         osascript -e "display notification \"$(_tn NOTIFY_RECORDING_SILENT)\" with title \"MeeTap\"" 2>/dev/null
         return 1
     fi
+
+    # 日历：按录音时段找对应的会，写 materials/calendar.md（查不到就跳过，最多十几秒）
+    calendar_lookup_for_session "$SESSION_DIR"
 
     if ! command -v aws &>/dev/null; then
         _t ERR_AWS_CLI_MISSING
@@ -1340,6 +1345,7 @@ again_session() {
         _t AGAIN_FROM_NOTES
         {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
+            calendar_lookup_for_session "$SESSION_DIR"
             summarize_transcript "$SESSION_DIR"
         } 2>&1 | tee -a "$LOG_DIR/meetap.log"
     else
@@ -1472,6 +1478,238 @@ PYEOF
     rm -f "$PROMPT_FILE" "$LLM_OUT"
 }
 
+# ── 日历：停止录音后按录音时段找对应的会（第三批）──
+# 匹配在 audio-multi-output calendar-query 里做（它只在已经完全授权时读、绝不请求授权）；
+# 这里负责：去掉入会信息、截断参会人、写 materials/calendar.md、把摘要写进 meta.json。
+# 查不到——没授权、没同步、没匹配到、超时、出错——都跳过，不写文件、不报错，只记一行日志，
+# 不耽误转录和生成纪要。calendar.md 是给模型看的资料，和纪要一样固定用中文写。
+CALENDAR_TIMEOUT=10
+
+# 处理 calendar-query 的 JSON（stdin）。argv：会话目录、录音开始 / 结束（epoch 秒）。
+# 输出 TSV：result\t状态\t…（给日志用），匹配到时再输出 meta\t<calendar 字段的 JSON>
+_calendar_py() {
+    cat <<'CALPY'
+import json, os, re, sys, tempfile
+from datetime import datetime
+
+# ── 去掉入会信息：会议链接、会议号、密码、电话拨入。各家邀请模板五花八门，宁可多删 ──
+URL_RE = re.compile(r'<?\b(?:https?|ftp)://[^\s<>"]+>?', re.I)
+BARE_URL_RE = re.compile(r'\b(?:[\w-]+\.)*(?:chime\.aws|zoom\.(?:us|com)|teams\.(?:microsoft|live)\.com|'
+                         r'meet\.google\.com|webex\.com|meeting\.tencent\.com|voovmeeting\.com|feishu\.cn|'
+                         r'larksuite\.com|dingtalk\.com)(?:/\S*)?', re.I)
+# 有这些词的整行删掉
+STRONG_RE = re.compile(r'(?i)(meeting\s*(id|number|code)|webinar\s*id|会议\s*(号|id|码|密码)|conference\s*id|'
+                       r'access\s*code|pass\s*code|password|\bpwd\b|密码|口令|\bpin\b|\bdial\b|dial[- ]?in|拨入|'
+                       r'one[- ]tap|tap to join|join by phone|电话入会|拨号|一键入会|local number|international numbers|toll[- ]free)')
+# 「入会」类的词，配上链接或会议平台名才删（免得把「请大家准时参加」这类议程删掉）
+JOIN_RE = re.compile(r'(?i)(\bjoin\b|入会|加入会议|会议链接|meeting link|click here)')
+PLATFORM_RE = re.compile(r'(?i)(chime|zoom|teams|webex|google meet|腾讯会议|voov|飞书|lark|钉钉|meeting|会议|web|computer|mobile|phone|电话)')
+# 像电话号码 / 会议号的数字串：+ 开头的号码、3-4-4 分组的 9 位以上数字、连续 9 位以上数字、,,123# 拨号串
+NUMBER_RE = re.compile(r'(\+\d[\d\s().-]{6,}\d|\b\d{3}[\s-]?\d{3,4}[\s-]?\d{3,4}\b|\b\d{9,}\b|,,\d+#?)')
+# Teams 等：两条长下划线分隔线之间是整段入会信息。只认下划线——议程里用 ---- / ==== 分节的，
+# 两条一配对就会把中间的议程整段删掉
+SEP_RE = re.compile(r'^\s*_{20,}\s*$')
+PUNCT = ' \t:：-–—|·•,，;；()（）[]【】<>'
+# 正文里写着的邮箱只留 @ 前面那段（会进纪要和邮件）
+EMAIL_RE = re.compile(r'(?:mailto:)?([\w.+-]+)@[\w-]+(?:\.[\w-]+)+', re.I)
+
+def scrub(text):
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    seps = [i for i, l in enumerate(lines) if SEP_RE.match(l)]
+    drop = set(seps)
+    for a, b in zip(seps[0::2], seps[1::2]):
+        drop.update(range(a, b + 1))
+    out = []
+    for i, l in enumerate(lines):
+        if i in drop:
+            continue
+        had_url = bool(URL_RE.search(l) or BARE_URL_RE.search(l))
+        if STRONG_RE.search(l) or NUMBER_RE.search(l):
+            continue
+        if JOIN_RE.search(l) and (had_url or PLATFORM_RE.search(l)):
+            continue
+        rest = BARE_URL_RE.sub("", URL_RE.sub("", l)).rstrip()
+        if had_url and not rest.strip(PUNCT):
+            continue
+        out.append(EMAIL_RE.sub(lambda e: e.group(1), rest))
+    res = []
+    for l in out:                       # 连续空行合并成一行，首尾空行去掉
+        if not l.strip():
+            if res and res[-1] == "":
+                continue
+            res.append("")
+        else:
+            res.append(l)
+    while res and res[0] == "":
+        res.pop(0)
+    while res and res[-1] == "":
+        res.pop()
+    return "\n".join(res)
+
+def scrub_location(loc):
+    # 只剥首尾的分隔符，不剥括号（「会议室 A (演示楼 101)」要原样留着）
+    parts = [scrub(x).replace("\n", " ").strip(" \t:：-–—|·•,，;；") for x in re.split(r"[;\n；]", loc or "")]
+    return "; ".join(x for x in parts if x)
+
+def name_of(p):
+    # 没有名字时只用邮箱 @ 前面那段，calendar.md 里不出现完整邮箱
+    return ((p or {}).get("name") or "").strip() or ((p or {}).get("email") or "").split("@")[0].strip()
+
+def parse_time(iso):
+    try:
+        return datetime.fromisoformat(iso).astimezone()
+    except (TypeError, ValueError):
+        return None
+
+def out(*fields):
+    print("\t".join(str(f).replace("\t", " ").replace("\n", " ") for f in fields))
+
+def main():
+    session_dir, rec_start, rec_end = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+    raw = sys.stdin.read()
+    if not raw.strip():
+        out("result", "error", "no output")
+        return
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        out("result", "error", "bad json")
+        return
+    if not isinstance(d, dict):
+        out("result", "error", "bad json")
+        return
+    status = d.get("status")
+    if status == "not_authorized":
+        out("result", "not_authorized", d.get("auth", ""))
+        return
+    if status != "ok":
+        out("result", status if status in ("timeout", "error") else "error", d.get("message", ""))
+        return
+    m = d.get("match")
+    if not isinstance(m, dict) or not (m.get("title") or "").strip():
+        out("result", "none")
+        return
+
+    title = m["title"].strip()
+    org = m.get("organizer") or {}
+    org_name, org_email = name_of(org), (org.get("email") or "").lower()
+    # 只列人：会议室、设备这类资源不算参会人；组织者单独一行，不在参会人里重复
+    people = [a for a in m.get("attendees") or [] if a.get("type", "person") not in ("room", "resource")]
+    def is_org(a):
+        return bool(org_email and (a.get("email") or "").lower() == org_email) or bool(org_name and name_of(a) == org_name)
+    rank = {"chair": 0, "required": 1, "unknown": 2, "optional": 3, "nonParticipant": 4}
+    others = sorted([a for a in people if not is_org(a)], key=lambda a: rank.get(a.get("role"), 2))
+    total = len(others) + (1 if org_name else 0)
+    names = [n for n in (name_of(a) for a in others) if n]
+
+    st, en = parse_time(m.get("start")), parse_time(m.get("end"))
+    rs, rend = datetime.fromtimestamp(rec_start).astimezone(), datetime.fromtimestamp(rec_end).astimezone()
+    lines = ["# 日历里的这场会", "",
+             "> 来自系统日历，是会前的安排，实际讨论以录音为准。入会链接、会议号、密码、拨入电话已去掉。", "",
+             "- 标题：" + title]
+    if st and en:
+        end_fmt = "%H:%M" if en.date() == st.date() else "%Y-%m-%d %H:%M"
+        lines.append("- 时间：%s–%s（录音 %s–%s）" % (st.strftime("%Y-%m-%d %H:%M"), en.strftime(end_fmt),
+                                                  rs.strftime("%H:%M"), rend.strftime("%H:%M")))
+    if org_name:
+        lines.append("- 组织者：" + org_name)
+    if total > 30:
+        lines.append("- 参会人：共 %d 人，下面只列组织者和前 20 位：%s" % (total, "、".join(names[:20])))
+    elif names:
+        lines.append("- 参会人（%d 人）：%s" % (total, "、".join(names)))
+    loc = scrub_location(m.get("location"))
+    if loc:
+        lines.append("- 地点：" + loc)
+    notes = scrub(m.get("notes"))
+    if notes:
+        lines += ["", "## 会议说明", "", notes]
+    text = "\n".join(lines) + "\n"
+
+    mdir = os.path.join(session_dir, "materials")
+    os.makedirs(mdir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".calendar.", suffix=".tmp", dir=mdir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(mdir, "calendar.md"))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    cal = {"title": title, "start": m.get("start", ""), "end": m.get("end", ""),
+           "organizer": org_name, "attendee_count": total,
+           "candidates": [c.get("title", "") for c in d.get("candidates") or [] if isinstance(c, dict) and c.get("title")],
+           "looked_up_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    out("meta", json.dumps(cal, ensure_ascii=False))
+    out("result", "matched", title, int(m.get("overlap_sec", 0)) // 60)
+
+main()
+CALPY
+}
+
+# _run_with_timeout <秒> <命令…>：命令在自己的进程组里跑，到时连同子进程一起杀掉（退出码 124）
+_run_with_timeout() {
+    perl -e '
+        my $t = shift;
+        my $pid = fork;
+        die "fork: $!" unless defined $pid;
+        if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127; }
+        $SIG{ALRM} = sub { kill "KILL", -$pid; waitpid($pid, 0); exit 124 };
+        alarm $t;
+        waitpid($pid, 0);
+        exit($? >> 8);
+    ' "$@"
+}
+
+# calendar_lookup <会话目录> <录音开始 epoch> <录音结束 epoch>：结果只输出一行日志
+calendar_lookup() {
+    local dir="$1" start="$2" end="$3" out py kind a b c msg
+    [[ "$CFG_CALENDAR" == "on" && -x "$TOOL" ]] || return 0
+    py="$VENV_PYTHON"; [[ -x "$py" ]] || py="$(command -v python3)"
+    [[ -n "$py" ]] || return 0
+    # 查询程序自己 10 秒超时；万一卡死，外面 12 秒强杀。放进单独的进程组、超时杀整个组：
+    # 只杀它本身的话，它要是起了子进程，子进程还占着输出管道，这里就得一直等下去
+    out=$(_run_with_timeout $((CALENDAR_TIMEOUT + 2)) \
+        "$TOOL" calendar-query --start "$start" --end "$end" --timeout "$CALENDAR_TIMEOUT" </dev/null 2>/dev/null)
+    while IFS=$'\t' read -r kind a b c; do
+        case "$kind" in
+            meta) _meta calendar-set "$dir" "$a" >/dev/null 2>&1 ;;
+            result)
+                case "$a" in
+                    matched)        msg=$(_tn CAL_LOG_MATCHED "$b" "$c") ;;
+                    none)           msg=$(_tn CAL_LOG_NONE) ;;
+                    not_authorized) msg=$(_tn CAL_LOG_NOT_AUTHORIZED "$b" "$(basename "$0")") ;;
+                    timeout)        msg=$(_tn CAL_LOG_TIMEOUT) ;;
+                    *)              msg=$(_tn CAL_LOG_ERROR "$b") ;;
+                esac
+                echo "[$(date '+%H:%M:%S')] $msg"
+                ;;
+        esac
+    done < <(printf '%s' "$out" | "$py" -I -c "$(_calendar_py)" "$dir" "$start" "$end" 2>/dev/null)
+    return 0
+}
+
+# 按会话里的音频算录音时段（开始 = 文件名 meeting_YYYYMMDD_HHMMSS，结束 = 开始 + 音频时长）再查。
+# 转录开始前（stop 的后台流程、again 从转录重跑）和 again 只重跑纪要时调用；
+# materials/calendar.md 已经有了（查过，或用户自己放的）就不再查、不覆盖。
+calendar_lookup_for_session() {
+    local dir="$1" audio base start dur
+    [[ "$CFG_CALENDAR" == "on" ]] || return 0
+    [[ -e "$dir/materials/calendar.md" ]] && return 0
+    audio=$(find "$dir" -maxdepth 1 -name "meeting_*.m4a" | sort | tail -1)
+    base="${audio##*/}"
+    [[ "$base" =~ ^meeting_([0-9]{8}_[0-9]{6})\.m4a$ ]] || return 0
+    start=$(date -j -f "%Y%m%d_%H%M%S" "${BASH_REMATCH[1]}" +%s 2>/dev/null) || return 0
+    dur=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$audio" </dev/null 2>/dev/null)
+    dur="${dur%%.*}"
+    [[ "$dur" =~ ^[0-9]+$ && "$dur" -gt 0 ]] || return 0
+    calendar_lookup "$dir" "$start" "$((start + dur))"
+}
+
 # ── 会议标签（meta.json）与会话信息 ──
 # meetap [<会话>] -g 标签 / --untag 标签 / -g（列标签） / meetap <会话>（显示信息）
 # 标签存在会话目录最外层的 meta.json，不放 materials/（那里的东西会喂给模型）。
@@ -1483,6 +1721,8 @@ TAG_GUARD_HOURS=12   # 没写文件夹、没在录、最新一场早于这么多
 #   update <会话目录> <recording_dir> (--add 标签 | --remove 标签)…
 #       → 先输出相近标签提示（similar），再逐条输出 added/dup/removed/absent，最后 tags
 #   all <recording_dir>                               → 每行 "场数\t标签"，场数从多到少
+#   calendar-set <会话目录> <JSON>                     → 写 calendar 字段（第三批：日历信息）
+#   get 另外输出 "calendar\t标题\t开始\t结束"（有 calendar 字段时）
 # 统计范围：recording_dir 第一层的会话 + 20YY-MM 月份文件夹里的会话（用户按月手工挪老会议）。
 # 不认识的字段原样保留；写入先写同目录临时文件再改名；meta.json 读不了时输出 error，不覆盖。
 _meta_py() {
@@ -1602,11 +1842,34 @@ def cmd_update(session_dir, rec, ops):
         write(session_dir, data)
     out("tags", *tags)
 
+def one_line(v):
+    return str(v).replace("\t", " ").replace("\n", " ").replace("\r", " ").strip()
+
+def cmd_calendar_set(session_dir, cal_json):
+    data = load(session_dir)
+    cal = json.loads(cal_json)
+    if not isinstance(cal, dict):
+        raise ValueError("calendar is not an object")
+    if not data:
+        data = {"schema": 1, "session": os.path.basename(session_dir)}
+    data.setdefault("schema", 1)
+    data.setdefault("session", os.path.basename(session_dir))
+    data["calendar"] = cal
+    data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    write(session_dir, data)
+    out("ok")
+
 def main(argv):
     cmd = argv[1]
     try:
         if cmd == "get":
-            out("tags", *load(argv[2]).get("tags", []))
+            data = load(argv[2])
+            out("tags", *data.get("tags", []))
+            cal = data.get("calendar")
+            if isinstance(cal, dict) and isinstance(cal.get("title"), str) and cal["title"].strip():
+                out("calendar", one_line(cal["title"]), one_line(cal.get("start", "")), one_line(cal.get("end", "")))
+        elif cmd == "calendar-set":
+            cmd_calendar_set(argv[2], argv[3])
         elif cmd == "update":
             rest = argv[4:]
             cmd_update(argv[2], argv[3], list(zip(rest[0::2], rest[1::2])))
@@ -1635,14 +1898,17 @@ _meta() {
     "$py" -I -c "$(_meta_py)" "$@" </dev/null
 }
 
-# 读一场会的标签到 SESSION_TAGS 数组；meta.json 读不了时返回 1
+# 读一场会的标签到 SESSION_TAGS 数组，日历标题到 SESSION_CAL_TITLE / _START / _END；
+# meta.json 读不了时返回 1
 _read_tags() {
     local line f ok=1
     SESSION_TAGS=()
+    SESSION_CAL_TITLE=""; SESSION_CAL_START=""; SESSION_CAL_END=""
     while IFS= read -r line; do
         IFS=$'\t' read -r -a f <<< "$line"
         case "${f[0]}" in
             tags) SESSION_TAGS=("${f[@]:1}"); ok=0 ;;
+            calendar) SESSION_CAL_TITLE="${f[1]}"; SESSION_CAL_START="${f[2]:-}"; SESSION_CAL_END="${f[3]:-}" ;;
         esac
     done < <(_meta get "$1")
     return $ok
@@ -1827,6 +2093,21 @@ _tag_update() {
     return 0
 }
 
+# 日历标题当标签建议（_read_tags 之后调用）：标题还不是这场的标签、也能当标签用时才提示
+_suggest_calendar_tag() {
+    local dir="$1" explicit="$2" title="$SESSION_CAL_TITLE" low t cmd
+    [[ -n "$title" ]] || return 0
+    _check_tag "$title" >/dev/null 2>&1 || return 0
+    title="$TAG_VALUE"
+    low=$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')
+    for t in "${SESSION_TAGS[@]}"; do
+        [[ "$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')" == "$low" ]] && return 0
+    done
+    cmd="$(basename "$0")"
+    [[ "$explicit" == true ]] && cmd+=" $(_shell_word "$(_session_ref "$dir")")"
+    _t TAGLIST_CAL_SUGGEST "$title" "$cmd -g $(_shell_word "$title")"
+}
+
 # 列出这场的标签，以及用过的全部标签和各自的场数
 _tag_list() {
     local dir="$1" explicit="$2" recording="$3" prefix="" cur n t
@@ -1836,6 +2117,7 @@ _tag_list() {
         if [[ "$recording" == true ]]; then prefix=$(_tn TARGET_RECORDING); else prefix=$(_tn TARGET_LATEST); fi
     fi
     _t TAGLIST_SESSION "$prefix" "$(_session_brief "$dir" "$recording")" "$cur"
+    _suggest_calendar_tag "$dir" "$explicit"
     while IFS=$'\t' read -r n t; do
         [[ "$n" =~ ^[0-9]+$ ]] || continue
         nums+=("$n"); names+=("$t")
@@ -1851,11 +2133,22 @@ _tag_list() {
 }
 
 # meetap <会话>：显示这场会的信息，不开录
-_session_info() {
-    local dir="$1" recording="$2" b="${1##*/}" rel title tags rd
+# 会话的写法：在 recording_dir 下就写相对路径（20261118_1201、2026-10/20261008_1046），否则写全路径
+_session_ref() {
+    local rd
     rd="$(cd -- "$RECORDING_DIR" 2>/dev/null && pwd)"
-    rel="$dir"
-    [[ -n "$rd" && "$dir" == "$rd/"* ]] && rel="${dir#"$rd/"}"
+    if [[ -n "$rd" && "$1" == "$rd/"* ]]; then printf '%s' "${1#"$rd/"}"; else printf '%s' "$1"; fi
+}
+
+# 日历时段的短写法：12:00–13:00（取 ISO 时间里的时分）
+_cal_span() {
+    [[ -n "$1" && -n "$2" ]] || return 0
+    printf '%s–%s' "${1:11:5}" "${2:11:5}"
+}
+
+_session_info() {
+    local dir="$1" recording="$2" b="${1##*/}" rel title tags
+    rel=$(_session_ref "$dir")
     title=$(_notes_title "$dir")
     if _read_tags "$dir"; then tags=$(_join_tags "${SESSION_TAGS[@]}"); else tags=$(_tn META_UNREADABLE); fi
     _t INFO_HEADER "$rel"
@@ -1867,6 +2160,7 @@ _session_info() {
     fi
     if [[ -n "$title" ]]; then _t INFO_NOTES "$title"; else _t INFO_NO_NOTES; fi
     _t INFO_TAGS "$tags"
+    [[ -n "$SESSION_CAL_TITLE" ]] && _t INFO_CALENDAR "$SESSION_CAL_TITLE" "$(_cal_span "$SESSION_CAL_START" "$SESSION_CAL_END")"
     if [[ "$recording" == true ]]; then _t INFO_STATE_RECORDING; else _t INFO_STATE_ENDED; fi
 }
 
@@ -2105,9 +2399,23 @@ _warn_old_capture_config() {
     return 0
 }
 
+# BlackHole 的驱动文件还在不在（.driver 装在 HAL 插件目录里）。brew 卸载后驱动文件没了，
+# 但 coreaudiod 没重启的话设备列表里还挂着 BlackHole 2ch——只看设备列表会误以为还装着。
+# MEETAP_HAL_PLUGIN_DIRS 只给测试用（冒号分隔），用来模拟两种情况，不碰系统目录。
+_blackhole_driver_installed() {
+    local dirs="${MEETAP_HAL_PLUGIN_DIRS:-/Library/Audio/Plug-Ins/HAL:$HOME/Library/Audio/Plug-Ins/HAL}" d f
+    local IFS=:
+    for d in $dirs; do
+        for f in "$d"/BlackHole*.driver; do
+            [[ -e "$f" ]] && return 0
+        done
+    done
+    return 1
+}
+
 # setup：会议 App 的扬声器是不是还指着 BlackHole（只读，不改任何 App 的配置）。
 # Zoom 的设置在 viper.ini 里（设备名的十六进制）读得出来；Teams、腾讯会议读不到配置，
-# 系统里还装着 BlackHole 时提示一句怎么检查。
+# 设备列表里还有 BlackHole 时提示一句怎么检查——驱动还在、和驱动已删但设备还挂着，说法不同。
 _check_meeting_apps() {
     local ini="$HOME/Library/Application Support/zoom.us/data/viper.ini" k v name zoom_bh=""
     if [[ -f "$ini" ]]; then
@@ -2119,7 +2427,11 @@ _check_meeting_apps() {
         [[ -n "$zoom_bh" ]] && _t MIGRATE_ZOOM_ON_BH "$zoom_bh"
     fi
     if [[ -x "$TOOL" ]] && "$TOOL" list 2>/dev/null | grep -q 'BlackHole'; then
-        _t MIGRATE_APPS_BH_HINT
+        if _blackhole_driver_installed; then
+            _t MIGRATE_APPS_BH_HINT
+        else
+            _t MIGRATE_BH_UNINSTALLED_HINT
+        fi
     fi
 }
 
@@ -2644,6 +2956,55 @@ setup_tap() {
     return 1
 }
 
+# 当前终端 App 的名字（权限是授给它的）：TERM_PROGRAM 认得出的写名字，认不出写「你的终端 App」
+_terminal_app_name() {
+    case "${TERM_PROGRAM:-}" in
+        Apple_Terminal) _tn TERMINAL_APPLE ;;
+        ghostty)        printf 'Ghostty' ;;
+        iTerm.app)      printf 'iTerm' ;;
+        WarpTerminal)   printf 'Warp' ;;
+        vscode)         printf 'Visual Studio Code' ;;
+        "")             _tn TERMINAL_UNKNOWN ;;
+        *)              printf '%s' "$TERM_PROGRAM" ;;
+    esac
+}
+
+# setup：日历授权（可选）。整个 meetap 只有这里会请求日历授权（会弹授权框）；
+# 开录、停止、休眠自动停止、后台录音都只在已经授权时读。拒绝、跳过都算通过。
+setup_calendar() {
+    local st term
+    if [[ "$CFG_CALENDAR" != "on" ]]; then
+        _t SETUP_CAL_OFF
+        return 0
+    fi
+    if [[ ! -x "$TOOL" ]]; then
+        _t SETUP_CAL_UNAVAILABLE "$TOOL"
+        return 0
+    fi
+    term=$(_terminal_app_name)
+    st=$("$TOOL" calendar-status 2>/dev/null)
+    if [[ "$st" == notDetermined || "$st" == writeOnly ]]; then
+        if [[ -t 0 ]]; then
+            if [[ "$st" == writeOnly ]]; then _t SETUP_CAL_UPGRADE_ASK; else _t SETUP_CAL_ASK; fi
+            st=$("$TOOL" calendar-request 2>/dev/null)
+        elif [[ "$st" == notDetermined ]]; then
+            _t SETUP_CAL_NO_TTY
+            return 0
+        fi
+    fi
+    case "$st" in
+        fullAccess)
+            local n
+            n=$("$TOOL" calendar-count 2>/dev/null)
+            if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then _t SETUP_CAL_OK "$n"; else _t SETUP_CAL_NO_CALENDARS; fi
+            ;;
+        writeOnly)          _t SETUP_CAL_WRITE_ONLY "$term" "$term" ;;
+        denied|restricted)  _t SETUP_CAL_DENIED "$term" "$term" ;;
+        *)                  _t SETUP_CAL_UNKNOWN "${st:-?}" ;;
+    esac
+    return 0
+}
+
 setup_apps() {
     _require_macos || exit 1
     _t SETUP_HEADER
@@ -2668,6 +3029,11 @@ setup_apps() {
     _t SETUP_STEP_TAP
     _t SETUP_DIVIDER
     setup_tap
+    echo ""
+
+    _t SETUP_STEP_CALENDAR
+    _t SETUP_DIVIDER
+    setup_calendar
     echo ""
 
     _t SETUP_HEADER
@@ -2717,6 +3083,10 @@ case "${1:-}" in
     _wake-notify)
         wake_notify
         ;;
+    _calendar-lookup)
+        # 内部：meetap _calendar-lookup <会话目录> [<开始 epoch> <结束 epoch>]（测试、排查用）
+        if [[ -n "${3:-}" ]]; then calendar_lookup "${2:-}" "$3" "${4:-$3}"; else calendar_lookup_for_session "${2:-}"; fi
+        ;;
     mark)
         highlight_notes "${2:-}"
         ;;
@@ -2752,6 +3122,7 @@ case "${1:-}" in
                     "  multi_language        = $CFG_MULTI_LANGUAGE" \
                     "  visualizer            = $CFG_VISUALIZER" \
                     "  zero_alert_ignore     = ${CFG_ZERO_ALERT_IGNORE:-<none>}" \
+                    "  calendar              = $CFG_CALENDAR" \
                     "  email                 = ${CFG_EMAIL:-<not set>}" \
                     "  email_sender          = ${CFG_EMAIL_SENDER:-<not set>}"
                 echo ""

@@ -36,6 +36,14 @@ audio_persist = true
 # have no parentheses, add the program name. Comma-separated.
 zero_alert_ignore = com.amazon.workspaces
 
+# ── Calendar ──────────────────────────────────────────────────
+# After a recording stops, read the matching meeting from the macOS Calendar (title,
+# organizer, attendees, agenda) into the session's materials/calendar.md for the notes.
+# Join links, meeting IDs, passwords and dial-in numbers are removed. Requires calendar
+# access granted once via `meetap setup` (per terminal app); never prompts otherwise.
+# on | off  (off = never touch the calendar)
+calendar = on
+
 # ── Auto-stop ─────────────────────────────────────────────────
 # Recording runs until you run `meetap stop`. To auto-stop after a fixed
 # duration, pass a time limit (minutes) on start: `meetap start -d 60`.
