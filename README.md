@@ -90,7 +90,7 @@ make install     # 编译 audio-tap、audio-multi-output，装到 ~/bin，并嵌
    ```
 
    用 `AWS_PROFILE` 指定 profile 也行。
-3. 账号要有这些权限：`s3:PutObject/GetObject/DeleteObject`、`transcribe:*TranscriptionJob`、`bedrock:InvokeModelWithResponseStream`；要发邮件再加 `ses:SendRawEmail`。想收紧权限，照 [docs/iam.md](docs/iam.md) 的最小策略配。
+3. 账号要有这些权限：`s3:PutObject/GetObject/DeleteObject`、`transcribe:*TranscriptionJob`、`bedrock:InvokeModelWithResponseStream`；要发邮件再加 `ses:SendRawEmail`。默认模型 `global.anthropic.claude-sonnet-5` 是跨区域的推理配置文件，Bedrock 权限要按推理配置文件、本区域的基础模型、不分区域的基础模型三段写。想收紧权限，照 [docs/iam.md](docs/iam.md) 的最小策略配。
 
 费用按量计费，没有订阅、没有最低消费，一场会大约几毛钱（Transcribe 转录 + Bedrock 生成纪要）。
 
@@ -642,7 +642,7 @@ Transcribe 返回的原始结果 `transcribe-raw.json`（平均 700 多 KB）在
 | 收到"录音可能漏了"通知 | 有 App 在放声音、录到的却全是零：授权失效，或者系统录音中途出了故障；也可能那个 App 只是开着音频输出、其实没出声 | 看通知里写的是哪个 App。它当时其实没出声（比如 Amazon WorkSpaces 客户端一直开着输出），就把通知里**括号里那一串**（bundle ID，比如 `com.google.Chrome.helper`；命令行程序没有括号，写程序名）加进配置 `zero_alert_ignore`，逗号分隔。确实在开会，就跑 `meetap setup` 查授权，必要时 `meetap stop` 后重新开录。变零、恢复的时间记在 `.meetap/audio-tap.log`（`TAP_ZERO_START` / `TAP_ZERO_END`；名单里的 App 记作 `ignored=`） |
 | 转录失败：`AWS credentials not configured` | 没配 AWS 凭证 | 跑 `aws configure`，或者检查 `AWS_PROFILE` |
 | 弹通知"AWS 凭证可能过期了"，日志里"凭证取不到或者已经过期" | 凭证过期了，或者刷新时网断了一下 | 刷新凭证就行，meetap 自己接着跑，不用 `again`；每一步最多等 15 分钟。放弃了（第二次通知），就在凭证恢复以后跑通知里写的 `meetap again <会话>`，AWS 上已经转完的结果会直接拿来用 |
-| 转录或写纪要报 `AccessDenied` / `ValidationException` | 账号没开通模型，或者 IAM 权限不够 | 在 Bedrock 控制台的 Model access 里开通模型；IAM 要有 `bedrock:InvokeModelWithResponseStream`，见 [docs/iam.md](docs/iam.md) |
+| 转录或写纪要报 `AccessDenied` / `ValidationException` | 账号没开通模型，或者 IAM 权限不够 | 在 Bedrock 控制台的 Model access 里开通模型；IAM 要有 `bedrock:InvokeModelWithResponseStream`，默认模型是跨区域推理配置文件，推理配置文件、本区域的基础模型、不分区域的基础模型三段都要有，见 [docs/iam.md](docs/iam.md) |
 | 纪要一直没出来，卡在 "Generating meeting notes..." | 多半是 Bedrock 报错或者流断了 | 看会话的 `log/meetap.log` 里具体的 AWS 报错；断流的排查见 [docs/bedrock-纪要断流排障.md](docs/bedrock-纪要断流排障.md)；修好后 `meetap again` |
 | 录音有回声 | 外放的声音又被麦克风录进去一遍 | 戴耳机；只要电脑声音时用 `-m` |
 | 系统通知没弹出来 | 通知权限没开 | 系统设置 › 通知 里允许"终端"（或你用的终端 App）和"脚本编辑器"发送通知 |
