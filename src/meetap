@@ -1253,6 +1253,52 @@ summarize_transcript() {
     fi
 }
 
+# 会话文件夹名：20YYMMDD_HHMM，后面可接 _会议名（start 生成的格式）
+SESSION_NAME_RE='^20[0-9]{6}_[0-9]{4}(_.*)?$'
+
+# recording_dir 第一层最新一场（按目录名排序，命名以时间戳开头天然有序）。
+# 只认会话名：用户手工按月聚合的 2026-10 这类文件夹也以 20 开头，不能算进候选。
+_latest_session_dir() {
+    local d latest=""
+    while IFS= read -r d; do
+        [[ "${d##*/}" =~ $SESSION_NAME_RE ]] && latest="$d"
+    done < <(find "$RECORDING_DIR" -mindepth 1 -maxdepth 1 -type d -name "20*" | sort)
+    printf '%s' "$latest"
+}
+
+# 找会话目录（again、mark、贴标签、显示信息共用）。
+# resolve_session [目标] [strict]：目标为空 → recording_dir 第一层最新一场；
+# 目标是已存在的目录（绝对路径或相对当前目录）→ 用它；否则在 recording_dir 下按名字找
+# （也可以是 2026-10/20261008_1046 这样的相对路径）。
+# strict：目录名必须是会话名，否则返回 3——meetap .、meetap src 这类真实目录不能当成会话。
+# 找到：路径写到 stdout，返回 0；找不到返回 1；recording_dir 下一场会都没有返回 2。
+# 报错文案由调用方各自打印（返回码区分情况），这里不输出提示。
+resolve_session() {
+    local target="${1:-}" strict="${2:-}" dir
+    if [[ -z "$target" ]]; then
+        dir=$(_latest_session_dir)
+        [[ -n "$dir" ]] || return 2
+    elif [[ -d "$target" ]]; then
+        dir="$(cd -- "$target" && pwd)" || return 1
+    elif [[ -d "$RECORDING_DIR/$target" ]]; then
+        dir="$RECORDING_DIR/$target"
+    else
+        return 1
+    fi
+    if [[ "$strict" == strict ]]; then
+        dir="$(cd -- "$dir" && pwd)" || return 1   # 去掉末尾的 / 和 ./ 之类，取到真实目录名
+        [[ "${dir##*/}" =~ $SESSION_NAME_RE ]] || return 3
+    fi
+    printf '%s' "$dir"
+}
+
+# 参数的最后一级名字像不像会话文件夹名（用来区分「会话找不到」和「不认识的命令」）
+_looks_like_session() {
+    local b="$1"
+    while [[ "$b" == */ ]]; do b="${b%/}"; done
+    [[ "${b##*/}" =~ $SESSION_NAME_RE ]]
+}
+
 # meetap again [会议目录名] —— 对已有会议重新执行生成任务。
 # 应对三类场景：1) materials/ 新增了资料要重新生成纪要；2) 上次转录或
 # 纪要生成失败要重跑；3) 有新要求（编辑 <session>/extra-requirements.md
@@ -1262,26 +1308,14 @@ summarize_transcript() {
 again_session() {
     local target="${1:-}"
     local extra_prompt="${2:-}"   # 可选：本次补充给 LLM 的重新生成要求
-    local SESSION_DIR
+    local SESSION_DIR rc
 
-    if [[ -n "$target" ]]; then
-        # 支持绝对路径或目录名
-        if [[ -d "$target" ]]; then
-            SESSION_DIR="$(cd "$target" && pwd)"
-        elif [[ -d "$RECORDING_DIR/$target" ]]; then
-            SESSION_DIR="$RECORDING_DIR/$target"
-        else
-            _t ERR_AGAIN_SESSION_NOT_FOUND "$target" "$RECORDING_DIR"
-            exit 1
-        fi
-    else
-        # 默认：最近一次会议（按目录名排序，命名以时间戳开头天然有序）
-        SESSION_DIR=$(find "$RECORDING_DIR" -maxdepth 1 -type d -name "20*" | sort | tail -1)
-        if [[ -z "$SESSION_DIR" ]]; then
-            _t ERR_AGAIN_NO_SESSIONS "$RECORDING_DIR"
-            exit 1
-        fi
-    fi
+    # 支持绝对路径或目录名；不给则取最近一次会议
+    SESSION_DIR=$(resolve_session "$target"); rc=$?
+    case $rc in
+        1) _t ERR_AGAIN_SESSION_NOT_FOUND "$target" "$RECORDING_DIR"; exit 1 ;;
+        2) _t ERR_AGAIN_NO_SESSIONS "$RECORDING_DIR"; exit 1 ;;
+    esac
 
     local LOG_DIR="$SESSION_DIR/log"
     local TRANSCRIPT="$LOG_DIR/transcript.txt"
@@ -1338,43 +1372,38 @@ again_session() {
     fi
 }
 
+# 会话里实际的纪要 md（mark 和贴标签回显共用）：目录下最新 *.md，排除 archive/、
+# prompt.md、extra-requirements.md。（纪要经 smart_name_notes 已 mv 成
+# <日期>_<时间>_<主题>.md，文件名不固定）
+# NUL 分隔安全读取：SESSION_DIR 含空格时避免路径被词法拆词/glob 展开。
+# meeting-notes.md 是生成中间态（正常会经 smart_name_notes 改名走掉），
+# 若残留则词法上会误排到最后被当成「最新」，一并排除。没有纪要时输出为空。
+_latest_notes_md() {
+    local notes="" f
+    while IFS= read -r -d '' f; do
+        case "$(basename "$f")" in
+            prompt.md|extra-requirements.md|meeting-notes.md) continue ;;
+        esac
+        notes="$f"   # sort 升序，最后一个即最新命名
+    done < <(find "$1" -maxdepth 1 -type f -name "*.md" -print0 | sort -z)
+    printf '%s' "$notes"
+}
+
 # 纪要要点高亮：给已生成的纪要 md 原地补 <mark> 高亮。独立后处理，不碰生成流程。
 # 复用 summarize_via_* 作为 LLM 层；写回前过校验闸门，正文被改则拒写。
 highlight_notes() {
     local target="${1:-}"
-    local SESSION_DIR
+    local SESSION_DIR rc
 
-    # 目录解析（与 again_session 一致）
-    if [[ -n "$target" ]]; then
-        if [[ -d "$target" ]]; then
-            SESSION_DIR="$(cd "$target" && pwd)"
-        elif [[ -d "$RECORDING_DIR/$target" ]]; then
-            SESSION_DIR="$RECORDING_DIR/$target"
-        else
-            _t ERR_HL_SESSION_NOT_FOUND "$target" "$RECORDING_DIR"
-            exit 1
-        fi
-    else
-        SESSION_DIR=$(find "$RECORDING_DIR" -maxdepth 1 -type d -name "20*" | sort | tail -1)
-        if [[ -z "$SESSION_DIR" ]]; then
-            _t ERR_HL_NO_SESSIONS "$RECORDING_DIR"
-            exit 1
-        fi
-    fi
+    # 目录解析（与 again_session 共用 resolve_session）
+    SESSION_DIR=$(resolve_session "$target"); rc=$?
+    case $rc in
+        1) _t ERR_HL_SESSION_NOT_FOUND "$target" "$RECORDING_DIR"; exit 1 ;;
+        2) _t ERR_HL_NO_SESSIONS "$RECORDING_DIR"; exit 1 ;;
+    esac
 
-    # 定位实际纪要 md：目录下最新 *.md，排除 archive/、prompt.md、extra-requirements.md。
-    # （纪要经 smart_name_notes 已 mv 成 <日期>_<时间>_<主题>.md，文件名不固定）
-    # NUL 分隔安全读取：SESSION_DIR 含空格时避免路径被词法拆词/glob 展开。
-    # meeting-notes.md 是生成中间态（正常会经 smart_name_notes 改名走掉），
-    # 若残留则词法上会误排到最后被当成「最新」，一并排除。
-    local NOTES="" f base
-    while IFS= read -r -d '' f; do
-        base="$(basename "$f")"
-        case "$base" in
-            prompt.md|extra-requirements.md|meeting-notes.md) continue ;;
-        esac
-        NOTES="$f"   # sort 升序，最后一个即最新命名
-    done < <(find "$SESSION_DIR" -maxdepth 1 -type f -name "*.md" -print0 | sort -z)
+    local NOTES
+    NOTES=$(_latest_notes_md "$SESSION_DIR")
     if [[ -z "$NOTES" ]]; then
         _t ERR_HL_NO_NOTES "$SESSION_DIR"
         exit 1
@@ -1452,6 +1481,478 @@ PYEOF
     # 保证 footer 后有空行，避免编辑器把签名 HTML 块显示成源码。
     _normalize_trailing_blank "$PYBIN" "$NOTES"
     rm -f "$PROMPT_FILE" "$LLM_OUT"
+}
+
+# ── 会议标签（meta.json）与会话信息 ──
+# meetap [<会话>] -g 标签 / --untag 标签 / -g（列标签） / meetap <会话>（显示信息）
+# 标签存在会话目录最外层的 meta.json，不放 materials/（那里的东西会喂给模型）。
+# 以后会被菜单栏 app 调用：没有终端时不交互、不阻塞、不起后台进程。
+TAG_GUARD_HOURS=12   # 没写文件夹、没在录、最新一场早于这么多小时 → 有终端先确认，没终端直接拒绝
+
+# meta.json 读写（Python：JSON 和多字节字符交给标准库，标签只经 argv 传入，不拼进代码）。
+#   get <会话目录>                                    → "tags\t标签1\t标签2…"
+#   update <会话目录> <recording_dir> (--add 标签 | --remove 标签)…
+#       → 先输出相近标签提示（similar），再逐条输出 added/dup/removed/absent，最后 tags
+#   all <recording_dir>                               → 每行 "场数\t标签"，场数从多到少
+# 统计范围：recording_dir 第一层的会话 + 20YY-MM 月份文件夹里的会话（用户按月手工挪老会议）。
+# 不认识的字段原样保留；写入先写同目录临时文件再改名；meta.json 读不了时输出 error，不覆盖。
+_meta_py() {
+    cat <<'PYEOF'
+import json, os, re, sys, tempfile
+from datetime import datetime
+
+SESSION_RE = re.compile(r'^20\d{6}_\d{4}(_.*)?$')
+MONTH_RE = re.compile(r'^20\d{2}-\d{2}$')
+
+def out(*fields):
+    print("\t".join(fields))
+
+def load(session_dir):
+    path = os.path.join(session_dir, "meta.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("meta.json is not an object")
+    tags = data.get("tags", [])
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        raise ValueError("tags is not a list of strings")
+    return data
+
+def write(session_dir, data):
+    fd, tmp = tempfile.mkstemp(prefix=".meta.", suffix=".tmp", dir=session_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(session_dir, "meta.json"))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+def sessions(rec):
+    try:
+        names = sorted(os.listdir(rec))
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(rec, n)
+        if not os.path.isdir(p):
+            continue
+        if SESSION_RE.match(n):
+            yield p
+        elif MONTH_RE.match(n):
+            for m in sorted(os.listdir(p)):
+                q = os.path.join(p, m)
+                if SESSION_RE.match(m) and os.path.isdir(q):
+                    yield q
+
+def tag_counts(rec):
+    # 不分大小写归并：{casefold: [场数, {写法: 次数}]}
+    counts = {}
+    for s in sessions(rec):
+        try:
+            tags = load(s).get("tags", [])
+        except (ValueError, OSError):
+            continue   # 某一场的 meta.json 坏了，只是不计入统计
+        seen = set()
+        for t in tags:
+            k = t.casefold()
+            if k in seen:
+                continue
+            seen.add(k)
+            c = counts.setdefault(k, [0, {}])
+            c[0] += 1
+            c[1][t] = c[1].get(t, 0) + 1
+    return counts
+
+def display(entry):
+    spellings = entry[1]
+    return max(spellings, key=lambda s: spellings[s])   # 最常用的写法，并列取先出现的
+
+def cmd_update(session_dir, rec, ops):
+    data = load(session_dir)
+    tags = list(data.get("tags", []))
+    counts = tag_counts(rec)
+    changed = False
+    for op, tag in ops:
+        k = tag.casefold()
+        if op == "--add":
+            if any(t.casefold() == k for t in tags):
+                out("dup", tag)
+                continue
+            if k not in counts:   # 从没用过的新标签：一个包含另一个就算相近
+                for ek, entry in counts.items():
+                    if k in ek or ek in k:
+                        out("similar", tag, display(entry), str(entry[0]))
+            tags.append(tag)
+            changed = True
+            out("added", tag)
+        else:
+            hit = [t for t in tags if t.casefold() == k]
+            if not hit:
+                out("absent", tag)
+                continue
+            tags = [t for t in tags if t.casefold() != k]
+            changed = True
+            out("removed", hit[0])
+    if changed:
+        if not data:
+            data = {"schema": 1, "session": os.path.basename(session_dir)}
+        data.setdefault("schema", 1)
+        data.setdefault("session", os.path.basename(session_dir))
+        data["tags"] = tags
+        data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        write(session_dir, data)
+    out("tags", *tags)
+
+def main(argv):
+    cmd = argv[1]
+    try:
+        if cmd == "get":
+            out("tags", *load(argv[2]).get("tags", []))
+        elif cmd == "update":
+            rest = argv[4:]
+            cmd_update(argv[2], argv[3], list(zip(rest[0::2], rest[1::2])))
+        elif cmd == "all":
+            counts = tag_counts(argv[2])
+            for e in sorted(counts.values(), key=lambda e: (-e[0], display(e).casefold())):
+                out(str(e[0]), display(e))
+    except ValueError:
+        out("error", "badjson")
+        sys.exit(1)
+    except OSError as e:
+        out("error", "io", str(e).replace("\t", " ").replace("\n", " "))
+        sys.exit(1)
+
+main(sys.argv)
+PYEOF
+}
+
+_meta() {
+    local py="$VENV_PYTHON"
+    [[ -x "$py" ]] || py="$(command -v python3)"
+    if [[ -z "$py" ]]; then
+        printf 'error\tnopython\n'
+        return 1
+    fi
+    "$py" -I -c "$(_meta_py)" "$@" </dev/null
+}
+
+# 读一场会的标签到 SESSION_TAGS 数组；meta.json 读不了时返回 1
+_read_tags() {
+    local line f ok=1
+    SESSION_TAGS=()
+    while IFS= read -r line; do
+        IFS=$'\t' read -r -a f <<< "$line"
+        case "${f[0]}" in
+            tags) SESSION_TAGS=("${f[@]:1}"); ok=0 ;;
+        esac
+    done < <(_meta get "$1")
+    return $ok
+}
+
+# 正在录的那场：ffmpeg pid 活着，且 state/session-dir 指向存在的目录。
+# start 先建会话目录、写 session-dir，后起 ffmpeg 写 pid；这一瞬间算「没在录」，
+# 默认目标落到最新一场——正是刚建好的目录，不会贴到上一场。
+_recording_session_dir() {
+    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null || return 1
+    local sd
+    sd=$(cat "$STATE_DIR/session-dir" 2>/dev/null)
+    [[ -n "$sd" && -d "$sd" ]] || return 1
+    printf '%s' "$sd"
+}
+
+_same_dir() {
+    [[ "$(cd -- "$1" 2>/dev/null && pwd -P)" == "$(cd -- "$2" 2>/dev/null && pwd -P)" ]]
+}
+
+# 会话开始时间（epoch 秒），从文件夹名 20YYMMDD_HHMM 解析
+_session_start_epoch() {
+    date -j -f "%Y%m%d_%H%M%S" "${1:0:13}00" +%s 2>/dev/null
+}
+
+# 开始时间的短写法：当年写 11-18 12:01，跨年写 2025-11-18 12:01
+_session_when() {
+    local b="$1"
+    if [[ "${b:0:4}" == "$(date +%Y)" ]]; then
+        printf '%s-%s %s:%s' "${b:4:2}" "${b:6:2}" "${b:9:2}" "${b:11:2}"
+    else
+        printf '%s-%s-%s %s:%s' "${b:0:4}" "${b:4:2}" "${b:6:2}" "${b:9:2}" "${b:11:2}"
+    fi
+}
+
+# 时长（分钟，四舍五入）：正在录 → 从 pid 文件时间算已录时长（同 status）；
+# 否则用 ffprobe 读会话里的音频（同 stop）。音频按 audio_persist 删了、没装 ffprobe
+# 都输出空，调用方显示「未知」。不用 transcribe-raw.json 兜底：它只记到最后一句话，
+# 可能比录音短得多。
+_session_minutes() {
+    local dir="$1" recording="$2" secs audio st
+    if [[ "$recording" == true ]]; then
+        st=$(stat -f %m "$PID_FILE" 2>/dev/null) || return 0
+        secs=$(( $(date +%s) - st ))
+    else
+        audio=$(find "$dir" -maxdepth 1 -name "*.m4a" | sort | tail -1)
+        [[ -n "$audio" ]] && command -v ffprobe >/dev/null || return 0
+        secs=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$audio" </dev/null 2>/dev/null)
+        secs="${secs%%.*}"
+        [[ "$secs" =~ ^[0-9]+$ ]] || return 0
+    fi
+    printf '%d' $(( (secs + 30) / 60 ))
+}
+
+_fmt_minutes() {
+    if [[ -z "$1" ]]; then _tn DUR_UNKNOWN
+    elif (( $1 < 1 )); then _tn DUR_UNDER_MIN
+    else _tn DUR_MIN "$1"
+    fi
+}
+
+# 纪要标题：纪要文件名 2026-11-18_1201_<标题>.md 里的 <标题>；没有纪要输出为空
+_notes_title() {
+    local f name
+    f=$(_latest_notes_md "$1")
+    [[ -n "$f" ]] || return 0
+    name="${f##*/}"
+    name="${name%.md}"
+    [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}_(.+)$ ]] && name="${BASH_REMATCH[1]}"
+    printf '%s' "$name"
+}
+
+# 一场会的摘要（贴标签回显、列标签、护栏提示共用）：11-18 12:01（73 分钟 · 纪要：标题）
+_session_brief() {
+    local dir="$1" recording="$2" m dur title notes
+    m=$(_session_minutes "$dir" "$recording")
+    if [[ -n "$m" ]]; then dur=$(_fmt_minutes "$m"); else dur=$(_tn BRIEF_DUR_UNKNOWN); fi
+    [[ "$recording" == true ]] && dur=$(_tn BRIEF_RECORDING "$dur")
+    title=$(_notes_title "$dir")
+    if [[ -n "$title" ]]; then notes=$(_tn BRIEF_NOTES "$title"); else notes=$(_tn BRIEF_NO_NOTES); fi
+    _tn BRIEF "$(_session_when "${dir##*/}")" "$dur" "$notes"
+}
+
+_join_tags() {
+    local sep out="" t
+    sep=$(_tn TAG_SEP)
+    for t in "$@"; do out="${out:+$out$sep}$t"; done
+    [[ -n "$out" ]] || out=$(_tn TAGS_NONE)
+    printf '%s' "$out"
+}
+
+# 拼提示里的命令示例：含空格、引号等的标签加单引号，用户照抄就能用
+_shell_word() {
+    case "$1" in
+        *[[:space:]\'\"\\\$\`\!\*\?\[\]\(\)\{\}\;\&\|\<\>\#\~]*)
+            printf "'%s'" "${1//\'/\'\\\'\'}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# 校验一个标签值，通过则把去掉首尾空白后的值放进 TAG_VALUE
+_check_tag() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    if [[ -z "$v" ]]; then
+        _t ERR_TAG_EMPTY; return 1
+    elif [[ "$v" == *[[:cntrl:]]* ]]; then
+        _t ERR_TAG_BAD_CHAR; return 1
+    elif [[ "$v" == -* ]]; then
+        _t ERR_TAG_DASH "$v"; return 1
+    elif _looks_like_session "$v" || [[ "$v" =~ ^20[0-9]{6}_[0-9]{4} ]]; then
+        # -g 后面跟的像会话文件夹名：多半是参数顺序写反了
+        _t ERR_TAG_LOOKS_LIKE_SESSION "$v" "$(basename "$0")" "$v"; return 1
+    fi
+    TAG_VALUE="$v"
+}
+
+# 12 小时护栏：没写文件夹、没在录、最新一场开始于 TAG_GUARD_HOURS 小时以前。
+# 有终端先问确认；没终端（菜单栏 app 调用）直接拒绝，提示写明文件夹。两种情况都不写文件。
+_tag_guard() {
+    local dir="$1" explicit="$2" recording="$3" start s brief
+    shift 3
+    [[ "$explicit" == true || "$recording" == true ]] && return 0
+    start=$(_session_start_epoch "${dir##*/}")
+    [[ -n "$start" ]] || return 0
+    (( $(date +%s) - start < TAG_GUARD_HOURS * 3600 )) && return 0
+    brief=$(_session_brief "$dir" false)
+    if [[ -t 0 ]]; then
+        ui_confirm "$(_tn TAG_GUARD_CONFIRM "$brief" "$TAG_GUARD_HOURS")" && return 0
+        _t TAG_GUARD_CANCELLED
+        return 1
+    fi
+    s="$(basename "$0") ${dir##*/}"
+    while (( $# >= 2 )); do
+        [[ "$1" == --add ]] && s+=" -g" || s+=" --untag"
+        s+=" $(_shell_word "$2")"
+        shift 2
+    done
+    _t ERR_TAG_GUARD_REFUSED "$brief" "$TAG_GUARD_HOURS" "$s"
+    return 1
+}
+
+_meta_error() {
+    case "$1" in
+        badjson)  _t ERR_META_BAD "$2/meta.json" ;;
+        nopython) _t ERR_META_NO_PYTHON ;;
+        *)        _t ERR_META_IO "$2/meta.json" "${3:-}" ;;
+    esac
+}
+
+# 贴标签 / 撤标签，然后回显这场是哪一场、现在有哪些标签
+_tag_update() {
+    local dir="$1" recording="$2" line got=false err="" errinfo="" brief
+    shift 2
+    local f added=() dups=() removed=() absent=() similar=() tags=()
+    while IFS= read -r line; do
+        IFS=$'\t' read -r -a f <<< "$line"
+        case "${f[0]}" in
+            similar) similar+=("$(_tn TAG_SIMILAR "${f[2]}" "${f[3]}")") ;;
+            added)   added+=("${f[1]}") ;;
+            dup)     dups+=("${f[1]}") ;;
+            removed) removed+=("${f[1]}") ;;
+            absent)  absent+=("${f[1]}") ;;
+            tags)    tags=("${f[@]:1}"); got=true ;;
+            error)   err="${f[1]}"; errinfo="${f[2]}" ;;
+        esac
+    done < <(_meta update "$dir" "$RECORDING_DIR" "$@")
+    if [[ -n "$err" || "$got" != true ]]; then
+        _meta_error "${err:-io}" "$dir" "$errinfo"
+        exit 1
+    fi
+
+    brief=$(_session_brief "$dir" "$recording")
+    for line in "${similar[@]}"; do printf '%s\n' "$line"; done
+    (( ${#added[@]} )) && _t TAG_ADDED "$brief" "$(_join_tags "${added[@]}")"
+    (( ${#removed[@]} )) && _t TAG_REMOVED "$brief" "$(_join_tags "${removed[@]}")"
+    (( ${#added[@]} + ${#removed[@]} )) || _t TAG_UNCHANGED "$brief"
+    (( ${#dups[@]} )) && _t TAG_DUP "$(_join_tags "${dups[@]}")"
+    (( ${#absent[@]} )) && _t TAG_ABSENT "$(_join_tags "${absent[@]}")"
+    _t TAG_CURRENT "$(_join_tags "${tags[@]}")"
+    return 0
+}
+
+# 列出这场的标签，以及用过的全部标签和各自的场数
+_tag_list() {
+    local dir="$1" explicit="$2" recording="$3" prefix="" cur n t
+    local names=() nums=() i
+    if _read_tags "$dir"; then cur=$(_join_tags "${SESSION_TAGS[@]}"); else cur=$(_tn META_UNREADABLE); fi
+    if [[ "$explicit" != true ]]; then
+        if [[ "$recording" == true ]]; then prefix=$(_tn TARGET_RECORDING); else prefix=$(_tn TARGET_LATEST); fi
+    fi
+    _t TAGLIST_SESSION "$prefix" "$(_session_brief "$dir" "$recording")" "$cur"
+    while IFS=$'\t' read -r n t; do
+        [[ "$n" =~ ^[0-9]+$ ]] || continue
+        nums+=("$n"); names+=("$t")
+    done < <(_meta all "$RECORDING_DIR")
+    if (( ${#names[@]} == 0 )); then
+        _t TAGLIST_NONE "$(basename "$0")"
+        return 0
+    fi
+    _t TAGLIST_ALL_HEADER "${#names[@]}"
+    for (( i = 0; i < ${#names[@]}; i++ )); do
+        _t TAGLIST_ALL_ITEM "${names[$i]}" "${nums[$i]}"
+    done
+}
+
+# meetap <会话>：显示这场会的信息，不开录
+_session_info() {
+    local dir="$1" recording="$2" b="${1##*/}" rel title tags rd
+    rd="$(cd -- "$RECORDING_DIR" 2>/dev/null && pwd)"
+    rel="$dir"
+    [[ -n "$rd" && "$dir" == "$rd/"* ]] && rel="${dir#"$rd/"}"
+    title=$(_notes_title "$dir")
+    if _read_tags "$dir"; then tags=$(_join_tags "${SESSION_TAGS[@]}"); else tags=$(_tn META_UNREADABLE); fi
+    _t INFO_HEADER "$rel"
+    _t INFO_START "${b:0:4}-${b:4:2}-${b:6:2} ${b:9:2}:${b:11:2}"
+    if [[ "$recording" == true ]]; then
+        _t INFO_DURATION_RECORDING "$(_fmt_minutes "$(_session_minutes "$dir" true)")"
+    else
+        _t INFO_DURATION "$(_fmt_minutes "$(_session_minutes "$dir" false)")"
+    fi
+    if [[ -n "$title" ]]; then _t INFO_NOTES "$title"; else _t INFO_NO_NOTES; fi
+    _t INFO_TAGS "$tags"
+    if [[ "$recording" == true ]]; then _t INFO_STATE_RECORDING; else _t INFO_STATE_ENDED; fi
+}
+
+# 入口：session_cmd <会话目录或空> [参数…]
+# 会话目录为空时，默认目标是正在录的那场，没在录就是最新一场（只看 recording_dir 第一层）。
+session_cmd() {
+    local SESSION_DIR="$1" cmd arg dir rc list=false explicit=true recording=false rec_dir=""
+    local ops=()
+    shift
+    cmd=$(basename "$0")
+    while (( $# > 0 )); do
+        arg="$1"
+        case "$arg" in
+            -g|--tag|--untag)
+                if (( $# == 1 )); then
+                    [[ "$arg" == --untag ]] && { _t ERR_UNTAG_NEEDS_VALUE "$cmd"; exit 1; }
+                    list=true
+                    shift
+                    continue
+                fi
+                _check_tag "$2" || exit 1
+                if [[ "$arg" == --untag ]]; then ops+=(--remove "$TAG_VALUE"); else ops+=(--add "$TAG_VALUE"); fi
+                shift 2
+                ;;
+            -t|--test|-d|--duration|-b|--background|-m|--mute-mic|--mute-microphone)
+                _t ERR_TAG_WITH_START_OPT "$cmd" "$cmd"
+                exit 1
+                ;;
+            -*)
+                _t ERR_UNKNOWN_OPTION "$arg"
+                exit 1
+                ;;
+            *)
+                # 位置参数只能有一个，而且必须是会话（名字或路径）
+                if [[ -z "$SESSION_DIR" ]] && dir=$(resolve_session "$arg" strict); then
+                    SESSION_DIR="$dir"
+                elif [[ -z "$SESSION_DIR" ]] && _looks_like_session "$arg"; then
+                    _t ERR_SESSION_NOT_FOUND "$arg" "$RECORDING_DIR"
+                    exit 1
+                else
+                    _t ERR_TAG_EXTRA_ARG "$arg" "$cmd"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    if $list && (( ${#ops[@]} > 0 )); then
+        _t ERR_TAG_MISSING_VALUE "$cmd"
+        exit 1
+    fi
+
+    rec_dir=$(_recording_session_dir) || rec_dir=""
+    if [[ -z "$SESSION_DIR" ]]; then
+        explicit=false
+        if [[ -n "$rec_dir" ]]; then
+            SESSION_DIR="$rec_dir"
+        else
+            SESSION_DIR=$(resolve_session ""); rc=$?
+            if (( rc != 0 )); then
+                _t ERR_TAG_NO_SESSIONS "$RECORDING_DIR"
+                exit 1
+            fi
+        fi
+    fi
+    [[ -n "$rec_dir" ]] && _same_dir "$SESSION_DIR" "$rec_dir" && recording=true
+
+    if (( ${#ops[@]} > 0 )); then
+        _tag_guard "$SESSION_DIR" "$explicit" "$recording" "${ops[@]}" || exit 1
+        _tag_update "$SESSION_DIR" "$recording" "${ops[@]}"
+    elif $list; then
+        _tag_list "$SESSION_DIR" "$explicit" "$recording"
+    else
+        _session_info "$SESSION_DIR" "$recording"
+    fi
 }
 
 # tap 健康探针：判断 ffmpeg 是否已从 FIFO 读到真实 PCM。
@@ -2364,6 +2865,31 @@ setup_apps() {
     _t SETUP_HEADER
 }
 
+show_usage() {
+    _t USAGE_HEADER "$VERSION"
+    echo ""
+    _t USAGE_LINE
+    echo ""
+    _t USAGE_BARE
+    _t USAGE_START
+    _t USAGE_STOP
+    _t USAGE_STATUS
+    _t USAGE_AGAIN
+    _t USAGE_HIGHLIGHT
+    _t USAGE_TAG
+    _t USAGE_TAG_SESSION
+    _t USAGE_TAG_LIST
+    _t USAGE_UNTAG
+    _t USAGE_INFO
+    _t USAGE_SETUP
+    _t USAGE_CONFIG
+    _t USAGE_CONFIG_SHOW
+    _t USAGE_VERSION
+    _t USAGE_HELP
+    echo ""
+    _t USAGE_HINT
+}
+
 case "${1:-}" in
     start)
         start_recording "${@:2}"
@@ -2447,21 +2973,43 @@ case "${1:-}" in
     -v|--version|version)
         _t VERSION_LINE "$VERSION${BUILD_ID:+ ($BUILD_ID)}"
         ;;
+    "")
+        # 只敲 meetap ≡ meetap start。只认「完全不带参数」：meetap 周会、拼错的子命令
+        # 都不会落到这里，免得敲错一个字就开录。
+        start_recording
+        ;;
+    help|-h|--help)
+        show_usage
+        ;;
+    -t|--test|-d|--duration|-b|--background|-m|--mute-mic|--mute-microphone)
+        # 开录选项开头 ≡ meetap start …（白名单，不是「减号开头就开录」）。
+        # 和贴标签混用一律报错不开录：想贴标签却开了录，比报错代价大得多。
+        for _arg in "$@"; do
+            case "$_arg" in
+                -g|--tag|--untag)
+                    _t ERR_TAG_WITH_START_OPT "$(basename "$0")" "$(basename "$0")"
+                    exit 1
+                    ;;
+            esac
+        done
+        start_recording "$@"
+        ;;
+    -g|--tag|--untag)
+        session_cmd "" "$@"
+        ;;
     *)
-        _t USAGE_HEADER "$VERSION"
-        echo ""
-        _t USAGE_LINE
-        echo ""
-        _t USAGE_START
-        _t USAGE_STOP
-        _t USAGE_STATUS
-        _t USAGE_AGAIN
-        _t USAGE_HIGHLIGHT
-        _t USAGE_SETUP
-        _t USAGE_CONFIG
-        _t USAGE_CONFIG_SHOW
-        _t USAGE_VERSION
-        echo ""
-        _t USAGE_HINT
+        # meetap <会话> [-g 标签 | --untag 标签 | -g]：名字或路径都行，但目录名必须是会话名；
+        # meetap 周会、meetap .、meetap src 这类按不认识的命令处理
+        if _sd=$(resolve_session "$1" strict); then
+            session_cmd "$_sd" "${@:2}"
+        elif _looks_like_session "$1"; then
+            _t ERR_SESSION_NOT_FOUND "$1" "$RECORDING_DIR"
+            exit 1
+        else
+            _t ERR_UNKNOWN_COMMAND "$1"
+            echo ""
+            show_usage
+            exit 1
+        fi
         ;;
 esac
