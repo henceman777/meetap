@@ -327,7 +327,7 @@ if command -v ffmpeg >/dev/null; then
     OUT=$(cd "$TMP" && HOME="$TMP/home" PATH="$TMP/fakebin:$PATH" "$MEETAP" again "$S4" </dev/null 2>&1)
     s4=$(date -j -f "%Y%m%d_%H%M%S" 20261118_150005 +%s)
     grep -q -- "calendar-query --start $s4 --end $((s4 + 65)) " "$FAKE/calls.log" && [[ -f "$S4/materials/calendar.md" ]] \
-        && grep -q '这场会是「架构周会」' "$S4/log/meetap.log" \
+        && grep -q '这场会是「架构周会」' "$S4/.meetap/meetap.log" \
         && pass "转录开始前查日历：按音频算时段、写 calendar.md、日志里记一行" || fail "转录前没查日历: $(cat "$FAKE/calls.log" 2>/dev/null)"
     [[ "$(cat "$TMP/aws.log" 2>/dev/null)" == "aws sts get-caller-identity"* && $(grep -c . "$TMP/aws.log") -eq 1 ]] \
         && pass "这条测试没有上传任何东西（假 aws 只被问了凭证）" || fail "aws 调用: $(cat "$TMP/aws.log" 2>/dev/null)"

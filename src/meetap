@@ -375,12 +375,21 @@ autostop_daemon() {
     done
 }
 
+# 会话的诊断文件——排错日志 meetap.log、录音诊断 audio-tap.log、发言统计 speaker-stats.txt——
+# 放在会话里的隐藏目录 .meetap/（Finder 和 ls 默认看不到），log/ 里只留 transcript.txt。
+_diag_dir() {
+    mkdir -p "$1/.meetap" 2>/dev/null
+    printf '%s' "$1/.meetap"
+}
+
 transcribe_recording() {
     local AUDIO_FILE="$1"
     local SESSION_DIR="$2"
     local LOG_DIR="$SESSION_DIR/log"
     mkdir -p "$LOG_DIR"
-    local LOG_FILE="$LOG_DIR/meetap.log"
+    local DIAG_DIR
+    DIAG_DIR=$(_diag_dir "$SESSION_DIR")
+    local LOG_FILE="$DIAG_DIR/meetap.log"
     local AWS_REGION="$CFG_REGION"
 
     # 语音文件保留在 session 根目录原位，不再移入 log/（用户要求位置不变动）
@@ -497,7 +506,7 @@ transcribe_recording() {
 
     # Download result
     echo "[$(date '+%H:%M:%S')] $(_tn DOWNLOADING)"
-    aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$LOG_DIR/transcribe-raw.json" --region "$AWS_REGION"
+    aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$DIAG_DIR/transcribe-raw.json" --region "$AWS_REGION"
 
     # Extract transcript with speaker labels
     python3 - "$SESSION_DIR" <<'PYEOF'
@@ -505,7 +514,7 @@ import json, sys, os
 
 session_dir = sys.argv[1]
 log_dir = os.path.join(session_dir, "log")
-raw_json = os.path.join(log_dir, "transcribe-raw.json")
+raw_json = os.path.join(session_dir, ".meetap", "transcribe-raw.json")
 output_txt = os.path.join(log_dir, "transcript.txt")
 
 with open(raw_json) as f:
@@ -561,9 +570,9 @@ PYEOF
     python3 - "$SESSION_DIR" <<'PYEOF'
 import json, sys, os
 session_dir = sys.argv[1]
-log_dir = os.path.join(session_dir, "log")
-raw_json = os.path.join(log_dir, "transcribe-raw.json")
-stats_file = os.path.join(log_dir, "speaker-stats.txt")
+diag_dir = os.path.join(session_dir, ".meetap")
+raw_json = os.path.join(diag_dir, "transcribe-raw.json")
+stats_file = os.path.join(diag_dir, "speaker-stats.txt")
 with open(raw_json) as f:
     data = json.load(f)
 segments = data["results"]["speaker_labels"]["segments"]
@@ -586,6 +595,10 @@ with open(stats_file, "w") as f:
 print(f"Speaker stats saved: {stats_file}")
 PYEOF
 
+    if [[ -s "$LOG_DIR/transcript.txt" && -s "$DIAG_DIR/speaker-stats.txt" ]]; then
+        rm -f "$DIAG_DIR/transcribe-raw.json"
+    fi
+
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_DONE "$LOG_DIR/transcript.txt")"
     osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_DONE)\" with title \"MeeTap\"" 2>/dev/null
 
@@ -597,7 +610,9 @@ build_prompt() {
     local SESSION_DIR="$1"
     local LOG_DIR="$SESSION_DIR/log"
     local TRANSCRIPT="$LOG_DIR/transcript.txt"
-    local SPEAKER_STATS="$LOG_DIR/speaker-stats.txt"
+    # 发言统计：新会话在 .meetap/，还没整理过的老会话在 log/
+    local SPEAKER_STATS="$SESSION_DIR/.meetap/speaker-stats.txt"
+    [[ -f "$SPEAKER_STATS" ]] || SPEAKER_STATS="$LOG_DIR/speaker-stats.txt"
     local SESSION_NAME
     SESSION_NAME=$(basename "$SESSION_DIR")
 
@@ -1347,7 +1362,7 @@ again_session() {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] === meetap again (重新生成纪要): $(basename "$SESSION_DIR") ==="
             calendar_lookup_for_session "$SESSION_DIR"
             summarize_transcript "$SESSION_DIR"
-        } 2>&1 | tee -a "$LOG_DIR/meetap.log"
+        } 2>&1 | tee -a "$(_diag_dir "$SESSION_DIR")/meetap.log"
     else
         # 无转录：从音频重跑全链路
         local AUDIO_FILE
@@ -2815,8 +2830,10 @@ stop_recording() {
             # 留存 audio-tap 诊断日志（设备采样率、重采样、时钟自检）：/tmp 下的
             # tap.log 每次开录都会被覆盖，事后排查录音变速/静音全靠这份副本
             if [[ -s "$STATE_DIR/tap.log" ]]; then
-                mkdir -p "$SESSION_DIR/log" && cp "$STATE_DIR/tap.log" "$SESSION_DIR/log/audio-tap.log"
-                grep -q "CLOCK_DRIFT" "$STATE_DIR/tap.log" && _t REC_CLOCK_DRIFT "$SESSION_DIR/log/audio-tap.log"
+                local diag
+                diag=$(_diag_dir "$SESSION_DIR")
+                cp "$STATE_DIR/tap.log" "$diag/audio-tap.log"
+                grep -q "CLOCK_DRIFT" "$STATE_DIR/tap.log" && _t REC_CLOCK_DRIFT "$diag/audio-tap.log"
             fi
             if $SLEEP_MODE; then
                 # 马上要休眠，上传会被打断：只记下会话，唤醒后提示 meetap again。
