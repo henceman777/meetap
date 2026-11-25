@@ -1,6 +1,6 @@
 #!/bin/bash
 # MeeTap - macOS 会议录制 + 自动转录工具
-VERSION="2.0.0"
+VERSION="2.0.1"
 BUILD_ID=""   # make install 写入「分支@提交号」，区分本地试用构建；Homebrew 安装为空
 
 # --- Config ---
@@ -381,9 +381,10 @@ autostop_daemon() {
     done
 }
 
-# 会话的诊断文件——录音诊断 audio-tap.log、发言统计 speaker-stats.txt、转录失败时留下的
-# transcribe-raw.json——放在会话里的隐藏目录 .meetap/（Finder 和 ls 默认看不到）。
-# log/ 里放用户会看的：转录文本 transcript.txt 和排错日志 meetap.log。
+# 会话的诊断文件——录音诊断 audio-tap.log、发言统计 speaker-stats.txt——放在会话里的隐藏目录
+# .meetap/（Finder 和 ls 默认看不到）。log/ 里放用户会看、会拿去用的：转录文本 transcript.txt、
+# 排错日志 meetap.log，和 Transcribe 原始结果 transcribe-raw.json（唯一带逐词时间和置信度的文件，
+# 转录成功、失败都留着；2.0.0 转录完就删，有用户要用这些数据，2.0.1 起不再删）。
 _diag_dir() {
     mkdir -p "$1/.meetap" 2>/dev/null
     printf '%s' "$1/.meetap"
@@ -685,7 +686,7 @@ transcribe_recording() {
 
     # Download result
     echo "[$(date '+%H:%M:%S')] $(_tn DOWNLOADING)"
-    if ! _retry DOWNLOAD aws aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$DIAG_DIR/transcribe-raw.json" --region "$AWS_REGION"; then
+    if ! _retry DOWNLOAD aws aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$LOG_DIR/transcribe-raw.json" --region "$AWS_REGION"; then
         [[ -n "$RETRY_GAVE_UP" ]] && return 1
         # 结果文件没了（不是凭证、网络问题）：任务也清掉，again 时从头转
         _t ERR_TRANSCRIBE_FAILED "${RETRY_LAST_MSG:-download}"
@@ -703,7 +704,7 @@ import json, sys, os
 
 session_dir = sys.argv[1]
 log_dir = os.path.join(session_dir, "log")
-raw_json = os.path.join(session_dir, ".meetap", "transcribe-raw.json")
+raw_json = os.path.join(log_dir, "transcribe-raw.json")
 output_txt = os.path.join(log_dir, "transcript.txt")
 
 try:
@@ -767,7 +768,7 @@ PYEOF
     rm -f "$JOB_FILE"
 
     if (( tx_rc == 3 )); then
-        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 .meetap/ 里备查。
+        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 log/ 里备查。
         # meta.json 记下来，等着认的日历也定成 no_speech，meetap <文件夹> 照这个显示
         _meta no-speech "$SESSION_DIR" on >/dev/null 2>&1
         echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_NO_SPEECH "$AUDIO_FILE")"
@@ -785,7 +786,7 @@ PYEOF
 import json, sys, os
 session_dir = sys.argv[1]
 diag_dir = os.path.join(session_dir, ".meetap")
-raw_json = os.path.join(diag_dir, "transcribe-raw.json")
+raw_json = os.path.join(session_dir, "log", "transcribe-raw.json")
 stats_file = os.path.join(diag_dir, "speaker-stats.txt")
 with open(raw_json) as f:
     data = json.load(f)
@@ -814,10 +815,6 @@ with open(stats_file, "w") as f:
     f.write("\n".join(lines) + "\n")
 print(f"Speaker stats saved: {stats_file}")
 PYEOF
-
-    if [[ -s "$LOG_DIR/transcript.txt" && -s "$DIAG_DIR/speaker-stats.txt" ]]; then
-        rm -f "$DIAG_DIR/transcribe-raw.json"
-    fi
 
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_DONE "$LOG_DIR/transcript.txt")"
     osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_DONE)\" with title \"MeeTap\"" 2>/dev/null
@@ -1553,137 +1550,81 @@ _looks_like_session() {
     [[ "${b##*/}" =~ $SESSION_NAME_RE ]]
 }
 
-# ── meetap tidy：整理老会话（log/ 只留 transcript.txt）──
-# 新会话转录完就删 transcribe-raw.json、audio-tap.log 和 speaker-stats.txt 放进 .meetap/、meetap.log 留在
-# log/；这个命令把老会话整理成同样的样子（以前被挪进 .meetap/ 的 meetap.log 挪回 log/）。
-# 在整个 recording_dir 下按文件名找（第一层、月份文件夹、更深的子文件夹、老版本把文件放在会话根目录
-# 的布局都算），不碰 ~/Record-2 这类 recording_dir 以外的目录。默认只列清单、不改任何东西；--yes 才执行。
-# transcribe-raw.json 是唯一带逐词时间的文件：会话里还有音频的，删了以后能从音频重新转录找回来；
-# 没有音频的删了就再也找不回来，所以默认不删，加 --include-no-audio 才删。音频、纪要、materials/、
-# archive/ 一概不动。
+# ── meetap tidy：把老会话整理成新会话的样子 ──
+# 新会话：audio-tap.log、speaker-stats.txt、meta.json 在隐藏的 .meetap/，meetap.log、transcript.txt、
+# transcribe-raw.json 在 log/。这个命令把老会话挪成同样的样子：log/ 里的诊断文件和根目录的 meta.json
+# 挪进 .meetap/；以前被挪进 .meetap/ 的 meetap.log、2.0.0 转录失败时留在 .meetap/ 的 transcribe-raw.json
+# 挪回 log/。要挪去的位置已有同名文件就跳过、列出来。
+# 在整个 recording_dir 下按文件名找（第一层、月份文件夹、更深的子文件夹都算），不碰 ~/Record-2 这类
+# recording_dir 以外的目录。默认只列清单、不改任何东西；--yes 才执行。只挪不删：transcribe-raw.json 是
+# 唯一带逐词时间和置信度的文件，2.0.1 起一个都不删（老版本放在会话根目录的也不动）；音频、纪要、
+# materials/、archive/ 一概不动。
 _tidy_py() {
     cat <<'TIDYPY'
 import os, shutil, sys
 
-rec, apply_, include_no_audio = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1"
+rec, apply_ = sys.argv[1], sys.argv[2] == "1"
 DIAG = ("audio-tap.log", "speaker-stats.txt")   # 挪进 .meetap/；meetap.log 留在 log/
 SESSION_LIKE = __import__("re").compile(r'^(20\d{6}_\d{4}|\d{4}_\d{4})')
 
 def out(*f):
     print("\t".join(str(x).replace("\t", " ").replace("\n", " ") for x in f))
 
-def human(n):
-    return "%.1f MB" % (n / 1048576) if n >= 1048576 else "%d KB" % max(1, round(n / 1024))
-
-def nonempty(path):
-    try:
-        return os.path.getsize(path) > 0
-    except OSError:
-        return False
-
-def has_audio(session):
-    try:
-        return any(n.endswith(".m4a") and os.path.isfile(os.path.join(session, n)) for n in os.listdir(session))
-    except OSError:
-        return False
-
-sessions = {}   # 会话目录 → {"json": 路径, "moves": [文件名]}
+sessions = {}   # 会话目录 → {"moves": [文件名], "back": bool, "meta": bool, "raw": bool}
 for root, dirs, files in os.walk(rec):
-    dirs[:] = sorted(d for d in dirs if d != ".meetap")   # .meetap/ 里的是转录失败时故意留下的，不碰
+    dirs[:] = sorted(d for d in dirs if d != ".meetap")
     base = os.path.basename(root)
     if base == "log":
-        session = os.path.dirname(root)
-        if "transcribe-raw.json" in files:
-            sessions.setdefault(session, {})["json"] = os.path.join(root, "transcribe-raw.json")
         moves = [n for n in DIAG if n in files]
         if moves:
-            sessions.setdefault(session, {})["moves"] = moves
-    elif "transcribe-raw.json" in files:   # 老版本：文件直接放在会话根目录
-        sessions.setdefault(root, {})["json"] = os.path.join(root, "transcribe-raw.json")
+            sessions.setdefault(os.path.dirname(root), {})["moves"] = moves
     if os.path.isfile(os.path.join(root, ".meetap", "meetap.log")):   # 以前被挪进 .meetap/ 的排错日志
         sessions.setdefault(root, {})["back"] = True
+    if os.path.isfile(os.path.join(root, ".meetap", "transcribe-raw.json")):   # 2.0.0 转录失败时留下的
+        sessions.setdefault(root, {})["raw"] = True
     # 根目录的 meta.json（以前的版本放这里）：只认会话目录——有 log/、有音频，或者文件夹名像会话
     if "meta.json" in files and base not in ("log", "materials", "archive") and (
             "log" in dirs or any(f.endswith(".m4a") for f in files) or SESSION_LIKE.match(base)):
         sessions.setdefault(root, {})["meta"] = True
 
-sums = {"del_audio": [0, 0], "keep_noaudio": [0, 0], "del_noaudio": [0, 0], "keep_notranscript": [0, 0]}
-moved = moved_back = moved_meta = conflicts = 0
-rows = []
+def move(src, dst):   # 目标已有同名文件就不挪，返回 False
+    if os.path.exists(dst):
+        return False
+    if apply_:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+    return True
+
+moved = moved_back = moved_meta = moved_raw = conflicts = 0
 for session in sorted(sessions):
     info = sessions[session]
-    rel = os.path.relpath(session, rec)
-    kind, size = "none", 0
-    j = info.get("json")
-    if j:
-        size = os.path.getsize(j)
-        has_tr = nonempty(os.path.join(session, "log", "transcript.txt")) or nonempty(os.path.join(session, "transcript.txt"))
-        if not has_tr:
-            kind = "keep_notranscript"
-        elif has_audio(session):
-            kind = "del_audio"
-        else:
-            kind = "del_noaudio" if include_no_audio else "keep_noaudio"
-        sums[kind][0] += 1
-        sums[kind][1] += size
-    n_move = n_conf = 0
+    log, diag = os.path.join(session, "log"), os.path.join(session, ".meetap")
+    n_move = n_conf = n_back = n_meta = n_raw = 0
     for name in info.get("moves", []):
-        src = os.path.join(session, "log", name)
-        dst = os.path.join(session, ".meetap", name)
-        if os.path.exists(dst):
-            n_conf += 1
+        if move(os.path.join(log, name), os.path.join(diag, name)): n_move += 1
+        else: n_conf += 1
+    for key, name, src_dir, dst_dir in (("back", "meetap.log", diag, log), ("raw", "transcribe-raw.json", diag, log),
+                                        ("meta", "meta.json", session, diag)):
+        if not info.get(key):
             continue
-        n_move += 1
-        if apply_:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.move(src, dst)
-    n_back = 0
-    if info.get("back"):
-        src = os.path.join(session, ".meetap", "meetap.log")
-        dst = os.path.join(session, "log", "meetap.log")
-        if os.path.exists(dst):
+        if not move(os.path.join(src_dir, name), os.path.join(dst_dir, name)):
             n_conf += 1
-        else:
-            n_back = 1
-            if apply_:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.move(src, dst)
-    n_meta = 0
-    if info.get("meta"):
-        src = os.path.join(session, "meta.json")
-        dst = os.path.join(session, ".meetap", "meta.json")
-        if os.path.exists(dst):
-            n_conf += 1
-        else:
-            n_meta = 1
-            if apply_:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.move(src, dst)
-    if apply_ and kind in ("del_audio", "del_noaudio"):
-        os.remove(j)
-    moved += n_move
-    moved_back += n_back
-    moved_meta += n_meta
-    conflicts += n_conf
-    if kind != "none" or n_move or n_conf or n_back or n_meta:
-        rows.append((kind, rel, human(size), n_move, n_conf, n_back, n_meta))
-
-order = {"del_audio": 0, "keep_noaudio": 1, "del_noaudio": 1, "keep_notranscript": 2, "none": 3}
-for kind, rel, size, n_move, n_conf, n_back, n_meta in sorted(rows, key=lambda r: (order[r[0]], r[1])):
-    out("item", kind, rel, size, n_move, n_conf, n_back, n_meta)
-b = sums["keep_noaudio"] if not include_no_audio else sums["del_noaudio"]
-out("sum", sums["del_audio"][0], human(sums["del_audio"][1]), b[0], human(b[1]),
-    sums["keep_notranscript"][0], human(sums["keep_notranscript"][1]), moved, conflicts, moved_back, moved_meta)
+        elif key == "back": n_back = 1
+        elif key == "raw": n_raw = 1
+        else: n_meta = 1
+    moved += n_move; moved_back += n_back; moved_meta += n_meta; moved_raw += n_raw; conflicts += n_conf
+    out("item", os.path.relpath(session, rec), n_move, n_conf, n_back, n_meta, n_raw)
+out("sum", moved, conflicts, moved_back, moved_meta, moved_raw)
 TIDYPY
 }
 
-# meetap tidy [--yes] [--include-no-audio]
+# meetap tidy [--yes]（--include-no-audio 是 2.0.0 删原始结果时的选项，还认这个写法，只提示不起作用）
 tidy_sessions() {
-    local apply=0 include=0 arg py line kind rel size nmove nconf nback nmeta group="" suffix
+    local apply=0 arg py rel nmove nconf nback nmeta nraw first=1 suffix
     for arg in "$@"; do
         case "$arg" in
             --yes)              apply=1 ;;
-            --include-no-audio) include=1 ;;
+            --include-no-audio) _t TIDY_INCLUDE_NO_AUDIO_IGNORED ;;
             *) _t ERR_UNKNOWN_OPTION "$arg"; _t USAGE_TIDY; exit 1 ;;
         esac
     done
@@ -1693,44 +1634,29 @@ tidy_sessions() {
     while IFS=$'\t' read -r -a f; do
         case "${f[0]}" in
             item)
-                kind="${f[1]}"; rel="${f[2]}"; size="${f[3]}"; nmove="${f[4]}"; nconf="${f[5]}"; nback="${f[6]}"; nmeta="${f[7]}"
-                if [[ "$kind" != "$group" ]]; then
-                    group="$kind"
-                    echo ""
-                    case "$kind" in
-                        del_audio)         _t TIDY_GROUP_AUDIO ;;
-                        keep_noaudio)      _t TIDY_GROUP_NOAUDIO_KEEP ;;
-                        del_noaudio)       _t TIDY_GROUP_NOAUDIO_DEL ;;
-                        keep_notranscript) _t TIDY_GROUP_NOTRANSCRIPT ;;
-                        none)              _t TIDY_GROUP_MOVE_ONLY ;;
-                    esac
-                fi
+                rel="${f[1]}"; nmove="${f[2]}"; nconf="${f[3]}"; nback="${f[4]}"; nmeta="${f[5]}"; nraw="${f[6]}"
+                (( first )) && { echo ""; first=0; }
                 suffix=""
                 (( nmove > 0 )) && suffix+="$(_tn TIDY_ITEM_MOVES "$nmove")"
                 (( nback > 0 )) && suffix+="$(_tn TIDY_ITEM_BACK)"
+                (( nraw > 0 ))  && suffix+="$(_tn TIDY_ITEM_RAW_BACK)"
                 (( nmeta > 0 )) && suffix+="$(_tn TIDY_ITEM_META)"
                 (( nconf > 0 )) && suffix+="$(_tn TIDY_ITEM_CONFLICTS "$nconf")"
-                if [[ "$kind" == none ]]; then
-                    suffix="${suffix#，}"; suffix="${suffix#, }"   # 去掉开头的逗号（中英两种写法）
-                    _t TIDY_ITEM "$rel" "$suffix"
-                else
-                    _t TIDY_ITEM "$rel" "transcribe-raw.json（${size}）${suffix}"
-                fi
+                suffix="${suffix#，}"; suffix="${suffix#, }"   # 去掉开头的逗号（中英两种写法）
+                _t TIDY_ITEM "$rel" "$suffix"
                 ;;
             sum)
                 echo ""
-                _t TIDY_SUM_AUDIO "${f[1]}" "${f[2]}"
-                if (( include )); then _t TIDY_SUM_NOAUDIO_DEL "${f[3]}" "${f[4]}"; else _t TIDY_SUM_NOAUDIO_KEEP "${f[3]}" "${f[4]}"; fi
-                (( ${f[5]} > 0 )) && _t TIDY_SUM_NOTRANSCRIPT "${f[5]}" "${f[6]}"
-                _t TIDY_SUM_MOVED "${f[7]}"
-                (( ${f[9]} > 0 )) && _t TIDY_SUM_BACK "${f[9]}"
-                (( ${f[10]} > 0 )) && _t TIDY_SUM_META "${f[10]}"
-                (( ${f[8]} > 0 )) && _t TIDY_SUM_CONFLICTS "${f[8]}"
+                _t TIDY_SUM_MOVED "${f[1]}"
+                (( ${f[3]} > 0 )) && _t TIDY_SUM_BACK "${f[3]}"
+                (( ${f[5]} > 0 )) && _t TIDY_SUM_RAW_BACK "${f[5]}"
+                (( ${f[4]} > 0 )) && _t TIDY_SUM_META "${f[4]}"
+                (( ${f[2]} > 0 )) && _t TIDY_SUM_CONFLICTS "${f[2]}"
                 echo ""
                 if (( apply )); then _t TIDY_DONE; else _t TIDY_DRY_HINT "$(basename "$0")"; fi
                 ;;
         esac
-    done < <("$py" -I -c "$(_tidy_py)" "$RECORDING_DIR" "$apply" "$include")
+    done < <("$py" -I -c "$(_tidy_py)" "$RECORDING_DIR" "$apply")
 }
 
 # meetap again [会议目录名] —— 对已有会议重新执行生成任务。

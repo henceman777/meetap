@@ -40,7 +40,7 @@ open ~/Record
 | 标出纪要里的重点 | [标重点](#s-mark) |
 | 给会贴标签，以后按标签找回来 | [贴标签、找回以前的会](#s-tag) |
 | 纪要自动发到邮箱 | [自动发邮件](#s-email) |
-| 会话文件夹太乱、太占地方 | [整理老会话](#s-tidy) |
+| 老会话的文件夹和新录的不一样 | [整理老会话](#s-tidy) |
 | 终端里的提示换成英文 | [英文界面](#s-english) |
 | 命令、配置项一览 | [速查](#cheatsheet) |
 | 出问题了 | [故障排查](#troubleshooting) |
@@ -132,7 +132,8 @@ meetap setup               # 升级后先跑一次；在几个终端里开录，
 - **配置里的 `audio_capture = blackhole` 可以删掉**：2.0 起这一项不起作用，录音照样走 Process Tap，`start`、`setup` 会提示一句。
 - `meetap setup-zoom`、`setup-teams`、`setup-wemeet` 只会提示"2.0 起不需要配置会议 App 的扬声器"。
 - 授权没生效时没有别的录音方式可以退，会录成静音。所以 2.0 加了**静音报警**：录音期间只要有 App 在放声音、录到的却全是零，30 秒内弹通知（见[故障排查](#troubleshooting)）。
-- **会话文件夹变了**：诊断文件、标签挪进隐藏的 `.meetap/`，`log/` 里只留 `transcript.txt` 和 `meetap.log`，转录完就删掉用不上的 `transcribe-raw.json`。老会话照样读得到；想整理成新样子，跑 [`meetap tidy`](#s-tidy)。
+- **会话文件夹变了**：诊断文件、标签挪进隐藏的 `.meetap/`，`log/` 里是 `transcript.txt`、`meetap.log` 和 Transcribe 原始结果 `transcribe-raw.json`。老会话照样读得到；想整理成新样子，跑 [`meetap tidy`](#s-tidy)。
+- **2.0.0 转录完会删掉 `transcribe-raw.json`，2.0.1 起不再删**：逐词时间和置信度只在这个文件里。用 2.0.0 录的会想找回来，见[会话文件夹里有什么](#files)。
 - **日历是新功能**：想用的话在 `setup` 第 3 步授权，见[用上日历](#s-calendar)。
 
 ---
@@ -485,16 +486,15 @@ $ meetap -g
 
 <a id="s-tidy"></a>
 
-### 会话文件夹太乱、太占地方（tidy）
+### 老会话整理成新样子（tidy）
 
-**什么时候用**：以前录的会，`log/` 里还留着 `transcribe-raw.json`（平均 700 多 KB 一个）和诊断文件，看着乱、占地方。
+**什么时候用**：以前录的会，`log/` 里还放着录音诊断、发言统计这些诊断文件，或者 2.0.0 转录失败时把 `transcribe-raw.json` 留在了隐藏的 `.meetap/` 里，和新录的会放得不一样。
 
 **怎么用**：
 
 ```bash
-meetap tidy                            # 只列清单：每场会要删什么、挪什么，能腾出多少；不改任何文件
-meetap tidy --yes                      # 看过清单、确认后执行
-meetap tidy --yes --include-no-audio   # 连已经没有音频的会话的 transcribe-raw.json 也删
+meetap tidy        # 只列清单：每场会要挪什么；不改任何文件
+meetap tidy --yes  # 看过清单、确认后执行
 ```
 
 **你会看到什么**（临时目录里实跑，会话是编的）：
@@ -502,15 +502,12 @@ meetap tidy --yes --include-no-audio   # 连已经没有音频的会话的 trans
 ```
 下面是 meetap tidy 会做的事（/Users/you/Record；只是清单，还没动任何文件）：
 
-【有音频】删掉 transcribe-raw.json（以后要逐词时间，可以从音频重新转录）：
-  20261105_0930：transcribe-raw.json（793 KB），诊断文件 1 个挪进 .meetap/，meta.json 挪进 .meetap/
+  2026-10/20261008_1046：诊断文件 1 个挪进 .meetap/
+  20261105_0930：诊断文件 1 个挪进 .meetap/，meta.json 挪进 .meetap/
+  20261119_1000：transcribe-raw.json 挪回 log/
 
-【没有音频】transcribe-raw.json 是逐词时间唯一的来源，默认留着（加 --include-no-audio 才删）：
-  2026-10/20261008_1046：transcribe-raw.json（717 KB），诊断文件 1 个挪进 .meetap/
-
-有音频的会话：1 场，删掉 transcribe-raw.json 能腾出 793 KB
-没有音频的会话：1 场，transcribe-raw.json 合计 717 KB，默认不删（加 --include-no-audio 才删）
 挪进 .meetap/ 的诊断文件：2 个
+挪回 log/ 的 transcribe-raw.json：1 个
 挪进 .meetap/ 的 meta.json：1 个
 
 确认没问题后执行：meetap tidy --yes
@@ -518,10 +515,9 @@ meetap tidy --yes --include-no-audio   # 连已经没有音频的会话的 trans
 
 **注意**：
 
-- **还有音频的会话**：删掉 `transcribe-raw.json`；以后要逐词时间，可以从音频重新转录。
-- **已经没有音频的会话**：`transcribe-raw.json` 是逐词时间唯一的来源，删了就找不回来，所以默认不删，只在清单里列出场数和合计大小；确定不要了再加 `--include-no-audio`。
-- **没有转录稿的**：`transcribe-raw.json` 留着。
-- `audio-tap.log`、`speaker-stats.txt` 和根目录的 `meta.json` 挪进隐藏的 `.meetap/`；`meetap.log` 留在 `log/`，以前被挪进 `.meetap/` 的挪回 `log/`。目标位置已有同名文件的不挪，在清单里列出来。
+- **只挪不删**：`transcribe-raw.json` 是唯一带逐词时间和置信度的文件，tidy 一个都不删；留在 `.meetap/` 里的挪回 `log/`，老版本放在会话根目录的不动。
+- `audio-tap.log`、`speaker-stats.txt` 和根目录的 `meta.json` 挪进隐藏的 `.meetap/`；`meetap.log` 留在 `log/`，以前被挪进 `.meetap/` 的挪回 `log/`。要挪去的位置已有同名文件的不挪，在清单里列出来。
+- 2.0.0 的 `--include-no-audio`（连没有音频的会话的 `transcribe-raw.json` 也删）不再起作用：还认这个写法，只提示一句，不删任何东西。
 - 音频、纪要、`materials/`、`archive/`、转录稿一概不动。扫的是 `recording_dir`（默认 `~/Record`）下的所有会话，含月份文件夹、更深的子文件夹和老版本的文件布局。
 - 新录的会不用整理：转录完就是整理好的样子。
 
@@ -567,7 +563,7 @@ meetap tidy --yes --include-no-audio   # 连已经没有音频的会话的 trans
 | `meetap [会话] --untag 标签` | 撤掉一个标签 |
 | `meetap [会话] -g` | 列这场的标签和用过的全部标签 |
 | `meetap <会话>` | 显示这场的时间、时长、纪要、标签、日历 |
-| `meetap tidy [--yes] [--include-no-audio]` | 整理老会话；不加 `--yes` 只列清单 |
+| `meetap tidy [--yes]` | 老会话整理成新样子，只挪不删；不加 `--yes` 只列清单 |
 | `meetap setup` | 授权系统录音、日历，检查 1.x 留下的设置；每个终端 App 跑一次 |
 | `meetap config` / `meetap config show` | 编辑配置 / 看当前配置值 |
 | `meetap version` | 显示版本号 |
@@ -614,6 +610,7 @@ meetap tidy --yes --include-no-audio   # 连已经没有音频的会话的 trans
 ├── archive/                     ← （again 以后才有）旧版纪要
 ├── log/
 │   ├── transcript.txt           ← 带说话人的转录稿
+│   ├── transcribe-raw.json      ← Transcribe 原始结果：每个词的开始、结束时间和置信度
 │   └── meetap.log               ← 每一步的时间和报错，排错看这个
 └── .meetap/                     ← 隐藏文件夹（Finder 里按 Cmd+Shift+. 显示，或 ls -a）
     ├── meta.json                ← （贴过标签或查过日历才有）标签、日历等信息
@@ -623,7 +620,9 @@ meetap tidy --yes --include-no-audio   # 连已经没有音频的会话的 trans
     └── audio-tap.log            ← 录音诊断：采样率、变零 / 恢复的时间
 ```
 
-Transcribe 返回的原始结果 `transcribe-raw.json`（平均 700 多 KB）在转录稿和发言统计写出来以后就删掉了。**它是唯一带逐词时间的文件，删了以后想找回时间，只能从音频重新转录**（删掉 `log/transcript.txt` 再跑 `meetap again`）。转录没成功时它会留在 `.meetap/` 里。
+`log/transcribe-raw.json` 是 Transcribe 返回的原始结果（平均 700 多 KB），**会话里只有它带逐词时间和置信度**，转录成功、失败都留着；`audio_persist = false` 删掉音频以后也还在。
+
+2.0.0 转录完会把它删掉。用 2.0.0 录的会想找回来，音频还在的话，删掉 `log/transcript.txt` 再跑 `meetap again`：会从音频重新转录（Transcribe 再收一次费），纪要也跟着重写，旧纪要挪进 `archive/`。音频已经删了的就找不回来了。2.0.0 转录失败时留在 `.meetap/` 里的那份，跑 [`meetap tidy`](#s-tidy) 挪回 `log/`。
 
 ---
 
