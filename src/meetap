@@ -24,6 +24,8 @@ CFG_MULTI_LANGUAGE=false
 CFG_AI_BACKEND="bedrock"
 CFG_VISUALIZER="dot"
 CFG_AUDIO_PERSIST=true
+CFG_ECHO_CHECK="on"                # 开麦录的录音转录前查会议室回声：on / off（off 时两路相加，和以前一样）
+CFG_KEEP_STEREO_ORIGINAL="false"   # 判成会议室回声时留不留原始双声道录音（留了才能退回）
 CFG_AUDIO_CAPTURE="auto"   # 2.0 起只用 Process Tap；留着这一项只为认出老配置并提示删掉
 # 静音报警不算「有声音在放」的进程：这些 App 一直开着输出流、放的却是静音（实测 WorkSpaces）
 CFG_ZERO_ALERT_IGNORE="com.amazon.workspaces"
@@ -87,6 +89,8 @@ load_config() {
             ai_backend)            CFG_AI_BACKEND="$val" ;;
             visualizer)            CFG_VISUALIZER="$val" ;;
             audio_persist)         CFG_AUDIO_PERSIST="$val" ;;
+            echo_check)            CFG_ECHO_CHECK="$val" ;;
+            keep_stereo_original)  CFG_KEEP_STEREO_ORIGINAL="$val" ;;
             audio_capture)         CFG_AUDIO_CAPTURE="$val" ;;
             zero_alert_ignore)     CFG_ZERO_ALERT_IGNORE="$val" ;;
             calendar)              CFG_CALENDAR="$val" ;;
@@ -98,6 +102,15 @@ load_config() {
 
 ensure_config
 load_config
+
+# 开关类配置：不分大小写，true / yes / on / 1 算开，false / no / off / 0 算关，没写或写了别的按默认
+_flag() {   # _flag <值> <默认 on|off>：开返回 0
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true|yes|on|1)  return 0 ;;
+        false|no|off|0) return 1 ;;
+        *) [[ "$2" == on ]] ;;
+    esac
+}
 
 # --- i18n (CLI display only; meeting notes are always Chinese) ---
 load_i18n() {
@@ -552,19 +565,420 @@ _transcribe_cleanup() {   # _transcribe_cleanup <桶> <音频 key> <任务名> <
     aws transcribe delete-transcription-job --transcription-job-name "$3" --region "$4" 2>/dev/null
 }
 
-# 转录用的单声道音频。开麦录的 m4a 是双声道（声道 0 麦克风、声道 1 电脑的声音），Transcribe
-# 收到的要和以前一样是两路相加的单声道，所以上传前混好写到 <输出>（mp4 封装）。
-# 返回 0：<输出> 写好了，传它；1：录音本来就是单声道（-m 录的、老版本录的），直接传原文件；
-# 2：混不出来（<输出> 已删）。不管哪种，都不会把双声道文件交给 Transcribe
-_transcribe_input() {   # _transcribe_input <录音> <输出>
-    local src="$1" dst="$2" ch
+# 会议室回声检查（整场一个结论）。开麦录的 m4a 是双声道：声道 0 麦克风、声道 1 电脑的声音。
+# 人在会议室、笔记本也进了会，会议室设备（Teams Room 之类）也在会里时，会议室里的人声麦克风
+# 实时录到一遍；会议室设备传上去、会议 App 又从笔记本放出来一遍，晚 1~2 秒，混在一起像回声。
+# 这种会上电脑的声音里已经有会议室里的人（经会议室设备的麦克风）和远端的人，去掉麦克风
+# （等于开了 -m）就干净了。代价：会议室设备没收到的人，录音里也没有。
+#
+# 判错的代价不对称：普通线上会（戴耳机）也是两路都有声，但自己说的话只在麦克风里（会议 App
+# 不会把你自己的声音放回来）。误判成回声，整场自己的话就全丢了；漏判只是照旧有回声。所以
+# 宁可漏判，下面每一条都要满足才算回声，拿不准一律两路相加：
+#   - 两路各算 20 ms 一帧的能量包络（dB，减掉 0.5 秒滑动平均，只留音节起伏），切成互不重叠的
+#     30 秒段，麦克风有声 ≥ 3 秒的段才看；
+#   - 每段在 0.2~3 秒里找电脑的声音比麦克风晚多少时最像（归一化互相关）。开外放时麦克风里有
+#     电脑声音几十毫秒后的漏音，电脑声音自己的节奏会让别的延迟也显得像，先扣掉 ±0.2 秒内最像的
+#     那一处能解释的部分（偏相关）。扣完 ≥ 0.4、扣之前是旁边各个延迟的 3 倍以上、不在搜索范围的
+#     边上，才算这段像；
+#   - 音量：麦克风说话的那些帧，晚那么多以后电脑的声音的音量（中位数），不能比电脑声音平常的
+#     音量（只算远端的人在说话的帧，见 call_level）低 3 dB 以上。会议 App 把每个人都调到差不多的
+#     音量，会议室设备传来的那一遍和远端的人一样响（合成测试里 -1~+1 dB）；远端回声消除没做干净
+#     时漏回来的你自己的声音，就算很响也要低 6 dB（合成测试里 -4.7~-6 dB），一般低 20 dB 上下，
+#     靠这一条挡掉。代价：会议室设备那一路比远端的人小声 3 dB 以上时认不出来，照旧两路相加。
+#     远端几乎没人说话、没得比的时候也算不过关；
+#   - 至少 3 段像，而且延迟都在这些段延迟中位数的 ±0.16 秒以内（同一条路，延迟稳定）。延迟中途
+#     变了（比如从 1.2 秒变成 1.6 秒），只有其中一种延迟的那些段算数，另一部分照旧两路相加；
+#   - 逐帧数副本：麦克风有声的每一帧，前后 ±0.24 秒在电脑的声音里晚那么多（或者外放漏音的
+#     延迟上）也像、够响，而且增益和这条路上大多数帧一致，才算这一帧有副本。只按「这一段像不像」
+#     判不够：隔壁同事也在会里、或者会议室那一遍时有时无时，有副本的声音会把没副本的话盖住；
+#   - 支持的段：最像的延迟也落在这个范围、偏相关 ≥ 0.2、音量也过关，而且这一段麦克风有声的帧
+#     按帧数、按能量（你自己离麦克风最近、最响）都有 90% 以上有副本。从第一段支持的到最后一段
+#     支持的这个时段里，同样要按帧数、按能量都有 90% 以上有副本，有副本的合计 ≥ 30 秒，才判成回声；
+#   - 判成回声以后，也只在支持的段里去掉麦克风，别的段照常两路相加：时段里没过关的段（隔壁同事
+#     也在会里时，你说得多的那几段在这里）、麦克风没什么声音没看的段、会议室设备进会以前和
+#     退会以后。进会、退会那一刻落在 30 秒段中间、那一段又过了关时，那一段里麦克风多录到的一点
+#     会跟着去掉。
+# 至少要 3 段各有 3 秒以上麦克风说话，所以 1 分钟以内的录音不会判成回声。
+# 输出一行，tab 分隔：<结论> <延迟秒> <相关> <音量差 dB> <对得上的段数> <麦克风有声的段数> <覆盖 %>
+#   <去掉麦克风的时段：all 整场，或者 起-止,起-止（秒）>
+#   结论：echo 会议室设备在会里，那些时段只留电脑的声音；none 没认出来（后面几列是最像的
+#   那一段）；nosys 电脑的声音里几乎没有人声；nomic 麦克风里几乎没有人声
+_echo_check() {   # _echo_check <双声道录音>
+    python3 -I - "$1" <<'PYEOF'
+import array, math, operator, subprocess, sys
+from itertools import accumulate
+
+src = sys.argv[1]
+RATE, HOP, FPS = 8000, 160, 50          # 8 kHz 解码，20 ms 一帧
+BLOCK = 30 * FPS                        # 30 秒一段，互不重叠
+LAG_MIN, LAG_MAX = 10, 150              # 电脑的声音比麦克风晚 0.2~3 秒
+NEAR = 10                               # 外放漏音看 ±0.2 秒
+CORR_MIN, PEAK_RATIO = 0.4, 3.0
+CORR_SUPPORT = 0.2                      # 算覆盖时，延迟对得上的段要像到多少
+LEVEL_MIN = -3.0                        # 延迟那一遍的音量，最多比远端说话平常低 3 dB
+LAG_TOL = 8                             # 各段延迟和中位数最多差 0.16 秒
+MIN_BLOCK = 3 * FPS                     # 一段里麦克风有声至少 3 秒才看
+MIN_AGREE, MIN_MATCHED, COVER_MIN = 3, 30 * FPS, 0.9
+FW, SLACK = 12, 3                       # 逐帧看副本：前后 ±0.24 秒的窗，延迟 ±3 帧
+FRAME_MIN, FRAME_LEVEL = 0.3, -10.0     # 逐帧：窗里要像到多少，副本那一处最多比远端说话低多少 dB
+GAIN_TOL = 10.0                         # 逐帧：增益和这条路上大多数帧最多差多少 dB
+mul = operator.mul
+
+
+# 解码成 8 kHz 双声道，只留人声频段；每帧算平均能量（dB）
+p = subprocess.Popen(["ffmpeg", "-nostdin", "-v", "error", "-i", src, "-map", "0:a:0",
+                      "-af", "highpass=f=200,lowpass=f=3500", "-ar", str(RATE), "-ac", "2", "-f", "f32le", "-"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+CHUNK = HOP * 2 * 4 * 500
+em, es, rest = [], [], b""
+while True:
+    b = p.stdout.read(CHUNK)
+    if not b:
+        break
+    b = rest + b
+    cut = len(b) // (HOP * 8) * (HOP * 8)
+    rest = b[cut:]
+    a = array.array("f")
+    a.frombytes(b[:cut])
+    m, s = a[0::2], a[1::2]
+    for k in range(0, len(m), HOP):
+        x, y = m[k:k + HOP], s[k:k + HOP]
+        em.append(10 * math.log10(sum(map(mul, x, x)) / HOP + 1e-10))
+        es.append(10 * math.log10(sum(map(mul, y, y)) / HOP + 1e-10))
+if p.wait() != 0:
+    sys.exit(1)
+n = len(em)
+total = n / FPS
+
+# 有声：比这一路的底噪（第 10 百分位）高 12 dB 且高于 -70 dBFS。
+# 特征：底噪以下压平，再减掉 0.5 秒滑动平均，只留音节级的起伏（说话本身的慢起伏会让任何延迟都有点像）
+def features(e):
+    floor = sorted(e)[len(e) // 10] if e else -100
+    thr = max(floor + 12, -70)
+    c = [max(v, thr - 6) for v in e]
+    pre = [0.0] + list(accumulate(c))
+    W = 12
+    f = []
+    for i in range(len(c)):
+        lo, hi = max(0, i - W), min(len(c), i + W + 1)
+        f.append(c[i] - (pre[hi] - pre[lo]) / (hi - lo))
+    return f, [1 if v > thr else 0 for v in e]
+
+xm, vm = features(em)
+xs, vs = features(es)
+vpre = [0] + list(accumulate(vm))
+mpre = [0.0] + list(accumulate(v * v for v in xm))
+spre = [0.0] + list(accumulate(v * v for v in xs))
+def voiced(a, b):
+    return vpre[max(0, min(n, b))] - vpre[max(0, min(n, a))]
+
+# a[i] 和 b[i+L] 的归一化互相关，i 取 [c0, c1) 里两边都有数据的部分（L 可以是负的）
+def corr(a, apre, b, bpre, c0, c1, L):
+    i0, i1 = max(c0, -L, 0), min(c1, n - L, n)
+    if i1 - i0 < (c1 - c0) // 2:
+        return 0.0
+    den = math.sqrt((apre[i1] - apre[i0]) * (bpre[i1 + L] - bpre[i0 + L]))
+    return sum(map(mul, a[i0:i1], b[i0 + L:i1 + L])) / den if den > 0 else 0.0
+
+def mic_sys(c0, c1, L):
+    return corr(xm, mpre, xs, spre, c0, c1, L)
+
+# 外放漏音：麦克风里有电脑声音几十毫秒后的漏音时，电脑声音自己的节奏（音乐、说话的节拍）
+# 会让麦克风在 0.2 秒以后的某个延迟上也显得像。扣掉 ±0.2 秒内最像的那一处能解释的部分
+# （偏相关），剩下的才算延迟副本
+def near(c0, c1):
+    return max((mic_sys(c0, c1, L), L) for L in range(-NEAR, NEAR + 1))
+def partial(c0, c1, D, r, r0, L0):
+    if r0 <= 0:
+        return r
+    a0 = corr(xs, spre, xs, spre, c0 + L0, c1 + L0, D - L0)
+    # 分母最小取 0.3：麦克风几乎就是漏音（r0 接近 1）时，剩下那一点别被放大成「像」
+    return (r - r0 * a0) / max(0.3, math.sqrt(max(0.0, (1 - r0 * r0) * (1 - a0 * a0))))
+
+
+def median(v):
+    v = sorted(v)
+    return v[len(v) // 2] if v else -100.0
+
+def out(mode, lag=0.0, cc=0.0, level=0.0, agree=0, blocks=0, cover=0.0, ranges="-"):
+    print(f"{mode}\t{lag:.2f}\t{cc:.2f}\t{level:.1f}\t{agree}\t{blocks}\t{cover * 100:.0f}\t{ranges}")
+    sys.exit(0)
+
+if voiced(0, n) < MIN_MATCHED:
+    out("nomic")
+if sum(vs) < MIN_MATCHED:
+    out("nosys")
+
+# 电脑声音平常的音量：电脑的声音有声、但晚 L 帧之前（±3 帧）麦克风没声的那些帧（远端的人在说话），
+# 原始 dB（不压平）的中位数。不能把延迟那一遍自己也算进去：你说得多的时候，低 20 dB 的回声会把
+# 中位数拉下来，回声就显得没那么弱。这样的帧不到 5 秒（远端几乎没人说话）就没得比，算不过关
+rest = {}
+def call_level(L):
+    if L not in rest:
+        v = [es[j] for j in range(n) if vs[j] and voiced(j - L - 3, j - L + 4) == 0]
+        rest[L] = median(v) if len(v) >= 5 * FPS else None
+    return rest[L]
+
+rows = []   # (段起点, 延迟, 偏相关, 音量差, 麦克风有声帧数, 这段像不像, 外放漏音的相关, 外放漏音的延迟)
+for c0 in range(0, n, BLOCK):
+    c1 = min(n, c0 + BLOCK)
+    v = voiced(c0, c1)
+    if v < MIN_BLOCK:
+        continue
+    cs = [mic_sys(c0, c1, L) for L in range(LAG_MIN, LAG_MAX + 1)]
+    r0, L0 = near(c0, c1)
+    pcs = [partial(c0, c1, LAG_MIN + j, c, r0, L0) if c >= CORR_MIN / 2 else c for j, c in enumerate(cs)]
+    i = max(range(len(pcs)), key=pcs.__getitem__)
+    pk, L = pcs[i], LAG_MIN + i
+    side = [c for j, c in enumerate(cs) if abs(j - i) > 5]
+    rms = math.sqrt(sum(c * c for c in side) / len(side)) if side else 0.0
+    ref = call_level(L)
+    level = median(es[k + L] for k in range(c0, c1) if vm[k] and k + L < n) - ref if ref is not None else -99.0
+    ok = pk >= CORR_MIN and cs[i] >= PEAK_RATIO * rms and LAG_MIN < L < LAG_MAX and level >= LEVEL_MIN
+    rows.append((c0, L, pk, level, v, ok, r0, L0))
+if not rows:
+    out("nomic")
+
+cands = [r for r in rows if r[5]]
+med = median(r[1] for r in cands) if cands else 0
+agree = [r for r in cands if abs(r[1] - med) <= LAG_TOL]
+if len(agree) < MIN_AGREE:
+    b = max(rows, key=lambda r: r[2])
+    out("none", b[1] / FPS, b[2], b[3], len(agree), len(rows), 0.0)
+
+# 逐帧看麦克风有声的每一帧有没有副本：这一帧前后 ±0.24 秒（不压平的包络起伏）在电脑的声音里
+# 晚 med ±3 帧处像（归一化互相关 ≥ FRAME_MIN），而且那一处的电脑声音够响（比远端说话平常低不到
+# FRAME_LEVEL）。开外放时，麦克风录到的会议室音箱 / 笔记本外放的声音本来就是电脑的声音，在
+# 外放漏音的延迟（各段 ±0.2 秒里最像的那一处）上像、够响，也算有副本。
+# 隔壁同事也在会里时，同事的声音有副本，你自己的话没有：只按「这一段像不像」判，同事说得多就会
+# 把你盖住，所以必须逐帧数
+ref = call_level(med)
+leaks = [r[7] for r in rows if r[6] >= 0.3]
+lag_leak = median(leaks) if leaks else None
+def window(i):
+    return max(0, i - FW), min(n, i + FW + 1)
+def wcorr(i, l):
+    a, b = window(i)
+    a, b = max(a, -l), min(b, n - l)
+    if b - a < FW:
+        return 0.0
+    num = sum(map(mul, xm[a:b], xs[a + l:b + l]))
+    den = math.sqrt((mpre[b] - mpre[a]) * (spre[b + l] - spre[a + l]))
+    return num / den if den > 0 else 0.0
+def loud(i, l):
+    a, b = window(i)
+    a, b = max(a, -l), min(b, n - l)
+    if b <= a:
+        return False
+    e = (epre[b + l] - epre[a + l]) / (b - a)
+    return 10 * math.log10(e + 1e-10) - ref >= FRAME_LEVEL
+def wdb(pre, i, l):
+    a, b = window(i)
+    a, b = max(a, -l), min(b, n - l)
+    return 10 * math.log10((pre[b + l] - pre[a + l]) / (b - a) + 1e-10) if b > a else -100.0
+def candidate(i):
+    # 这一帧在哪条路上像、够响：返回 (路, 增益 dB)，增益 = 副本那一处的电脑声音 − 这一帧的麦克风
+    for k, c in enumerate((med, lag_leak)):
+        if c is None:
+            continue
+        for l in range(c - SLACK, c + SLACK + 1):
+            if wcorr(i, l) >= FRAME_MIN and loud(i, l):
+                return k, wdb(epre, i, l) - wdb(mlin, i, 0)
+    return None
+epre = [0.0] + list(accumulate(10 ** (v / 10) for v in es))
+mlin = [0.0] + list(accumulate(10 ** (v / 10) for v in em))
+cand = [candidate(i) if vm[i] else None for i in range(n)]
+# 增益还要和这条路上大多数帧一致（±GAIN_TOL）：同一个人经会议室设备传过来，增益差不多；隔壁同事
+# 在你麦克风里低 16 dB、在电脑的声音里正常音量，增益 +16 dB，而你自己和远端碰巧叠上的那几帧
+# 增益在 0 dB 上下，对不上
+gains = [median(c[1] for c in cand if c and c[0] == k) for k in (0, 1)]
+copy = [bool(c) and abs(c[1] - gains[c[0]]) <= GAIN_TOL for c in cand]
+weight = [10 ** (v / 10) for v in em]
+def share(a, b):
+    # 一段时间里麦克风有声的帧，有副本的占多少：按帧数、按能量（你自己离麦克风最近、最响）各算一个
+    fr = [i for i in range(a, b) if vm[i]]
+    if not fr:
+        return 1.0, 1.0
+    w = sum(weight[i] for i in fr)
+    return (sum(1 for i in fr if copy[i]) / len(fr),
+            sum(weight[i] for i in fr if copy[i]) / w if w > 0 else 0.0)
+
+# 支持的段：最像的延迟也落在 med 附近、偏相关 ≥ 0.2、音量过关，而且这一段麦克风说的话，按帧数、
+# 按能量都有 COVER_MIN 以上有副本。没副本的话在一段里占得多，这一段就不支持；只有一两秒时还在
+# 那 10% 里，会跟着这一段去掉（见 how-it-works 的已知问题：旁边同事的笔记本也在会里）
+support = []
+for r in rows:
+    if abs(r[1] - med) <= LAG_TOL and r[2] >= CORR_SUPPORT and r[3] >= LEVEL_MIN:
+        f, e = share(r[0], min(n, r[0] + BLOCK))
+        if f >= COVER_MIN and e >= COVER_MIN:
+            support.append(r)
+# 只留电脑声音的时段：从第一段支持的开始，到最后一段支持的结束（会议室设备晚进会、早退会，
+# 前后照常两路相加）。整个时段里也要按帧数、按能量都有 COVER_MIN 以上有副本
+start = support[0][0] if support else 0
+end = min(n, support[-1][0] + BLOCK) if support else 0
+f, e = share(start, end) if support else (0.0, 0.0)
+cover = min(f, e)
+matched = sum(1 for i in range(start, end) if vm[i] and copy[i])
+if support and matched >= MIN_MATCHED and cover >= COVER_MIN:
+    # 整场判成回声以后，也只在支持的段里去掉麦克风；时段里没过关的段（你说得多的那几段多半就在
+    # 这里）、麦克风没什么声音没看的段，都照常两路相加。相邻的段并成一个时段（秒，止秒向上取整）
+    secs = (n + FPS - 1) // FPS
+    spans = []
+    for r in support:
+        a, b = r[0] // FPS, min(secs, (r[0] + BLOCK + FPS - 1) // FPS)
+        if spans and spans[-1][1] == a:
+            spans[-1][1] = b
+        else:
+            spans.append([a, b])
+    rg = "all" if spans == [[0, secs]] else ",".join(f"{a}-{b}" for a, b in spans)
+    out("echo", med / FPS, median(r[2] for r in agree), median(r[3] for r in agree), len(agree), len(rows), cover, rg)
+f, e = share(0, n)
+b = max(rows, key=lambda r: r[2])
+out("none", b[1] / FPS, b[2], b[3], len(agree), len(rows), min(f, e))
+PYEOF
+}
+
+# 把文件刷到磁盘上再改名：mv 本身是原子的，但不先刷盘，断电时改名可能已经落盘、内容还没有，
+# 唯一的一份录音就成了空文件。macOS 的 fsync 只交给磁盘缓存，要 F_FULLFSYNC 才真正写进去
+_fsync() {   # _fsync <文件或目录>…
+    python3 -I -c 'import fcntl, os, sys
+for p in sys.argv[1:]:
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC) if hasattr(fcntl, "F_FULLFSYNC") else os.fsync(fd)
+    finally:
+        os.close(fd)' "$@"
+}
+
+# 开麦录的双声道录音定稿成单声道，原地替换会话里的 meeting_*.m4a：会议室设备在会里（见
+# _echo_check）就整场只留电脑的声音，否则两路相加（和以前一样）；配置 echo_check = off 时不查、
+# 直接两路相加。时长不变，以后按转录结果的时间戳剪片段也对得上。
+# 判成回声时在 .meetap/echo-check.txt 记一行结论（again 靠它知道麦克风去掉了）；配置
+# keep_stereo_original = true 时还把原始双声道录音留成 .meetap/<原名>.stereo-original.m4a，判错了
+# 可以退回（见 _echo_undo）。默认不留：会话文件夹和以前一样大，只有一个单声道 meeting_*.m4a。
+# 不丢音频：先写临时文件（按进程号起名，同一场 again 和后台转录同时跑也不会互相覆盖；上次被强杀
+# 留下的先清掉，见下面），写完刷到磁盘（_fsync），再用 mv 原子替换，任何时候都有一份完整的录音。
+# 结论和测出的数写进 meetap.log（stdout、stderr 已经接到日志上，检查出错的 Python 报错也在里面）。
+# 已经是单声道（定稿过、-m 录的、老版本录的）只清临时文件。返回 0 成功；2 混不出来（原录音不动）；
+# 3 这个文件还在录（不碰）
+_finalize_audio() {   # _finalize_audio <录音> <会话的 .meetap 目录>
+    local src="$1" diag="$2" ch res mode="" lag corr level agree blocks cover tmp f old_pid
+    # 还在录的文件不碰（again 那边已经拦了，这里再拦一次）
+    if [[ -f "$PID_FILE" && -f "$OUTPUT_FILE_MARKER" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null \
+       && [[ "$(cat "$OUTPUT_FILE_MARKER")" -ef "$src" ]]; then
+        return 3
+    fi
+    # 上次被强杀留下的临时文件：那个进程不在了，或者 10 分钟没再写过就删（进程号可能已经被别的
+    # 进程重用；正在定稿的 ffmpeg 一直在往里写，一小时的录音也就十几秒写完）
+    for f in "$diag"/finalize.*.m4a; do
+        [[ -e "$f" ]] || continue
+        old_pid=${f##*/finalize.}; old_pid=${old_pid%%.*}
+        if ! [[ "$old_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$old_pid" 2>/dev/null || [[ -n "$(find "$f" -mmin +10)" ]]; then
+            rm -f "$f"
+        fi
+    done
     ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$src" </dev/null 2>/dev/null)
-    [[ "$ch" == 1 ]] && return 1
-    local mix=(-af "pan=mono|c0=c0+c1")
+    [[ "$ch" == 1 ]] && return 0
+    tmp="$diag/finalize.$(exec sh -c 'echo $PPID').m4a"   # 本进程号：后台转录在子 shell 里，$$ 是父进程的
+    local mix=(-af "pan=mono|c0=c0+c1") ts="[$(date '+%H:%M:%S')]"
     [[ "$ch" == 2 ]] || mix=(-ac 1)   # 读不出声道数：交给 ffmpeg 自己混成单声道
-    ffmpeg -nostdin -v error -y -i "$src" "${mix[@]}" -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 -f mp4 "$dst" && return 0
-    rm -f "$dst"
-    return 2
+    if [[ "$ch" == 2 ]] && ! _flag "$CFG_ECHO_CHECK" on; then
+        echo "$ts $(_tn ECHO_DISABLED)"
+    elif [[ "$ch" == 2 ]]; then
+        res=$(_echo_check "$src")
+        IFS=$'\t' read -r mode lag corr level agree blocks cover ranges <<< "$res"
+        case "$mode" in
+            echo)
+                local stats
+                stats=$(_tn ECHO_STATS "$lag" "$corr" "$level" "$blocks" "$agree" "$cover")
+                if [[ "$ranges" == all ]]; then
+                    mix=(-af "pan=mono|c0=c1")
+                    res="$ts $(_tn ECHO_FOUND "$stats")"
+                else
+                    # 只在这些时段静掉麦克风，别的时段两路相加。每个时段一个 between()；ffmpeg 的表达式
+                    # 一长（实测 100 多个）就算不动，所以 40 个一组，每组一个 volume=0，串起来
+                    local r a b enable="" mute="" shown="" nb=0 muted=0
+                    for r in ${ranges//,/ }; do
+                        a=${r%-*}; b=${r#*-}
+                        enable+="${enable:++}between(t,$a,$b)"
+                        if (( ++nb % 40 == 0 )); then mute+="${mute:+,}volume=0:enable='$enable'"; enable=""; fi
+                        shown+="${shown:+, }$(printf '%d:%02d-%d:%02d' $((a / 60)) $((a % 60)) $((b / 60)) $((b % 60)))"
+                        muted=$((muted + b - a))
+                    done
+                    [[ -n "$enable" ]] && mute+="${mute:+,}volume=0:enable='$enable'"
+                    mix=(-filter_complex "[0:a:0]channelsplit=channel_layout=stereo[m][s];[m]$mute[mm];[mm][s]amix=inputs=2:normalize=0")
+                    res="$ts $(_tn ECHO_FOUND_PART "$stats" "$(printf '%d:%02d' $((muted / 60)) $((muted % 60)))" "$shown")"
+                fi
+                echo "$res"
+                ;;
+            none)  echo "$ts $(_tn ECHO_NONE "$lag" "$corr" "$level" "$blocks" "$agree" "$cover")" ;;
+            nosys) echo "$ts $(_tn ECHO_NO_SYSTEM)" ;;
+            nomic) echo "$ts $(_tn ECHO_NO_MIC)" ;;
+            *)     echo "$ts $(_tn ECHO_CHECK_FAILED)"; mode="" ;;
+        esac
+    fi
+    if ! ffmpeg -nostdin -v error -y -i "$src" "${mix[@]}" -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 -f mp4 "$tmp"; then
+        rm -f "$tmp"
+        return 2
+    fi
+    local orig="$diag/$(basename "${src%.m4a}").stereo-original.m4a"
+    if [[ "$mode" == echo ]] && _flag "$CFG_KEEP_STEREO_ORIGINAL" off; then
+        # 硬链接：不多占空间、不拷贝；替换以后它就是原始录音唯一的一份。文件系统不支持硬链接就拷贝，
+        # 先拷到临时名字（finalize.<进程号>.orig.m4a，被强杀也只会留下它，下次按临时文件清掉）再 mv，
+        # 免得留下拷了一半的「原始录音」
+        if [[ ! -e "$orig" ]] && ! ln "$src" "$orig" 2>/dev/null; then
+            local otmp="${tmp%.m4a}.orig.m4a"
+            if ! cp -p "$src" "$otmp" || ! _fsync "$otmp" || ! mv -f "$otmp" "$orig"; then
+                rm -f "$tmp" "$otmp"
+                return 2
+            fi
+        fi
+        echo "[$(date '+%H:%M:%S')] $(_tn ECHO_KEPT_ORIGINAL "${orig#"${diag%/*}"/}")"
+    fi
+    if ! _fsync "$tmp" || ! mv -f "$tmp" "$src"; then
+        rm -f "$tmp"
+        return 2
+    fi
+    _fsync "$diag/.." 2>/dev/null   # 改名本身也落盘
+    if [[ "$mode" == echo ]]; then
+        printf '%s\n' "$res" > "$diag/echo-check.txt"
+        osascript -e "display notification \"$(_tn NOTIFY_MIC_DROPPED)\" with title \"MeeTap\"" 2>/dev/null
+    fi
+    return 0
+}
+
+# 回声检查判错了的退路（again 调用，配置 echo_check = off 时才动）：
+#   - 留着原始双声道录音（keep_stereo_original = true 录的）：用它两路相加重做 meeting_*.m4a，
+#     删掉原始录音，旧转录稿挪进 archive/，接下来从头转录；
+#   - 判成过回声、但没留原始录音：麦克风那一路已经没了，照实说一句，again 照常往下跑
+_echo_undo() {   # _echo_undo <会话目录>
+    local dir="$1" orig dst tmp saved_job saved_bucket saved_region saved_key
+    _flag "$CFG_ECHO_CHECK" on && return 0
+    orig=$(find "$dir/.meetap" -maxdepth 1 -name '*.stereo-original.m4a' 2>/dev/null | sort | tail -1)
+    if [[ -z "$orig" ]]; then
+        [[ -f "$dir/.meetap/echo-check.txt" ]] && _t AGAIN_ECHO_NO_ORIGINAL
+        return 0
+    fi
+    dst="$dir/$(basename "${orig%.stereo-original.m4a}").m4a"
+    tmp="$dir/.meetap/finalize.$(exec sh -c 'echo $PPID').m4a"
+    if ! ffmpeg -nostdin -v error -y -i "$orig" -af "pan=mono|c0=c0+c1" -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 -f mp4 "$tmp" \
+       || ! _fsync "$tmp" || ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        _t ERR_ECHO_UNDO "$orig"
+        return 1
+    fi
+    rm -f "$orig" "$dir/.meetap/echo-check.txt"
+    # 旧转录稿是按只留电脑声音转的：挪走，again 才会从录音重新转；AWS 上没取回的旧任务也清掉
+    if [[ -f "$dir/log/transcript.txt" ]]; then
+        mkdir -p "$dir/archive"
+        mv "$dir/log/transcript.txt" "$dir/archive/$(date +%H%M%S)_transcript.txt"
+    fi
+    if [[ -f "$dir/.meetap/transcribe-job.json" ]]; then
+        IFS=$'\t' read -r saved_job saved_bucket saved_region saved_key < <(_job_file_read "$dir/.meetap/transcribe-job.json")
+        [[ "$saved_job" == meetap-* && "$saved_key" != "-" ]] && _transcribe_cleanup "$saved_bucket" "$saved_key" "$saved_job" "$saved_region"
+        rm -f "$dir/.meetap/transcribe-job.json"
+    fi
+    _t AGAIN_ECHO_UNDONE "$(basename "$dst")"
 }
 
 transcribe_recording() {
@@ -586,6 +1000,19 @@ transcribe_recording() {
     exec >> "$LOG_FILE" 2>&1
     _log_separator
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
+
+    # 开麦录的双声道录音先定稿成单声道（查会议室回声，见 _finalize_audio），原地替换。
+    # 后面的静音检查、上传、转录、以后剪片段，用的都是这个文件；定稿过的再跑一遍什么都不做
+    local fin_rc=0
+    _finalize_audio "$AUDIO_FILE" "$DIAG_DIR" || fin_rc=$?
+    if (( fin_rc == 3 )); then
+        _t ERR_STILL_RECORDING "$AUDIO_FILE"
+        return 1
+    elif (( fin_rc != 0 )); then
+        _t ERR_TRANSCRIBE_INPUT "$AUDIO_FILE"
+        osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
+    fi
 
     # 整段是数字静音（全 0 样本）就不上传转录：多半是没授权系统音频录制，
     # 或 --mute-microphone 时电脑一直没出声。必须在上传前查，上传步骤会删本地音频。
@@ -649,34 +1076,12 @@ transcribe_recording() {
             return 1
         fi
 
-        # 双声道录音（开麦录的）先混成单声道再传；key 还用原录音的文件名，again 照常认。
-        # 混出来的文件按进程号起名，同一场的 again 和后台转录同时跑也不会互相覆盖；
-        # 上次被强杀留下的（那个进程已经不在了）先清掉。传完（成功、失败都算）就删
-        local tx_pid f old_pid UPLOAD_FILE="$AUDIO_FILE" TX_INPUT tx_rc
-        tx_pid=$(exec sh -c 'echo $PPID')   # 本进程号：后台转录在子 shell 里跑，$$ 是父进程的
-        for f in "$DIAG_DIR"/transcribe-input.*.m4a; do
-            [[ -e "$f" ]] || continue
-            old_pid=${f##*/transcribe-input.}; old_pid=${old_pid%.m4a}
-            [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null || rm -f "$f"
-        done
-        TX_INPUT="$DIAG_DIR/transcribe-input.$tx_pid.m4a"
-        _transcribe_input "$AUDIO_FILE" "$TX_INPUT"; tx_rc=$?
-        if (( tx_rc == 0 )); then
-            UPLOAD_FILE="$TX_INPUT"
-        elif (( tx_rc == 2 )); then
-            _t ERR_TRANSCRIBE_INPUT "$AUDIO_FILE"
-            osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
-            return 1
-        fi
-
-        # Upload
+        # Upload（录音开头已经定稿成单声道，传的就是会话里那个文件）
         echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"
-        if ! _retry UPLOAD aws aws s3 cp "$UPLOAD_FILE" "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION"; then
-            rm -f "$TX_INPUT"
+        if ! _retry UPLOAD aws aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION"; then
             _t ERR_UPLOAD_FAILED
             return 1
         fi
-        rm -f "$TX_INPUT"
 
         # Start transcription
         echo "[$(date '+%H:%M:%S')] $(_tn START_JOB "$JOB_NAME")"
@@ -796,7 +1201,7 @@ PYEOF
     # 本地音频要等转录文本落盘后再删：上传后立刻删的话，转录中途休眠/断网，
     # transcript 没出来、音频也没了，meetap again 无从重跑
     if [[ "$CFG_AUDIO_PERSIST" != "true" && ! -f "$STATE_DIR/test-mode" && -s "$LOG_DIR/transcript.txt" ]]; then
-        rm -f "$AUDIO_FILE"
+        rm -f "$AUDIO_FILE" "$DIAG_DIR/$(basename "${AUDIO_FILE%.m4a}").stereo-original.m4a"
         echo "[$(date '+%H:%M:%S')] $(_tn LOCAL_AUDIO_DELETED)"
     fi
 
@@ -1713,6 +2118,13 @@ again_session() {
         1) _t ERR_AGAIN_SESSION_NOT_FOUND "$target" "$RECORDING_DIR"; exit 1 ;;
         2) _t ERR_AGAIN_NO_SESSIONS "$RECORDING_DIR"; exit 1 ;;
     esac
+    # 正在录的这一场一律不动（只重写纪要也不行，录音还没完）：转录前的定稿会把 ffmpeg 还在写的
+    # 录音换掉，后半段就没了。不带参数时默认取最新一场，正好就是正在录的
+    local live
+    if live=$(_recording_session_dir) && _same_dir "$live" "$SESSION_DIR"; then
+        _t ERR_AGAIN_RECORDING "$(basename "$SESSION_DIR")" "$0"
+        exit 1
+    fi
 
     local LOG_DIR="$SESSION_DIR/log"
     local TRANSCRIPT="$LOG_DIR/transcript.txt"
@@ -1726,6 +2138,10 @@ again_session() {
         printf '%s\n' "$extra_prompt" > "$SESSION_DIR/extra-requirements.md"
         _t AGAIN_EXTRA_PROMPT "$extra_prompt"
     fi
+
+    # 回声检查判错了：echo_check = off 时用留下的原始双声道录音重做两路相加（没留就说一声）。
+    # 放在归档旧纪要前面：退不回去时什么都还没动
+    _echo_undo "$SESSION_DIR" || exit 1
 
     # 归档旧纪要（md/html），避免重跑覆盖丢失历史版本
     local old note archive_dir="$SESSION_DIR/archive"
@@ -3364,7 +3780,7 @@ start_recording() {
 
     # audio-tap tap-start 输出 Float32 LE PCM 到 stdout：开麦时是双声道（声道 0 麦克风、
     # 声道 1 系统音，不混音），-m 时是单声道（只有系统音）。录音文件照原样存成双声道 m4a，
-    # 上传转录前再混成单声道（见 _transcribe_input）。
+    # 上传转录前定稿成单声道（查会议室回声，见 _echo_check、_finalize_audio）。
     # 下面注意 1~3 是早期架构的教训（那时 ffmpeg 用 avfoundation 自己读麦克风、两路混录），
     # 现在 ffmpeg 只读 FIFO、只做编码，留着防止回退：
     # 注意1：ffmpeg 的 stdin(pipe:0) 就是 audio-tap 的 PCM 数据管道，
@@ -3942,6 +4358,8 @@ case "${1:-}" in
                     "  max_speakers          = $CFG_MAX_SPEAKERS" \
                     "  audio_bitrate         = $CFG_AUDIO_BITRATE" \
                     "  audio_persist         = $CFG_AUDIO_PERSIST" \
+                    "  echo_check            = $CFG_ECHO_CHECK" \
+                    "  keep_stereo_original  = $CFG_KEEP_STEREO_ORIGINAL" \
                     "  multi_language        = $CFG_MULTI_LANGUAGE" \
                     "  visualizer            = $CFG_VISUALIZER" \
                     "  zero_alert_ignore     = ${CFG_ZERO_ALERT_IGNORE:-<none>}" \
