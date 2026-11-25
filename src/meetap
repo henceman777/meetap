@@ -381,9 +381,10 @@ autostop_daemon() {
     done
 }
 
-# 会话的诊断文件——录音诊断 audio-tap.log、发言统计 speaker-stats.txt、转录失败时留下的
-# transcribe-raw.json——放在会话里的隐藏目录 .meetap/（Finder 和 ls 默认看不到）。
-# log/ 里放用户会看的：转录文本 transcript.txt 和排错日志 meetap.log。
+# 会话的诊断文件——录音诊断 audio-tap.log、发言统计 speaker-stats.txt——放在会话里的隐藏目录
+# .meetap/（Finder 和 ls 默认看不到）。log/ 里放用户会看、会拿去用的：转录文本 transcript.txt、
+# 排错日志 meetap.log，和 Transcribe 原始结果 transcribe-raw.json（唯一带逐词时间和置信度的文件，
+# 转录成功、失败都留着；2.0.0 转录完就删，有用户要用这些数据，2.0.1 起不再删）。
 _diag_dir() {
     mkdir -p "$1/.meetap" 2>/dev/null
     printf '%s' "$1/.meetap"
@@ -685,7 +686,7 @@ transcribe_recording() {
 
     # Download result
     echo "[$(date '+%H:%M:%S')] $(_tn DOWNLOADING)"
-    if ! _retry DOWNLOAD aws aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$DIAG_DIR/transcribe-raw.json" --region "$AWS_REGION"; then
+    if ! _retry DOWNLOAD aws aws s3 cp "s3://${BUCKET}/${JOB_NAME}.json" "$LOG_DIR/transcribe-raw.json" --region "$AWS_REGION"; then
         [[ -n "$RETRY_GAVE_UP" ]] && return 1
         # 结果文件没了（不是凭证、网络问题）：任务也清掉，again 时从头转
         _t ERR_TRANSCRIBE_FAILED "${RETRY_LAST_MSG:-download}"
@@ -703,7 +704,7 @@ import json, sys, os
 
 session_dir = sys.argv[1]
 log_dir = os.path.join(session_dir, "log")
-raw_json = os.path.join(session_dir, ".meetap", "transcribe-raw.json")
+raw_json = os.path.join(log_dir, "transcribe-raw.json")
 output_txt = os.path.join(log_dir, "transcript.txt")
 
 try:
@@ -767,7 +768,7 @@ PYEOF
     rm -f "$JOB_FILE"
 
     if (( tx_rc == 3 )); then
-        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 .meetap/ 里备查。
+        # 一个词都没识别出来（录音只有几秒、或者没人说话）：不生成纪要；原始结果留在 log/ 里备查。
         # meta.json 记下来，等着认的日历也定成 no_speech，meetap <文件夹> 照这个显示
         _meta no-speech "$SESSION_DIR" on >/dev/null 2>&1
         echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_NO_SPEECH "$AUDIO_FILE")"
@@ -785,7 +786,7 @@ PYEOF
 import json, sys, os
 session_dir = sys.argv[1]
 diag_dir = os.path.join(session_dir, ".meetap")
-raw_json = os.path.join(diag_dir, "transcribe-raw.json")
+raw_json = os.path.join(session_dir, "log", "transcribe-raw.json")
 stats_file = os.path.join(diag_dir, "speaker-stats.txt")
 with open(raw_json) as f:
     data = json.load(f)
@@ -814,10 +815,6 @@ with open(stats_file, "w") as f:
     f.write("\n".join(lines) + "\n")
 print(f"Speaker stats saved: {stats_file}")
 PYEOF
-
-    if [[ -s "$LOG_DIR/transcript.txt" && -s "$DIAG_DIR/speaker-stats.txt" ]]; then
-        rm -f "$DIAG_DIR/transcribe-raw.json"
-    fi
 
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_DONE "$LOG_DIR/transcript.txt")"
     osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_DONE)\" with title \"MeeTap\"" 2>/dev/null
