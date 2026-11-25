@@ -447,7 +447,8 @@ _retry() {
         esac
         n=$((n + 1))
         if (( SECONDS - t0 >= RETRY_LIMIT )); then
-            echo "[$(date '+%H:%M:%S')] $(_tn RETRY_GAVE_UP "$name" "$(( (RETRY_LIMIT + 59) / 60 ))" "$RETRY_SESSION")" >&2
+            # 终端里的提示加引号能直接复制（路径有空格时）；通知原样写，引号转义 AppleScript 不认
+            echo "[$(date '+%H:%M:%S')] $(_tn RETRY_GAVE_UP "$name" "$(( (RETRY_LIMIT + 59) / 60 ))" "$(_shell_word "$RETRY_SESSION")")" >&2
             _notify "$(_tn NOTIFY_RETRY_GAVE_UP "$name" "$RETRY_SESSION")"
             RETRY_GAVE_UP=1; RETRY_DOWN=""
             rm -f "$errf"; return $rc
@@ -555,6 +556,7 @@ _transcribe_cleanup() {   # _transcribe_cleanup <桶> <音频 key> <任务名> <
 transcribe_recording() {
     local AUDIO_FILE="$1"
     local SESSION_DIR="$2"
+    local TEED="${3:-}"   # teed：调用方（前台 again）已经把输出 tee 进日志、同时显示在终端
     local LOG_DIR="$SESSION_DIR/log"
     mkdir -p "$LOG_DIR"
     local DIAG_DIR
@@ -567,8 +569,9 @@ transcribe_recording() {
 
     # 语音文件保留在 session 根目录原位，不再移入 log/（用户要求位置不变动）
 
-    # 接着往后写，不冲掉上一次的日志（again 重跑时，上一次为什么失败还看得到）
-    exec >> "$LOG_FILE" 2>&1
+    # 接着往后写，不冲掉上一次的日志（again 重跑时，上一次为什么失败还看得到）。
+    # again 在前台跑时由调用方 tee 进日志、同时显示在终端（第三个参数 teed），这里不再改 stdout
+    [[ "$TEED" == teed ]] || exec >> "$LOG_FILE" 2>&1
     _log_separator
     echo "[$(date '+%H:%M:%S')] $(_tn TRANSCRIBE_STARTED)"
 
@@ -580,7 +583,7 @@ transcribe_recording() {
     if [[ -n "$max_vol" ]] && (( ${max_vol%%.*} <= -90 )); then
         _t ERR_RECORDING_SILENT "$AUDIO_FILE" "$0"
         osascript -e "display notification \"$(_tn NOTIFY_RECORDING_SILENT)\" with title \"MeeTap\"" 2>/dev/null
-        return 1
+        return 3   # 重跑也一样是静音，上面已经说了怎么办；again 不再提示重跑
     fi
 
     # 日历：按录音时段收候选（查不到就跳过，最多十几秒）；转录完、生成纪要之前再按内容认
@@ -1498,9 +1501,11 @@ summarize_transcript() {
         [[ -n "$CAL_NOTIFY" ]] && notes_msg+="$(_tn NOTIFY_CAL_SEP)$CAL_NOTIFY"
         osascript -e "display notification \"${notes_msg//\"/}\" with title \"MeeTap\"" 2>/dev/null
         send_meeting_notes "$FINAL_OUTPUT" "$SESSION_DIR"
+        return 0   # 纪要已经生成；邮件发没发出去由 send_meeting_notes 自己提示，不算纪要失败
     else
         echo "[$(date '+%H:%M:%S')] $(_tn NOTES_FAILED)"
         osascript -e "display notification \"$(_tn NOTIFY_NOTES_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+        return 1
     fi
 }
 
@@ -1659,6 +1664,13 @@ tidy_sessions() {
     done < <("$py" -I -c "$(_tidy_py)" "$RECORDING_DIR" "$apply")
 }
 
+# again 里一步的结果：3 表示已经提示过该怎么办（_retry 等到上限放弃时说了怎么重跑，录音整段静音时说了原因），
+# again 不再加一句重跑提示
+_again_rc() {
+    [[ "$1" != 0 && -n "$RETRY_GAVE_UP" ]] && return 3
+    return "$1"
+}
+
 # meetap again [会议目录名] —— 对已有会议重新执行生成任务。
 # 应对三类场景：1) materials/ 新增了资料要重新生成纪要；2) 上次转录或
 # 纪要生成失败要重跑；3) 有新要求（编辑 <session>/extra-requirements.md
@@ -1713,7 +1725,9 @@ again_session() {
             _log_separator
             calendar_collect_for_session "$SESSION_DIR"
             summarize_transcript "$SESSION_DIR"
+            _again_rc $?
         } 2>&1 | tee -a "$LOG_DIR/meetap.log"
+        rc=${PIPESTATUS[0]}
     else
         # 无转录：从音频重跑全链路
         local AUDIO_FILE
@@ -1723,7 +1737,14 @@ again_session() {
             exit 1
         fi
         _t AGAIN_FROM_TRANSCRIBE "$(basename "$AUDIO_FILE")"
-        transcribe_recording "$AUDIO_FILE" "$SESSION_DIR"
+        # 和上面只重跑纪要一样：过程 tee 进日志、同时显示在终端。以前 transcribe_recording
+        # 把 stdout 整个改到日志里，终端十来分钟一片空白，纪要失败也看不到，只好再跑一次 again
+        ( transcribe_recording "$AUDIO_FILE" "$SESSION_DIR" teed; _again_rc $? ) 2>&1 | tee -a "$LOG_DIR/meetap.log"
+        rc=${PIPESTATUS[0]}
+    fi
+    # 3：已经提示过该怎么办（见 _again_rc），别再说一遍。提示也记进日志；路径有空格时加引号，能直接复制
+    if (( rc != 0 && rc != 3 )); then
+        _t AGAIN_FAILED_HINT "$(_shell_word "$(_session_ref "$SESSION_DIR")")" 2>&1 | tee -a "$LOG_DIR/meetap.log"
     fi
 
     # 因休眠结束的会话补跑出转录后，清除待办提示
@@ -1731,6 +1752,7 @@ again_session() {
         && [[ "$(cat "$PENDING_AGAIN_FILE")" == "$(basename "$SESSION_DIR")" ]]; then
         rm -f "$PENDING_AGAIN_FILE"
     fi
+    return $rc
 }
 
 # 会话里实际的纪要 md（mark 和贴标签回显共用）：目录下最新 *.md，排除 archive/、
@@ -2367,7 +2389,10 @@ calendar_recognize() {
         # 放进单独的进程组，超时连子进程一起杀。凭证问题等着恢复（反正下一步生成纪要也要用凭证）；
         # 别的问题（超时、出错）不重试，马上按时间兜底
         [[ -n "$RETRY_SESSION" ]] || RETRY_SESSION=$(_session_ref "$dir")
+        # 日历认不出来不耽误纪要（按时间兜底），这一步放弃不算这一轮放弃：别让 again 以为已经提示过重跑
+        local gave_up_before="$RETRY_GAVE_UP"
         _retry CALENDAR cred _run_with_timeout "$CAL_LLM_TIMEOUT" "$0" _calendar-llm "$prompt" "$llm" </dev/null >/dev/null; rc=$?
+        RETRY_GAVE_UP="$gave_up_before"
         if (( rc == 124 )); then status="timeout"; elif (( rc != 0 )) || [[ ! -s "$llm" ]]; then status="failed"; fi
         if [[ "$status" != ok ]]; then
             err="$RETRY_LAST_MSG"
@@ -2891,9 +2916,16 @@ _tag_list() {
 # meetap <会话>：显示这场会的信息，不开录
 # 会话的写法：在 recording_dir 下就写相对路径（20261118_1201、2026-10/20261008_1046），否则写全路径
 _session_ref() {
-    local rd
+    local rd r
     rd="$(cd -- "$RECORDING_DIR" 2>/dev/null && pwd)"
-    if [[ -n "$rd" && "$1" == "$rd/"* ]]; then printf '%s' "${1#"$rd/"}"; else printf '%s' "$1"; fi
+    if [[ -n "$rd" && "$1" == "$rd/"* ]]; then
+        # recording_dir 写成以 / 结尾时会话路径是 <rd>//<名>，多出来的 / 也去掉，不然成了 /<名>
+        r="${1#"$rd/"}"
+        while [[ "$r" == /* ]]; do r="${r#/}"; done
+        printf '%s' "$r"
+    else
+        printf '%s' "$1"
+    fi
 }
 
 # 日历时段的短写法：12:00–13:00（取 ISO 时间里的时分）
