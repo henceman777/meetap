@@ -22,7 +22,9 @@ multi_language = false
 # ── Recording ─────────────────────────────────────────────────
 # Output directory
 recording_dir = ~/Record
-# Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
+# Audio bitrate (64k=small file, 128k=balanced, 256k=high quality). With the mic on, the two channels
+# share it while recording (128k = 64k per channel, plenty for speech; 64k leaves 32k per channel and
+# sounds muffled, so use 96k or more), and the final mono file is encoded at this rate again.
 audio_bitrate = 128k
 # Keep the local audio file after transcription (true=keep, false=delete once the transcript is saved)
 audio_persist = true
