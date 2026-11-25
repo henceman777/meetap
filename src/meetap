@@ -552,6 +552,21 @@ _transcribe_cleanup() {   # _transcribe_cleanup <桶> <音频 key> <任务名> <
     aws transcribe delete-transcription-job --transcription-job-name "$3" --region "$4" 2>/dev/null
 }
 
+# 转录用的单声道音频。开麦录的 m4a 是双声道（声道 0 麦克风、声道 1 电脑的声音），Transcribe
+# 收到的要和以前一样是两路相加的单声道，所以上传前混好写到 <输出>（mp4 封装）。
+# 返回 0：<输出> 写好了，传它；1：录音本来就是单声道（-m 录的、老版本录的），直接传原文件；
+# 2：混不出来（<输出> 已删）。不管哪种，都不会把双声道文件交给 Transcribe
+_transcribe_input() {   # _transcribe_input <录音> <输出>
+    local src="$1" dst="$2" ch
+    ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$src" </dev/null 2>/dev/null)
+    [[ "$ch" == 1 ]] && return 1
+    local mix=(-af "pan=mono|c0=c0+c1")
+    [[ "$ch" == 2 ]] || mix=(-ac 1)   # 读不出声道数：交给 ffmpeg 自己混成单声道
+    ffmpeg -nostdin -v error -y -i "$src" "${mix[@]}" -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 -f mp4 "$dst" && return 0
+    rm -f "$dst"
+    return 2
+}
+
 transcribe_recording() {
     local AUDIO_FILE="$1"
     local SESSION_DIR="$2"
@@ -634,12 +649,34 @@ transcribe_recording() {
             return 1
         fi
 
+        # 双声道录音（开麦录的）先混成单声道再传；key 还用原录音的文件名，again 照常认。
+        # 混出来的文件按进程号起名，同一场的 again 和后台转录同时跑也不会互相覆盖；
+        # 上次被强杀留下的（那个进程已经不在了）先清掉。传完（成功、失败都算）就删
+        local tx_pid f old_pid UPLOAD_FILE="$AUDIO_FILE" TX_INPUT tx_rc
+        tx_pid=$(exec sh -c 'echo $PPID')   # 本进程号：后台转录在子 shell 里跑，$$ 是父进程的
+        for f in "$DIAG_DIR"/transcribe-input.*.m4a; do
+            [[ -e "$f" ]] || continue
+            old_pid=${f##*/transcribe-input.}; old_pid=${old_pid%.m4a}
+            [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null || rm -f "$f"
+        done
+        TX_INPUT="$DIAG_DIR/transcribe-input.$tx_pid.m4a"
+        _transcribe_input "$AUDIO_FILE" "$TX_INPUT"; tx_rc=$?
+        if (( tx_rc == 0 )); then
+            UPLOAD_FILE="$TX_INPUT"
+        elif (( tx_rc == 2 )); then
+            _t ERR_TRANSCRIBE_INPUT "$AUDIO_FILE"
+            osascript -e "display notification \"$(_tn NOTIFY_TRANSCRIBE_FAILED)\" with title \"MeeTap\"" 2>/dev/null
+            return 1
+        fi
+
         # Upload
         echo "[$(date '+%H:%M:%S')] $(_tn UPLOADING)"
-        if ! _retry UPLOAD aws aws s3 cp "$AUDIO_FILE" "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION"; then
+        if ! _retry UPLOAD aws aws s3 cp "$UPLOAD_FILE" "s3://${BUCKET}/${AUDIO_KEY}" --region "$AWS_REGION"; then
+            rm -f "$TX_INPUT"
             _t ERR_UPLOAD_FAILED
             return 1
         fi
+        rm -f "$TX_INPUT"
 
         # Start transcription
         echo "[$(date '+%H:%M:%S')] $(_tn START_JOB "$JOB_NAME")"
@@ -3325,8 +3362,11 @@ start_recording() {
     ORIG_NAME=$("$TOOL" default-output-name 2>/dev/null || echo "Unknown")
     MIC_NAME=$("$TOOL" default-input-name 2>/dev/null || echo "default")
 
-    # audio-tap tap-start 输出 Float32 LE mono PCM 到 stdout
-    # ffmpeg 从 stdin 读系统音 + avfoundation 读麦克风,混录输出
+    # audio-tap tap-start 输出 Float32 LE PCM 到 stdout：开麦时是双声道（声道 0 麦克风、
+    # 声道 1 系统音，不混音），-m 时是单声道（只有系统音）。录音文件照原样存成双声道 m4a，
+    # 上传转录前再混成单声道（见 _transcribe_input）。
+    # 下面注意 1~3 是早期架构的教训（那时 ffmpeg 用 avfoundation 自己读麦克风、两路混录），
+    # 现在 ffmpeg 只读 FIFO、只做编码，留着防止回退：
     # 注意1：ffmpeg 的 stdin(pipe:0) 就是 audio-tap 的 PCM 数据管道，
     # 绝不能加 < /dev/null（会覆盖管道 → tap 收 EPIPE 秒退 → 录音全空）。
     # 注意2：avfoundation 自带挂钟时间戳而 pipe 从 0 开始，两路直接 amix
@@ -3339,7 +3379,7 @@ start_recording() {
     # （该链条在 ffmpeg 卡死时断裂，留下孤儿 tap 占住音频链路，
     # 导致下一次录制 ffmpeg 打不开输入 → 恶性循环）。
     # meetily 架构：audio-tap 进程内采系统音(tap) + 麦克风(CoreAudio 输入
-    # IO proc)，ring buffer 混音后输出单路 PCM；ffmpeg 只做编码、零设备
+    # IO proc)，ring buffer 对齐后输出一路 PCM（一路源一个声道）；ffmpeg 只做编码、零设备
     # 访问——彻底消灭 avfoundation 与 tap 的设备竞态（用户环境必现卡死）。
     # 电平双文件由 audio-tap 内部输出（tap-level 系统音 / mic-level 麦克风）。
     # audio-tap 的输出自带时钟：系统没播放、也没麦克风时按时补零，stdout
@@ -3358,8 +3398,10 @@ start_recording() {
         rm -f "$STATE_DIR/tap-level" "$STATE_DIR/mic-level" "$TAP_FIFO" "$STATE_DIR/ffmpeg.log"
         mkfifo "$TAP_FIFO"
 
-        local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level")
-        $MUTE_MIC && mic_args=()
+        # 声道数只看开没开麦（audio-tap 那边麦克风打不开时声道 0 全零，声道数不变），
+        # 和 ffmpeg 的 -ac 必须是同一个值
+        local mic_args=(--with-mic --mic-level-file "$STATE_DIR/mic-level") tap_ch=2
+        $MUTE_MIC && { mic_args=(); tap_ch=1; }
         _jobctl_on
         # --zero-alert-text：有声音在放、tap 交出的却全是零时，audio-tap 弹的通知文案
         # （{apps} 换成在放声音的 App，每个写成「显示名（bundle ID）」，写法和分隔符按当前语言传入；整场都查，零段起止记进 tap.log，stop 时随 audio-tap.log
@@ -3381,8 +3423,8 @@ start_recording() {
         # stdin=/dev/null 读到 EOF 判为 N 而秒退 → time= 不推进 → 健康探测
         # 误判「tap 无数据」触发自愈，3 次全撞同一文件 → 假报“反复无数据”。
         _jobctl_on
-        ffmpeg -y -f f32le -ar "$TAP_RATE" -ac 1 -i "$TAP_FIFO" \
-            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac 1 \
+        ffmpeg -y -f f32le -ar "$TAP_RATE" -ac "$tap_ch" -i "$TAP_FIFO" \
+            -c:a aac -b:a "$CFG_AUDIO_BITRATE" -ac "$tap_ch" \
             "${FFMPEG_MUX_ARGS[@]}" \
             "$OUTPUT_FILE" \
             < /dev/null > "$STATE_DIR/ffmpeg.log" 2>&1 &

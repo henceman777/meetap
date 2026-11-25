@@ -3,7 +3,8 @@
 #   假 aws 命令行、假 boto3（生成纪要、认日历、发邮件）按计划先失败几次再恢复，或者一直失败；
 #   MEETAP_RETRY_LIMIT_SEC 把每一步的 15 分钟缩成几秒。
 # 覆盖：各步骤断了等着、恢复了接着跑完；通知只弹两次；等到上限放弃；again 复用 AWS 上已完成的转录任务；
-# S3 只删这一场自己的文件；日志接着往后写；别的错误不空等；认日历时凭证问题等、别的问题马上兜底。
+# S3 只删这一场自己的文件；日志接着往后写；别的错误不空等；认日历时凭证问题等、别的问题马上兜底；
+# 开麦录的双声道录音上传前混成单声道，混出来的文件不管传没传成都删掉，混不出来就不上传。
 #
 # 用法: test/retry-test.sh
 set -uo pipefail
@@ -56,6 +57,8 @@ clear_plans() { rm -f "$FAKE"/plan-* "$FAKE"/count-*; }
 cat > "$FAKEBIN/aws" <<EOF
 #!/bin/bash
 echo "\$*" >> "$FAKE/aws.log"
+# 上传的那个文件留一份，看传上去的是什么
+[[ "\$1 \$2" == "s3 cp" && "\$3" != s3://* ]] && cp "\$3" "$FAKE/uploaded.m4a" 2>/dev/null
 step=""
 case "\$1 \$2" in
     "sts get-caller-identity")          step=sts; op=GetCallerIdentity ;;
@@ -309,6 +312,50 @@ use_cfg
 diff <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-zh-CN.sh" | sort) \
      <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-en-US.sh" | sort) >/dev/null \
     && pass "中英两份提示语的 key 一致" || fail "中英提示语 key 不一致"
+
+# ── 12. 开麦录的双声道录音：上传混好的单声道（key 还是原录音的文件名），传完、传失败都删掉 ──
+# 两路是两个人（按随机音节开关的带通噪声），各垫一个轻音当记号：麦克风 5 kHz、电脑的声音 7 kHz
+voice() {
+    echo "anoisesrc=r=48000:c=pink:seed=$2:a=0.5,bandpass=f=1000:width_type=o:w=2[n$1];anoisesrc=r=1000:c=white:seed=$(($2 + 100)),lowpass=f=4,lowpass=f=4[s$1];anoisesrc=r=1000:c=white:seed=$(($2 + 200)),lowpass=f=0.3,lowpass=f=0.3[p$1];[s$1][p$1]amerge=inputs=2,aeval=gt(val(0)\,0)*gt(val(1)\,0):c=mono,aresample=48000[g$1];[n$1][g$1]amultiply"
+}
+stereo_session() {   # stereo_session <文件夹名> <音频时间戳>：40 秒双声道录音
+    local d="$REC/$1"
+    mkdir -p "$d/materials"
+    ffmpeg -v quiet -filter_complex "$(voice m 1)[vm];sine=f=5000:r=48000,volume=0.1[tm];[vm][tm]amix=inputs=2:normalize=0[mic];$(voice s 2)[vs];sine=f=7000:r=48000,volume=0.1[ts];[vs][ts]amix=inputs=2:normalize=0[sys];[mic][sys]join=inputs=2:channel_layout=stereo,atrim=0:40" \
+        -c:a aac -b:a 128k "$d/meeting_$2.m4a" </dev/null
+    printf '%s' "$d"
+}
+tone_db() {   # tone_db <文件> <频率>：那个频率附近的平均音量（dB）
+    ffmpeg -nostdin -i "$1" -af "bandpass=f=$2:width_type=q:w=20,volumedetect" -f null - 2>&1 | sed -n 's/.*mean_volume: \([-0-9.]*\) dB.*/\1/p'
+}
+loud() { awk -v v="$1" 'BEGIN { exit !(v != "" && v > -50) }'; }
+leftover() { ls "$1/.meetap/" 2>/dev/null | grep '^transcribe-input'; }
+S12=$(stereo_session 20261119_1800 20261119_180005)
+# 上次被强杀留下的混音文件（那个进程已经不在了）：这次开头就清掉
+sleep 0 & dead=$!; wait $dead
+mkdir -p "$S12/.meetap"; echo stale > "$S12/.meetap/transcribe-input.$dead.m4a"
+clear_plans; rm -f "$FAKE/uploaded.m4a"
+again "$S12"
+up=$(grep '^s3 cp ' "$FAKE/aws.log" | grep -v '^s3 cp s3://' | head -1)
+ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$FAKE/uploaded.m4a" 2>/dev/null)
+v5=$(tone_db "$FAKE/uploaded.m4a" 5000); v7=$(tone_db "$FAKE/uploaded.m4a" 7000)
+done_ok "$S12" && [[ "$up" == "s3 cp $S12/.meetap/transcribe-input."*".m4a s3://"*"/meeting_20261119_180005.m4a --region us-east-1" ]] \
+    && [[ "$ch" == 1 ]] && loud "$v5" && loud "$v7" \
+    && pass "双声道录音：上传的是两路相加的单声道（麦克风 ${v5} dB、电脑的声音 ${v7} dB），key 用原文件名" \
+    || fail "双声道录音 (rc=$RC): 上传「$up」声道 $ch，麦克风 $v5 dB、电脑的声音 $v7 dB"
+[[ -z "$(leftover "$S12")" && -f "$S12/meeting_20261119_180005.m4a" ]] \
+    && pass "混出来的文件传完就删、上次留下的也清了，原录音还在" || fail "留下了: $(leftover "$S12")"
+S12b=$(stereo_session 20261119_1810 20261119_181005)
+clear_plans; plan up other always
+again "$S12b"
+[[ -z "$(leftover "$S12b")" ]] && grep -q 'Upload failed' "$LOG" \
+    && pass "上传失败：混出来的文件也删了" || fail "上传失败后留下了: $(leftover "$S12b") / $(tail -3 "$LOG")"
+clear_plans
+# 混不出来（录音坏了，ffprobe、ffmpeg 都读不了）：报错、不上传，绝不把原文件交出去
+S12c="$REC/20261119_1820"; mkdir -p "$S12c/materials"; head -c 4096 /dev/urandom > "$S12c/meeting_20261119_182005.m4a"
+again "$S12c"
+! grep -q '^s3 cp .* s3://' "$FAKE/aws.log" && grep -q '没能把双声道录音混成单声道，没有上传' "$LOG" && [[ -z "$(leftover "$S12c")" ]] \
+    && pass "混不出来：报错、不上传" || fail "混不出来时: $(grep '^s3 cp' "$FAKE/aws.log") / $(tail -3 "$LOG")"
 
 echo
 [[ $FAIL -eq 0 ]] && echo "ALL PASS" || echo "SOME FAILED"

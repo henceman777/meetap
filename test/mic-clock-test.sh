@@ -27,9 +27,10 @@ PLIST="$REPO_ROOT/src/audio-tap-Info.plist"
 
 DUR=3                                  # 采集时长（秒）
 RATE=48000                             # 本机 tap/mic 均为 48k（脚本内仅用于阈值估算）
-# 阈值：0.5 秒 mono Float32 = 48000*4*0.5 = 96000 字节。远低于 3 秒理论量
-# (~576KB)，留足调度抖动余量；又远高于「回调没触发」的 0 字节，判别清晰。
-MIN_BYTES=96000
+# 阈值：每个声道 0.5 秒 Float32 = 48000*4*0.5 = 96000 字节，乘声道数（--with-mic 双声道，
+# 读 stderr 的 CHANNELS=）。远低于 3 秒理论量（每声道 ~576KB），留足调度抖动余量；
+# 又远高于「回调没触发」的 0 字节，判别清晰。
+MIN_BYTES_PER_CH=96000
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -57,10 +58,12 @@ FAIL=0
 for MODE in "--with-mic" ""; do
     "$BIN" tap-start $MODE --duration "$DUR" > "$OUT" 2> "$ERRLOG" || true
     BYTES=$(wc -c < "$OUT" | tr -d ' ')
+    CH=$(sed -n 's/^CHANNELS=//p' "$ERRLOG"); CH=${CH:-1}
+    MIN_BYTES=$(( MIN_BYTES_PER_CH * CH ))
     echo ""
     echo "== [${MODE:-无麦克风}] audio-tap stderr =="
     cat "$ERRLOG"
-    echo "== [${MODE:-无麦克风}] stdout PCM 字节数 = ${BYTES} (阈值 ${MIN_BYTES}) =="
+    echo "== [${MODE:-无麦克风}] stdout PCM 字节数 = ${BYTES}（${CH} 声道，阈值 ${MIN_BYTES}）=="
     if [[ "$BYTES" -ge "$MIN_BYTES" ]]; then
         echo "PASS: 系统静音时仍持续输出 PCM。"
     else
