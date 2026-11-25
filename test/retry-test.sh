@@ -3,7 +3,8 @@
 #   假 aws 命令行、假 boto3（生成纪要、认日历、发邮件）按计划先失败几次再恢复，或者一直失败；
 #   MEETAP_RETRY_LIMIT_SEC 把每一步的 15 分钟缩成几秒。
 # 覆盖：各步骤断了等着、恢复了接着跑完；通知只弹两次；等到上限放弃；again 复用 AWS 上已完成的转录任务；
-# S3 只删这一场自己的文件；日志接着往后写；别的错误不空等；认日历时凭证问题等、别的问题马上兜底。
+# S3 只删这一场自己的文件；日志接着往后写；别的错误不空等；认日历时凭证问题等、别的问题马上兜底；
+# 开麦录的双声道录音上传前定稿成单声道（查会议室回声）、原地替换，会话里不多留文件，混不出来就不上传。
 #
 # 用法: test/retry-test.sh
 set -uo pipefail
@@ -56,6 +57,8 @@ clear_plans() { rm -f "$FAKE"/plan-* "$FAKE"/count-*; }
 cat > "$FAKEBIN/aws" <<EOF
 #!/bin/bash
 echo "\$*" >> "$FAKE/aws.log"
+# 上传的那个文件留一份，看传上去的是什么
+[[ "\$1 \$2" == "s3 cp" && "\$3" != s3://* ]] && cp "\$3" "$FAKE/uploaded.m4a" 2>/dev/null
 step=""
 case "\$1 \$2" in
     "sts get-caller-identity")          step=sts; op=GetCallerIdentity ;;
@@ -309,6 +312,128 @@ use_cfg
 diff <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-zh-CN.sh" | sort) \
      <(grep -oE '^MSG_[A-Z_0-9]+' "$REPO_ROOT/src/i18n/messages-en-US.sh" | sort) >/dev/null \
     && pass "中英两份提示语的 key 一致" || fail "中英提示语 key 不一致"
+
+# ── 12. 开麦录的双声道录音：先定稿成单声道（原地替换），上传的就是会话里的那个文件 ──
+# 两路是两个人（按随机音节开关的带通噪声），各垫一个轻音当记号：麦克风 5 kHz、电脑的声音 7 kHz
+voice() {
+    echo "anoisesrc=r=48000:c=pink:seed=$2:a=0.5,bandpass=f=1000:width_type=o:w=2[n$1];anoisesrc=r=1000:c=white:seed=$(($2 + 100)),lowpass=f=4,lowpass=f=4[s$1];anoisesrc=r=1000:c=white:seed=$(($2 + 200)),lowpass=f=0.3,lowpass=f=0.3[p$1];[s$1][p$1]amerge=inputs=2,aeval=gt(val(0)\,0)*gt(val(1)\,0):c=mono,aresample=48000[g$1];[n$1][g$1]amultiply"
+}
+# stereo_session <文件夹名> <音频时间戳> [room]：双声道录音；带 room 就是会议室设备也在会里
+# （电脑的声音里有麦克风人声晚 1.5 秒的一遍，和远端一样响）；不带是普通线上会。都是 4 分钟（短了判断不了）
+stereo_session() {
+    local d="$REC/$1" sys="$(voice s 2)" secs=240 mic="$(voice m 1)"
+    [[ "${3:-}" == room ]] && { mic="$(voice m 1),asplit[vm][r2];[r2]adelay=1500,volume=0.7[echo];$(voice s 2),volume=0.7[rem];[echo][rem]amix=inputs=2:normalize=0"; sys=""; }
+    mkdir -p "$d/materials"
+    if [[ -n "$sys" ]]; then
+        mic="$mic[vm];$sys"
+    fi
+    ffmpeg -v quiet -filter_complex "$mic[vs];sine=f=5000:r=48000,volume=0.1[tm];[vm][tm]amix=inputs=2:normalize=0[mic];sine=f=7000:r=48000,volume=0.1[ts];[vs][ts]amix=inputs=2:normalize=0[sys];[mic][sys]join=inputs=2:channel_layout=stereo,atrim=0:$secs" \
+        -c:a aac -b:a 128k "$d/meeting_$2.m4a" </dev/null
+    printf '%s' "$d"
+}
+tone_db() {   # tone_db <文件> <频率> [起 止]：那个频率附近的平均音量（dB）
+    ffmpeg -nostdin ${3:+-ss "$3" -to "$4"} -i "$1" -af "bandpass=f=$2:width_type=q:w=20,volumedetect" -f null - 2>&1 | sed -n 's/.*mean_volume: \([-0-9.]*\) dB.*/\1/p'
+}
+loud() { awk -v v="$1" 'BEGIN { exit !(v != "" && v > -50) }'; }
+chans() { ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$1" 2>/dev/null; }
+extra_audio() { find "$1" -name '*.m4a' ! -path "$1/meeting_*.m4a" | sed "s|^$1/||"; }
+S12=$(stereo_session 20261119_1800 20261119_180005)
+# 上次被强杀留下的定稿临时文件（那个进程已经不在了）：这次开头就清掉
+sleep 0 & dead=$!; wait $dead
+mkdir -p "$S12/.meetap"; echo stale > "$S12/.meetap/finalize.$dead.m4a"
+clear_plans; rm -f "$FAKE/uploaded.m4a"
+again "$S12"
+up=$(grep '^s3 cp ' "$FAKE/aws.log" | grep -v '^s3 cp s3://' | head -1)
+v5=$(tone_db "$FAKE/uploaded.m4a" 5000); v7=$(tone_db "$FAKE/uploaded.m4a" 7000)
+done_ok "$S12" && [[ "$up" == "s3 cp $S12/meeting_20261119_180005.m4a s3://"*"/meeting_20261119_180005.m4a --region us-east-1" ]] \
+    && [[ "$(chans "$FAKE/uploaded.m4a")" == 1 && "$(chans "$S12/meeting_20261119_180005.m4a")" == 1 ]] && loud "$v5" && loud "$v7" \
+    && grep -q '🔁 回声检查：没认出会议室设备，两路相加' "$LOG" \
+    && pass "普通线上会：会话里的录音定稿成两路相加的单声道（麦克风 ${v5} dB、电脑的声音 ${v7} dB），传的就是它" \
+    || fail "普通线上会 (rc=$RC): 上传「${up}」，麦克风 $v5 dB、电脑的声音 $v7 dB / $(grep '🔁\|⚠️' "$LOG")"
+[[ -z "$(extra_audio "$S12")" ]] && pass "会话里只有一个录音文件，上次留下的临时文件也清了" || fail "多出: $(extra_audio "$S12")"
+
+# 会议室设备也在会里：整场只留电脑的声音，默认不留原始录音，会话里还是只有一个录音文件
+S12r=$(stereo_session 20261119_1840 20261119_184005 room)
+clear_plans; rm -f "$FAKE/uploaded.m4a" "$FAKE/notify.log"
+again "$S12r"
+# 结论里去掉麦克风的那些时段（日志里写着），挑最长的一段看：只有电脑的声音
+rg=$(grep -o '其余时段两路相加：.*\|整场只留电脑的声音' "$LOG" | tail -1)
+if [[ "$rg" == 整场* ]]; then a=0; b=240; else
+    read -r a b <<< "$(sed 's/^其余时段两路相加：//' <<< "$rg" | tr ',' '\n' | awk -F'[-:]' '{ s = $1 * 60 + $2; e = $3 * 60 + $4; if (e - s > m) { m = e - s; r = s " " e } } END { print r }')"
+fi
+v5=$(tone_db "$FAKE/uploaded.m4a" 5000 $((a + 1)) $((b - 1))); v7=$(tone_db "$FAKE/uploaded.m4a" 7000)
+done_ok "$S12r" && ! loud "$v5" && loud "$v7" && grep -q '去掉了麦克风' "$LOG" \
+    && grep -q '去掉了麦克风' "$FAKE/notify.log" && [[ -z "$(extra_audio "$S12r")" ]] \
+    && pass "会议室设备在会里：去掉麦克风的 ${a}~${b} 秒只有电脑的声音（麦克风 ${v5} dB、电脑的声音 ${v7} dB），弹了通知，没留多的音频" \
+    || fail "会议室设备 (rc=$RC): 麦克风 $v5 dB、电脑的声音 $v7 dB，多出 $(extra_audio "$S12r") / $(grep '🔁\|⚠️' "$LOG")"
+# again（已经定稿过）：不重判，echo_check 关了也退不回去，照实说
+use_cfg; echo "echo_check = off" >> "$XDG_CONFIG_HOME/meetap/config"
+rm -f "$S12r/log/transcript.txt"; clear_plans
+again "$S12r"
+[[ "$OUT" == *"麦克风那一路已经去掉"* ]] && done_ok "$S12r" && ! grep -q '回声检查：' <(tail -20 "$LOG") \
+    && pass "定稿过的 again 不重判；没留原始录音时照实说退不回两路相加" || fail "again 时: $OUT"
+use_cfg
+
+# keep_stereo_original = true + audio_persist = false：转录完录音和原始录音都删掉
+printf 'keep_stereo_original = true\naudio_persist = false\n' >> "$XDG_CONFIG_HOME/meetap/config"
+S12k=$(stereo_session 20261119_1850 20261119_185005 room)
+clear_plans
+again "$S12k"
+done_ok "$S12k" && [[ -z "$(find "$S12k" -name '*.m4a')" ]] && grep -q 'keep_stereo_original = true' "$LOG" \
+    && pass "audio_persist = false：转录完录音和留下的原始录音都删了" || fail "audio_persist = false 时还剩: $(find "$S12k" -name '*.m4a')"
+use_cfg
+
+# echo_check = OFF（不分大小写）：不查，照样两路相加
+echo "echo_check = OFF" >> "$XDG_CONFIG_HOME/meetap/config"
+S12d=$(stereo_session 20261119_1830 20261119_183005 room)
+clear_plans; rm -f "$FAKE/uploaded.m4a"
+again "$S12d"
+v5=$(tone_db "$FAKE/uploaded.m4a" 5000); v7=$(tone_db "$FAKE/uploaded.m4a" 7000)
+done_ok "$S12d" && grep -q '配置 echo_check = off' "$LOG" && ! grep -q '回声检查：' "$LOG" && loud "$v5" && loud "$v7" \
+    && pass "echo_check = OFF：不查回声，会议室设备在会里也照样两路相加" || fail "echo_check = OFF (rc=$RC): $(grep '🔁' "$LOG") / $v5 $v7"
+use_cfg
+
+# 上传失败：会话里留下定稿好的单声道录音，没有多的文件
+S12b=$(stereo_session 20261119_1810 20261119_181005)
+clear_plans; plan up other always
+again "$S12b"
+[[ -z "$(extra_audio "$S12b")" && "$(chans "$S12b/meeting_20261119_181005.m4a")" == 1 ]] && grep -q 'Upload failed' "$LOG" \
+    && pass "上传失败：录音已经定稿、还在，没有多的文件" || fail "上传失败后: $(extra_audio "$S12b") / $(tail -3 "$LOG")"
+clear_plans
+# 混不出来（录音坏了，ffprobe、ffmpeg 都读不了）：报错、不上传，原文件不动
+S12c="$REC/20261119_1820"; mkdir -p "$S12c/materials"; head -c 4096 /dev/urandom > "$S12c/meeting_20261119_182005.m4a"
+sum0=$(md5 -q "$S12c/meeting_20261119_182005.m4a")
+again "$S12c"
+! grep -q '^s3 cp .* s3://' "$FAKE/aws.log" && grep -q '没能把双声道录音混成单声道，没有上传' "$LOG" && [[ -z "$(extra_audio "$S12c")" ]] \
+    && [[ "$(md5 -q "$S12c/meeting_20261119_182005.m4a")" == "$sum0" ]] \
+    && pass "混不出来：报错、不上传、原文件不动" || fail "混不出来时: $(grep '^s3 cp' "$FAKE/aws.log") / $(tail -3 "$LOG")"
+
+# ── 13. 正在录的这一场不能 again：定稿会把 ffmpeg 还在写的录音换掉。只重写纪要也一样拒绝 ──
+S13=$(stereo_session 20261130_0900 20261130_090005)
+mkdir -p "$S13/log"; echo "旧转录" > "$S13/log/transcript.txt"
+sum0=$(md5 -q "$S13/meeting_20261130_090005.m4a")
+sleep 300 & live=$!
+echo "$live" > "$MEETAP_STATE_DIR/ffmpeg.pid"; echo "$S13" > "$MEETAP_STATE_DIR/session-dir"
+echo "$S13/meeting_20261130_090005.m4a" > "$MEETAP_STATE_DIR/output-file"
+clear_plans
+again ""   # 不带参数：默认最新一场，就是正在录的这一场
+[[ $RC != 0 && "$OUT" == *"正在录音，现在不能 again"* && "$(md5 -q "$S13/meeting_20261130_090005.m4a")" == "$sum0" ]] \
+    && ! grep -q . "$FAKE/aws.log" 2>/dev/null && [[ -z "$(ls "$S13"/2026-*.md 2>/dev/null)" ]] \
+    && pass "正在录的这一场 again：拒绝，录音一个字节没动，也没重写纪要" || fail "正在录时 again (rc=$RC): $OUT"
+kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+rm -f "$MEETAP_STATE_DIR/ffmpeg.pid" "$MEETAP_STATE_DIR/session-dir" "$MEETAP_STATE_DIR/output-file"
+
+# ── 14. 退回两路相加失败（留下的原始录音坏了）：报错，旧纪要、录音都没动 ──
+S14=$(stereo_session 20261119_1900 20261119_190005)
+ffmpeg -v quiet -y -i "$S14/meeting_20261119_190005.m4a" -ac 1 -c:a aac "$S14/m.m4a" </dev/null && mv "$S14/m.m4a" "$S14/meeting_20261119_190005.m4a"
+mkdir -p "$S14/.meetap" "$S14/log"; head -c 4096 /dev/urandom > "$S14/.meetap/meeting_20261119_190005.stereo-original.m4a"
+echo "旧转录" > "$S14/log/transcript.txt"; echo "# 旧纪要" > "$S14/2026-11-19_1900_旧纪要.md"
+use_cfg; echo "echo_check = off" >> "$XDG_CONFIG_HOME/meetap/config"
+again "$S14"
+[[ $RC != 0 && "$OUT" == *"没能用"*"重做两路相加的录音，什么都没动"* && -f "$S14/2026-11-19_1900_旧纪要.md" && ! -d "$S14/archive" ]] \
+    && [[ -f "$S14/log/transcript.txt" && -f "$S14/.meetap/meeting_20261119_190005.stereo-original.m4a" ]] \
+    && pass "退回失败：报错，旧纪要没被归档，转录稿和原始录音都还在" || fail "退回失败时 (rc=$RC): $OUT / $(ls "$S14")"
+use_cfg
 
 echo
 [[ $FAIL -eq 0 ]] && echo "ALL PASS" || echo "SOME FAILED"

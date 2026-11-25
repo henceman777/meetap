@@ -10,9 +10,9 @@
 
 ## 背景
 
-`meetap` 在 macOS 14.4+ 默认走 **Process Tap** 采集音频：`audio-tap`（Swift）在进程内用 `AudioHardwareCreateProcessTap` + aggregate device 采系统音、同进程混入麦克风，输出 Float32 LE mono PCM 到 stdout，经 FIFO 喂给 ffmpeg 编码成 m4a。
+`meetap` 在 macOS 14.4+ 默认走 **Process Tap** 采集音频：`audio-tap`（Swift）在进程内用 `AudioHardwareCreateProcessTap` + aggregate device 采系统音、同进程采麦克风，输出 Float32 LE PCM 到 stdout，经 FIFO 喂给 ffmpeg 编码成 m4a。（写这篇时两路在 audio-tap 里混成单声道；后来改成开麦时双声道、转录前再定稿成单声道，见 [how-it-works.md](how-it-works.md) 的「会议室回声」。下面的排障过程不受影响。）
 
-- 采集链路：`audio-tap`（tap 回调 + mic 回调混音）→ FIFO → ffmpeg → `.m4a`
+- 采集链路：`audio-tap`（tap 回调 + mic 回调，写线程按墙钟取数）→ FIFO → ffmpeg → `.m4a`
 - 电平/波形链路：`audio-tap` 的 **mic 回调独立**写 `mic-level` 文件，终端点阵波形读它
 
 ---

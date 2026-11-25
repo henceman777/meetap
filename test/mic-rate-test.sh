@@ -56,7 +56,7 @@ echo "输入: $(SwitchAudioSource -c -t input 2>/dev/null || echo '?')  输出: 
 
 now() { perl -MTime::HiRes=time -e 'printf "%.4f", time'; }
 
-# 跑一次：墙钟从启动前一刻到进程退出，总帧数 = stdout 字节 / 4。
+# 跑一次：墙钟从启动前一刻到进程退出，总帧数 = stdout 字节 / 4 / 声道数（开麦是双声道，见 stderr 的 CHANNELS=）。
 # 期间每 4 秒抽查一次麦克风电平，任何一次 > -91 dBFS 即说明麦克风真的出了数据。
 run_once() {
     rm -f "$TMP/mic-level"
@@ -72,10 +72,11 @@ run_once() {
     done
     wait "$pid" || true
     t1=$(now)
-    local bytes; bytes=$(stat -f%z "$TMP/pcm.raw")
+    local bytes ch; bytes=$(stat -f%z "$TMP/pcm.raw")
+    ch=$(sed -n 's/^CHANNELS=//p' "$TMP/stderr.log"); ch=${ch:-1}
     WALL=$(echo "$t1 - $t0" | bc -l)
-    MEASURED=$(echo "$bytes / 4 / $WALL" | bc -l | xargs printf "%.0f")
-    PCT=$(echo "100 * $bytes / 4 / $WALL / $RATE" | bc -l | xargs printf "%.2f")
+    MEASURED=$(echo "$bytes / 4 / $ch / $WALL" | bc -l | xargs printf "%.0f")
+    PCT=$(echo "100 * $bytes / 4 / $ch / $WALL / $RATE" | bc -l | xargs printf "%.2f")
 }
 
 FAIL=0

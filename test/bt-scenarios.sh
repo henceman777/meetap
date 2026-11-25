@@ -90,14 +90,15 @@ record() {
     local name=$1 mic=$2 tone=$3 action=$4
     local m4a="$OUT_DIR/scenario-$name.m4a" fifo="$TMP/tap.fifo" log="$OUT_DIR/scenario-$name.tap.log"
     rm -f "$m4a" "$fifo"; mkfifo "$fifo"
-    local mic_args=(); [[ $mic == 1 ]] && mic_args=(--with-mic)
+    # 开麦时 audio-tap 输出双声道（声道 0 麦克风、声道 1 系统音），和 meetap 一样按原样存
+    local mic_args=() ch=1; [[ $mic == 1 ]] && { mic_args=(--with-mic); ch=2; }
     if [[ $tone == 1 ]]; then afplay -v 0.03 "$TMP/tone.wav" & TONE_PID=$!; fi
     sleep 1
     T0=$(now)
     "$BIN" tap-start ${RATE_ARGS[@]+"${RATE_ARGS[@]}"} ${mic_args[@]+"${mic_args[@]}"} \
         < /dev/null > "$fifo" 2> "$log" &
     local tap=$!
-    ffmpeg -y -f f32le -ar "$RATE" -ac 1 -i "$fifo" -c:a aac -b:a 128k -ac 1 \
+    ffmpeg -y -f f32le -ar "$RATE" -ac "$ch" -i "$fifo" -c:a aac -b:a 128k -ac "$ch" \
         -movflags frag_keyframe+empty_moov -frag_duration 10000000 -flush_packets 1 "$m4a" < /dev/null > "$TMP/ffmpeg.log" 2>&1 &
     local ff=$!
     if [[ $action != none ]]; then

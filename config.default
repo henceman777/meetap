@@ -22,10 +22,23 @@ multi_language = false
 # ── Recording ─────────────────────────────────────────────────
 # Output directory
 recording_dir = ~/Record
-# Audio bitrate (64k=small file, 128k=balanced, 256k=high quality)
+# Audio bitrate (64k=small file, 128k=balanced, 256k=high quality). With the mic on, the two channels
+# share it while recording (128k = 64k per channel, plenty for speech; 64k leaves 32k per channel and
+# sounds muffled, so use 96k or more), and the final mono file is encoded at this rate again.
 audio_bitrate = 128k
 # Keep the local audio file after transcription (true=keep, false=delete once the transcript is saved)
 audio_persist = true
+# Meeting-room echo check, for recordings made with the mic on. If a meeting room device (Teams Room
+# and the like) is in the same call, the computer audio repeats the room voices 1-2 s after the mic heard
+# them. When that is found, meetap keeps only the computer audio (as if -m had been on) in the 30 s blocks
+# where the mic speech is confirmed to be in the computer audio; other blocks mix both channels. Anyone
+# the room device does not pick up is then not in the recording.
+# on (default) / off = always mix both channels, as before.
+echo_check = on
+# When the echo check drops the mic, also keep the original two-channel recording in .meetap/ so the
+# decision can be undone: set echo_check = off and run meetap again on that meeting.
+# Costs about 58 MB per hour at 128k. Default false: the session holds one mono recording, as before.
+keep_stereo_original = false
 # Audio is always captured with Process Tap (macOS 14.4+); there is no capture setting.
 # Silent-recording alert: if an app is playing sound but the capture is all zeros,
 # meetap shows a notification within 30 s naming that app as "Name (bundle ID)",

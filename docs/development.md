@@ -19,7 +19,7 @@ make clean      # 清理构建产物
 ```
 src/
 ├── meetap                    # bash 主控脚本（录音、转录、纪要、日历、标签、tidy 都在这里）
-├── audio-tap.swift           # Core Audio Process Tap 采集 + 麦克风进程内混音（macOS 14.4+）
+├── audio-tap.swift           # Core Audio Process Tap 采集 + 麦克风进程内采集，两路分声道输出（macOS 14.4+）
 ├── audio-tap-Info.plist      # 嵌入 audio-tap 的音频录制权限描述
 ├── audio-multi-output.swift  # CoreAudio 设备查询 / 切换默认输出（升级迁移用）+ 休眠自动结束（sleep-watch）+ 日历查询（EventKit）
 ├── audio-multi-output-Info.plist  # 嵌入 audio-multi-output 的日历用途说明
@@ -38,7 +38,7 @@ config.default                # 首次运行时拷到 ~/.config/meetap/config �
 
 | 不需要音频设备、不触达 AWS | 需要真机（音频设备、真实录音） |
 |---|---|
-| `bare-start-test.sh`、`calendar-test.sh`、`calendar-selftest.sh`、`frag-write-test.sh`、`highlight-verify-test.sh`、`log-cleanup-test.sh`、`migrate-test.sh`、`resample-selftest.sh`、`resolve-session-test.sh`、`retry-test.sh`、`sleep-stop-test.sh`、`sleep-watch-test.sh`、`tag-test.sh`、`track3-golden-test.sh`、`zero-guard-selftest.sh` | `bt-scenarios.sh`（蓝牙耳机）、`ctrl-c-test.sh`、`mic-clock-test.sh`、`mic-rate-test.sh` |
+| `bare-start-test.sh`、`calendar-test.sh`、`calendar-selftest.sh`、`echo-check-test.sh`、`frag-write-test.sh`、`highlight-verify-test.sh`、`log-cleanup-test.sh`、`migrate-test.sh`、`resample-selftest.sh`、`resolve-session-test.sh`、`retry-test.sh`、`sleep-stop-test.sh`、`sleep-watch-test.sh`、`tag-test.sh`、`track3-golden-test.sh`、`zero-guard-selftest.sh` | `bt-scenarios.sh`（蓝牙耳机）、`ctrl-c-test.sh`、`mic-clock-test.sh`、`mic-rate-test.sh` |
 
 注意：`sleep-stop-test.sh` 里有作用到整台机器的 `pkill`，正在录音时别跑。
 

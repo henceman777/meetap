@@ -10,10 +10,13 @@ import Foundation
 //   tap-rate                  打印默认输出设备标称采样率（整数 Hz，仅参考）
 //   tap-format                打印 Process Tap 实际采样率（整数 Hz，采集/编码以此为准）
 //   tap-start [--output-rate HZ] [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH]
-//                             捕获系统音频（--with-mic 混入麦克风），Float32 LE mono PCM 写 stdout
-//                             输出恒为 --output-rate（默认 48000）：tap、麦克风各自重采样到该率再混音，
+//                             捕获系统音频，Float32 LE PCM 写 stdout。不带 --with-mic 是单声道（系统音）；
+//                             带 --with-mic 是交错双声道：声道 0 麦克风、声道 1 系统音，不在这里混音，
+//                             转录前由 meetap 判断会议室回声以后再混（见 src/meetap 的 _echo_check）。
+//                             声道数只看有没有 --with-mic：麦克风打不开时声道 0 全零，声道数不变。
+//                             输出恒为 --output-rate（默认 48000）：tap、麦克风各自重采样到该率，
 //                             与设备实际采样率无关（蓝牙耳机通话模式麦克风只有 16k/24k）。
-//                             ffmpeg 读法: ffmpeg -f f32le -ar <同一个 output-rate> -ac 1 -i pipe:0 ...
+//                             ffmpeg 读法: ffmpeg -f f32le -ar <同一个 output-rate> -ac <1|2> -i pipe:0 ...
 //   selftest-resample         重采样自检（合成信号，不碰音频设备）
 //
 // tap-start 启动后 stderr 输出 "SAMPLE_RATE=<rate>" 等元信息（数据只走 stdout）。
@@ -94,10 +97,10 @@ var zgCallbacks: Int = 0
 var faultZeroFromNs: UInt64 = 0
 var faultZeroUntilNs: UInt64 = .max
 
-// MARK: - 麦克风采集与混音（--with-mic，借鉴 meetily ring-buffer 混音架构）
+// MARK: - 麦克风采集（--with-mic，借鉴 meetily ring-buffer 架构）
 // meetily 经验（core_audio.rs / pipeline.rs, MIT）：绝不让外部进程（ffmpeg
-// avfoundation）碰音频设备——tap 采系统音、进程内采麦克风、ring buffer 混音、
-// 单路 PCM 输出。彻底消灭设备抢占/枚举竞态一类问题。
+// avfoundation）碰音频设备——tap 采系统音、进程内采麦克风、ring buffer 对齐、
+// 一路 PCM 输出（两个声道）。彻底消灭设备抢占/枚举竞态一类问题。
 
 // 通用音频环形缓冲：IO 回调写入，输出写线程按需读出。系统音、麦克风各一个。
 // 满了覆盖最旧样本，覆盖量计入该路的丢弃统计。
@@ -148,7 +151,7 @@ final class AudioRing {
 
 // MARK: - 采样率转换
 // 每个源在进 ring 之前都转到统一的输出采样率，ring 里永远是同一个采样率的样本，
-// 才能按样本 1:1 混音。蓝牙耳机一开麦就切到通话模式（HFP），麦克风只有 16k/24k，
+// 才能按样本 1:1 对齐。蓝牙耳机一开麦就切到通话模式（HFP），麦克风只有 16k/24k，
 // 而 tap 由系统重采样、恒为 48k；不转换的话，24k 麦克风会让整段录音 2 倍速 + 升调
 // （AirPods Pro 实录事故）。
 // 用线性插值而不是 AudioConverter：墙钟同步要逐拍连续微调比例（adjust），
@@ -563,7 +566,9 @@ func writeAll(fd: Int32, data: UnsafeRawPointer, count: Int) -> Bool {
 
 // MARK: - 输出写线程（墙钟节拍）
 // stdout 的唯一写出口。每 10ms 按墙钟算出「从启动到现在应写的帧数」，补写差额：
-// 每一路各取这么多帧（Source 负责不足补零 / 多余丢弃 / 微调比例）混音写出。
+// 每一路各取这么多帧（Source 负责不足补零 / 多余丢弃 / 微调比例），一路一个声道交错写出。
+// 不混音：会议室里笔记本和会议室设备同时入会时，系统音里有麦克风那些人声晚 1~2 秒的副本，
+// 先混了就再也分不开，所以两路原样留到录音文件里，转录前再决定怎么用。
 // 节拍只跟墙钟走，不跟任何设备的硬件时钟：哪一路速率和声明不符，都不会让录音变速。
 // （老架构按「活跃源里可用量最少的那个」取数，24k 麦克风把整段录音拖成 2 倍速。）
 final class OutputWriter {
@@ -573,6 +578,7 @@ final class OutputWriter {
     private let queue = DispatchQueue(label: "meetap.audio-tap.writer", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     private let cap: Int
+    let channels: Int             // = 源的个数，第 i 个源写声道 i
     private let out, tmp: UnsafeMutablePointer<Float>
     private(set) var written = 0
     private var nextMeasureNs: UInt64
@@ -587,7 +593,8 @@ final class OutputWriter {
         self.originNs = originNs
         for s in sources { s.originNs = originNs }
         cap = max(4800, Int(rate / 10))  // 单次渲染上限 100ms，追帧时分块
-        out = .allocate(capacity: cap)
+        channels = sources.count
+        out = .allocate(capacity: cap * channels)
         tmp = .allocate(capacity: cap)
         nextMeasureNs = originNs + Self.measureNs
         nextReportNs = originNs + Self.reportNs
@@ -604,7 +611,7 @@ final class OutputWriter {
     private func tick() {
         if writeFailedFlag.pointee { return }
         let ok = pump(now: DispatchTime.now().uptimeNanoseconds) { p, n in
-            writeAll(fd: 1, data: p, count: n * MemoryLayout<Float>.size)
+            writeAll(fd: 1, data: p, count: n * self.channels * MemoryLayout<Float>.size)
         }
         if !ok {
             // 下游（ffmpeg）已退出：置位并交给主线程清理
@@ -613,17 +620,20 @@ final class OutputWriter {
         }
     }
 
-    // 写到墙钟 now 应有的帧数；sink 返回 false 表示下游已关闭。selftest 用合成时间驱动它。
+    // 写到墙钟 now 应有的帧数；sink 收到 n 帧（n × channels 个交错样本），返回 false 表示
+    // 下游已关闭。selftest 用合成时间驱动它。
     func pump(now: UInt64, sink: (UnsafePointer<Float>, Int) -> Bool) -> Bool {
         let due = Int(Double(now - originNs) * rate / 1e9)
+        let ch = channels
         while written < due {
             let n = min(cap, due - written)
-            out.update(repeating: 0, count: n)
-            for s in sources {
+            for (c, s) in sources.enumerated() {
                 s.pull(n, into: tmp, now: now)
-                for i in 0..<n { out[i] += tmp[i] }
+                // + 0：-0.0 变成 +0.0。以前是加进清零的缓冲（0 + -0.0 = +0.0），-m 的输出要和以前
+                // 逐字节一样；setup 的授权探测（tap_probe）按「有没有非零字节」判断，-0.0 的
+                // 字节 00 00 00 80 会被当成有声音
+                for i in 0..<n { out[i * ch + c] = max(-1.0, min(1.0, tmp[i])) + 0 }
             }
-            for i in 0..<n { out[i] = max(-1.0, min(1.0, out[i])) }
             if !sink(out, n) { return false }
             written += n
         }
@@ -1120,6 +1130,11 @@ func runTapFormat() -> Never {
 }
 
 var activeMic: MicCapture? = nil
+
+// 输出声道顺序：有麦克风时声道 0 麦克风、声道 1 系统音（meetap 的回声检查按这个顺序读）
+func outputSources(mic: Source?, sys: Source) -> [Source] {
+    (mic.map { [$0] } ?? []) + [sys]
+}
 var activeWriter: OutputWriter? = nil
 var tapWatchdog: DispatchSourceTimer? = nil
 var activeZeroGuard: ZeroGuard? = nil
@@ -1166,13 +1181,13 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     }
 
     // 装配：tap、麦克风各一路（Source），各自重采样到 outputRate 写进自己的 ring；
-    // OutputWriter 按墙钟取数混音写 stdout。写线程等 tap 起来才启动：tap 起不来就
-    // 不出一个字节直接退出，让 meetap 的健康探测照常判失败、重试。启动后先补齐
-    // 从 launchNs 到此刻的空档（设备初始化期间），时长仍从启动时刻算。
+    // OutputWriter 按墙钟取数，一路一个声道写 stdout（有麦克风时声道 0 麦克风、声道 1 系统音）。
+    // 写线程等 tap 起来才启动：tap 起不来就不出一个字节直接退出，让 meetap 的健康探测照常
+    // 判失败、重试。启动后先补齐从 launchNs 到此刻的空档（设备初始化期间），时长仍从启动时刻算。
     let ringCap = Int(outputRate) * 2  // 2s
     let sysSource = Source(name: "tap", ring: AudioRing(capacity: ringCap), outRate: outputRate)
     let micSource = withMic ? Source(name: "mic", ring: AudioRing(capacity: ringCap), outRate: outputRate) : nil
-    let writer = OutputWriter(rate: outputRate, sources: [sysSource] + (micSource.map { [$0] } ?? []),
+    let writer = OutputWriter(rate: outputRate, sources: outputSources(mic: micSource, sys: sysSource),
                               originNs: launchNs)
     activeWriter = writer
 
@@ -1213,7 +1228,7 @@ func runTapStart(duration: Double?, levelFile: String?, micLevelFile: String?, w
     // 元信息走 stderr（stdout 只有 PCM 数据）。SAMPLE_RATE 即 --output-rate，
     // 调用方给 ffmpeg -ar 用的必须是同一个值。
     fputs("SAMPLE_RATE=\(Int(outputRate))\n", stderr)
-    fputs("CHANNELS=1\n", stderr)
+    fputs("CHANNELS=\(writer.channels)\n", stderr)
     fputs("FORMAT=f32le\n", stderr)
 
     // 重建 tap（看门狗用），沿用同一路 sysSource
@@ -1455,7 +1470,8 @@ func runSelftestResample() -> Never {
         var burstSec = 0.0            // 首个回调一次性带来的积压（秒）
         var period = 0.02             // 回调周期
     }
-    struct SimResult { let out: [Float]; let drift: [(Double, String)]; let stats: [Source.Stats] }
+    // chans：输出按声道拆开（第 j 个设备 = 声道 j）
+    struct SimResult { let chans: [[Float]]; let drift: [(Double, String)]; let stats: [Source.Stats] }
     func simulate(_ devs: [Dev], seconds: Double = 60) -> SimResult {
         let origin: UInt64 = 1_000_000_000
         var simT = 0.0
@@ -1468,7 +1484,8 @@ func runSelftestResample() -> Never {
             return r
         }
         let writer = OutputWriter(rate: out, sources: sources, originNs: origin)
-        var result = [Float](); result.reserveCapacity(Int(out * seconds) + 1)
+        var result = [[Float]](repeating: [], count: devs.count)
+        for j in result.indices { result[j].reserveCapacity(Int(out * seconds) + 1) }
         var k = [Int](repeating: 0, count: devs.count)       // 下一个回调序号
         var seed: UInt64 = 12345
         func jitter() -> Double {                            // 0~4ms 投递延迟（确定性伪随机）
@@ -1502,11 +1519,12 @@ func runSelftestResample() -> Never {
             if ms % 10 == 0 {
                 tick += 1
                 _ = writer.pump(now: origin + UInt64(simT * 1e9)) { p, n in
-                    result.append(contentsOf: UnsafeBufferPointer(start: p, count: n)); return true
+                    for i in 0..<n { for j in 0..<devs.count { result[j].append(p[i * devs.count + j]) } }
+                    return true
                 }
             }
         }
-        return SimResult(out: result, drift: drift, stats: sources.map { $0.stats() })
+        return SimResult(chans: result, drift: drift, stats: sources.map { $0.stats() })
     }
     // 上升过零次数 / 时长 = 频率（补零段最多多数一个过零，误差可忽略）
     func pitch(_ x: [Float], _ a: Double, _ b: Double) -> Double {
@@ -1519,15 +1537,19 @@ func runSelftestResample() -> Never {
     let full = Int(out * 60)
     func report(_ label: String, _ r: SimResult, expectDrift: Bool, maxDriftAt: Double = 20,
                 pitchFrom: Double = 40, maxPadMs: Int = 30, maxDropMs: Int = 0) {
-        let p = pitch(r.out, pitchFrom, 60)
+        // 每个声道各自：帧数 = 墙钟、音高不变
+        let frames = r.chans.map { $0.count }.min() ?? 0
+        let ps = r.chans.map { pitch($0, pitchFrom, 60) }
+        let p = ps.max { abs($0 / freq - 1) < abs($1 / freq - 1) } ?? 0
         let pad = r.stats.map { ms($0.pad) }.max() ?? 0
         let drop = r.stats.map { ms($0.drop) }.max() ?? 0
         let driftAt = r.drift.first?.0
-        var ok = r.out.count == full && abs(p / freq - 1) < 0.005 && pad <= maxPadMs && drop <= maxDropMs
+        var ok = r.chans.allSatisfy { $0.count == full } && abs(p / freq - 1) < 0.005
+        ok = ok && pad <= maxPadMs && drop <= maxDropMs
         ok = ok && (expectDrift ? (driftAt.map { $0 <= maxDriftAt } ?? false) : r.drift.isEmpty)
         let driftDesc = driftAt.map { String(format: "CLOCK_DRIFT@%.0fs", $0) } ?? "无 CLOCK_DRIFT"
         check(ok, String(format: "%@: %d 帧(应 %d) 音高 %.1fHz pad=%dms drop=%dms %@",
-                         label, r.out.count, full, p, pad, drop, driftDesc))
+                         label, frames, full, p, pad, drop, driftDesc))
     }
 
     report("AirPods 麦 24k 如实上报", simulate([Dev(name: "mic", trueRate: 24000, declared: 24000)]),
@@ -1553,6 +1575,56 @@ func runSelftestResample() -> Never {
     report("tap 48k + 麦 16k 同时", simulate([Dev(name: "tap", trueRate: 48000, declared: 48000, period: 512 / 48000),
                                             Dev(name: "mic", trueRate: 16000, declared: 16000)]),
            expectDrift: false)
+    do {
+        // 声道顺序和 tap-start 一样（outputSources）：声道 0 麦克风、声道 1 系统音
+        let mk = { (n: String) in Source(name: n, ring: AudioRing(capacity: 16), outRate: out) }
+        let order = outputSources(mic: mk("mic"), sys: mk("tap")).map { $0.name }
+        check(order == ["mic", "tap"] && outputSources(mic: nil, sys: mk("tap")).map { $0.name } == ["tap"],
+              "声道顺序：开麦 \(order)，不开麦只有 tap")
+        // 两路各占一个声道、不混音：麦克风断流的那几秒，麦克风声道是零，tap 声道照常
+        let devs = order.map { $0 == "mic" ? Dev(name: "mic", trueRate: 16000, declared: 16000, stall: 20...25)
+                                           : Dev(name: "tap", trueRate: 48000, declared: 48000, period: 512 / 48000) }
+        let r = simulate(devs)
+        let a = Int(21 * out), b = Int(24 * out)
+        let micPeak = r.chans[0][a..<b].map { abs($0) }.max() ?? 1
+        let tapPeak = r.chans[1][a..<b].map { abs($0) }.max() ?? 0
+        check(r.chans.count == 2 && micPeak == 0 && tapPeak > 0.99,
+              String(format: "两路分声道：麦断流时声道 0（麦）峰值 %.3f、声道 1（tap）峰值 %.3f", micPeak, tapPeak))
+    }
+    do {
+        // 单声道（-m）输出和老写法（加进清零的缓冲再限幅）逐个样本、逐字节一样；-0.0 写成 +0.0
+        let src = Source(name: "tap", ring: AudioRing(capacity: Int(out) * 2), outRate: out)
+        let origin: UInt64 = 1_000_000_000
+        let writer = OutputWriter(rate: out, sources: outputSources(mic: nil, sys: src), originNs: origin)
+        let pattern: [Float] = [-0.0, 0.0, 0.25, -0.5, 1.5, -2.0, -0.0, 1e-30, -1e-30]
+        let input = (0..<9600).map { pattern[$0 % pattern.count] }
+        var got: [Float] = []
+        for step in 0...40 {          // 每 10ms 一拍：前 20 拍各送进 480 个样本，之后只取
+            let now = origin + UInt64(step) * 10_000_000
+            if step < 20 {
+                // 直接进 ring（不经重采样，免得水位微调改了样本值）
+                input[(step * 480)..<(step * 480 + 480)].withUnsafeBufferPointer {
+                    src.ring.write($0.baseAddress!, 480, stride: 1)
+                }
+            }
+            _ = writer.pump(now: now) { p, n in
+                got.append(contentsOf: UnsafeBufferPointer(start: p, count: n)); return true
+            }
+        }
+        let old = { (x: Float) -> Float in var o: Float = 0; o += x; return max(-1.0, min(1.0, o)) }
+        let negZero = got.filter { $0 == 0 && $0.sign == .minus }.count
+        // 输出 = 空档的 +0.0、接着一段连续的输入（开头可能被裁掉一些）、再是 +0.0。
+        // 找到对齐的位置后，整段逐字节和老写法比
+        let s0 = got.firstIndex { $0 != 0 } ?? 0
+        let same = (0..<input.count).contains { i0 in
+            old(input[i0]).bitPattern == got[s0].bitPattern && (0..<got.count).allSatisfy { j in
+                let i = i0 + j - s0
+                return got[j].bitPattern == (i >= 0 && i < input.count ? old(input[i]) : 0).bitPattern
+            }
+        }
+        check(writer.channels == 1 && negZero == 0 && same,
+              "单声道输出和老写法逐字节一样（-0.0 写成 +0.0，剩 \(negZero) 个 -0.0）")
+    }
     report("开麦 3s 后才出数据且首包积压 0.5s",
            simulate([Dev(name: "mic", trueRate: 24000, declared: 24000, startAt: 3, burstSec: 0.5)]),
            expectDrift: false, maxDropMs: 1000)
@@ -1713,9 +1785,10 @@ guard let cmd = args.first else {
       tap-rate                  打印默认输出设备标称采样率（Hz）
       tap-format                打印 Process Tap 实际采样率（Hz，采集/编码应以此为准）
       tap-start [--output-rate HZ] [--duration N] [--with-mic] [--level-file PATH] [--mic-level-file PATH]
-                                捕获系统音频，Float32 LE mono PCM 写 stdout
+                                捕获系统音频，Float32 LE PCM 写 stdout（单声道）
                                 --output-rate: 输出采样率（默认 48000），各源重采样到此率
-                                --with-mic: 混入默认输入设备（麦克风）
+                                --with-mic: 同时录默认输入设备（麦克风），输出改成交错双声道：
+                                声道 0 麦克风、声道 1 系统音（不混音）
                                 --level-file: 每 0.4s 写当前电平(dBFS)到文件，
                                 供波形显示读取（SIGINT/SIGTERM 停止并清理）
                                 --zero-alert-text: 有声音在放、tap 却全是零时弹的通知文案，
